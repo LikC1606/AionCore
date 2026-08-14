@@ -1067,6 +1067,19 @@ impl ConversationService {
             }
         }
 
+        if let Some(status) = selected_mcp_statuses
+            .iter()
+            .find(|status| status.name == "deepscientist-benchmark-container")
+            && status.status != ConversationMcpStatusKind::Loaded
+        {
+            return Err(ConversationError::BadRequest {
+                reason: format!(
+                    "benchmark-container MCP is unavailable: {}",
+                    status.reason.as_deref().unwrap_or("unknown transport failure")
+                ),
+            });
+        }
+
         if let Some(obj) = extra.as_object_mut() {
             obj.insert(
                 "mcp_server_ids".to_owned(),

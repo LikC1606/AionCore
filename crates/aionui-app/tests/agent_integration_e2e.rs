@@ -33,6 +33,7 @@ struct MockAgent {
     confirmations: Mutex<Vec<Confirmation>>,
     approvals: Mutex<std::collections::HashMap<String, bool>>,
     last_activity: AtomicI64,
+    status: Mutex<ConversationStatus>,
 }
 
 impl MockAgent {
@@ -45,6 +46,7 @@ impl MockAgent {
             confirmations: Mutex::new(vec![]),
             approvals: Mutex::new(std::collections::HashMap::new()),
             last_activity: AtomicI64::new(now_ms()),
+            status: Mutex::new(ConversationStatus::Running),
         }
     }
 }
@@ -64,7 +66,7 @@ impl IAgentTask for MockAgent {
     }
 
     fn status(&self) -> Option<ConversationStatus> {
-        Some(ConversationStatus::Running)
+        Some(*self.status.lock().unwrap())
     }
 
     fn last_activity_at(&self) -> TimestampMs {
@@ -135,6 +137,12 @@ impl MockTaskManager {
             .lock()
             .unwrap()
             .insert(conv_id.to_owned(), AgentInstance::Mock(agent.clone()));
+        agent
+    }
+
+    fn insert_finished(&self, conv_id: &str, workspace: &str) -> Arc<MockAgent> {
+        let agent = self.insert(conv_id, workspace);
+        *agent.status.lock().unwrap() = ConversationStatus::Finished;
         agent
     }
 }
@@ -494,6 +502,54 @@ async fn runtime_ensure_with_mock_agent() {
     );
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn runtime_release_removes_only_a_finished_agent_task() {
+    let (mut app, services, mock_tm) = build_app_with_mock_tasks().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "Pass123!").await;
+    let conv_id = create_conversation(&mut app, &token, &csrf, "Runtime Release Test").await;
+    mock_tm.insert_finished(&conv_id, "/mock-workspace");
+
+    let req = json_with_token(
+        "POST",
+        &format!("/api/conversations/{conv_id}/runtime/release"),
+        json!({}),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(mock_tm.get_task(&conv_id).is_none());
+
+    let resp = app
+        .oneshot(get_with_token(&format!("/api/conversations/{conv_id}"), &token))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "release must preserve the conversation row"
+    );
+}
+
+#[tokio::test]
+async fn runtime_release_rejects_a_running_agent_task() {
+    let (mut app, services, mock_tm) = build_app_with_mock_tasks().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "Pass123!").await;
+    let conv_id = create_conversation(&mut app, &token, &csrf, "Runtime Release Busy Test").await;
+    mock_tm.insert(&conv_id, "/mock-workspace");
+
+    let req = json_with_token(
+        "POST",
+        &format!("/api/conversations/{conv_id}/runtime/release"),
+        json!({}),
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert!(mock_tm.get_task(&conv_id).is_some());
 }
 
 // ── Confirmation system with mock agent ─────────────────────────

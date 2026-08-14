@@ -117,6 +117,7 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/{id}/artifacts/{artifactId}", patch(update_artifact))
         .route("/api/conversations/{id}/cancel", post(cancel))
         .route("/api/conversations/{id}/runtime/ensure", post(ensure_runtime))
+        .route("/api/conversations/{id}/runtime/release", post(release_runtime))
         .route("/api/conversations/{id}/active-lease", post(active_lease))
         // Confirmation system
         .route("/api/conversations/{id}/confirmations", get(list_confirmations))
@@ -330,6 +331,27 @@ async fn ensure_runtime(
     Ok(Json(ApiResponse::ok(response)))
 }
 
+async fn release_runtime(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    state.service.get(&user.id, &id).await.map_err(ApiError::from)?;
+    let Some(task) = state.task_manager.get_task(&id) else {
+        return Ok(Json(ApiResponse::success()));
+    };
+    if task.status() != Some(aionui_common::ConversationStatus::Finished) {
+        return Err(ApiError::Conflict(
+            "Conversation runtime can only be released after the turn is terminal".into(),
+        ));
+    }
+    state
+        .task_manager
+        .kill_and_wait(&id, Some(aionui_common::AgentKillReason::ExecutionComplete))
+        .await;
+    Ok(Json(ApiResponse::success()))
+}
+
 async fn active_lease(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
@@ -428,6 +450,14 @@ async fn active_count(
 #[cfg(test)]
 mod error_mapping_tests {
     use super::*;
+
+    #[test]
+    fn conversation_router_exposes_non_destructive_runtime_release() {
+        let source = include_str!("routes.rs");
+        assert!(source.contains("/api/conversations/{id}/runtime/release"));
+        assert!(source.contains("AgentKillReason::ExecutionComplete"));
+        assert!(source.contains("Conversation runtime can only be released after the turn is terminal"));
+    }
 
     #[test]
     fn conversation_not_found_maps_to_app_not_found() {
