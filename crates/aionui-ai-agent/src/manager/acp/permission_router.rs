@@ -13,6 +13,13 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{debug, info};
 
 const BENCHMARK_CONTAINER_MCP_SERVER_NAME: &str = "deepscientist-benchmark-container";
+const BENCHMARK_CONTAINER_MCP_TOOLS: &[&str] = &[
+    "benchmark_exec",
+    "benchmark_read",
+    "benchmark_write",
+    "benchmark_list",
+    "benchmark_stat",
+];
 const AUTO_APPROVE_MCP_SERVERS: &[&str] = &[TEAM_MCP_SERVER_NAME];
 
 struct PendingPermission {
@@ -201,13 +208,46 @@ fn auto_approve_option_id_with_benchmark(
     request: &agent_client_protocol::schema::RequestPermissionRequest,
     benchmark_container_isolation: bool,
 ) -> Option<String> {
-    let server_name = extract_mcp_server_name(request)?;
-    let team_server = AUTO_APPROVE_MCP_SERVERS.contains(&server_name.as_str());
-    let benchmark_server = benchmark_container_isolation && server_name == BENCHMARK_CONTAINER_MCP_SERVER_NAME;
+    let team_server = extract_mcp_server_name(request)
+        .is_some_and(|server_name| AUTO_APPROVE_MCP_SERVERS.contains(&server_name.as_str()));
+    let benchmark_server = benchmark_container_isolation && is_exact_benchmark_mcp_request(request);
     if !team_server && !benchmark_server {
         return None;
     }
     select_allow_option_id(request)
+}
+
+fn is_exact_benchmark_mcp_request(request: &agent_client_protocol::schema::RequestPermissionRequest) -> bool {
+    let fields = &request.tool_call.fields;
+    let Some(title) = fields.title.as_deref() else {
+        return false;
+    };
+    let Some(tool) = benchmark_tool_from_dotted_title(title) else {
+        return false;
+    };
+
+    // Codex ACP permission requests may omit raw_input even though the
+    // preceding tool-call update included it. When raw_input is present,
+    // require every available identity field to agree with the exact title.
+    let Some(raw_input) = fields.raw_input.as_ref() else {
+        return true;
+    };
+    let server_matches = raw_input
+        .get("server")
+        .or_else(|| raw_input.get("server_name"))
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|server| server == BENCHMARK_CONTAINER_MCP_SERVER_NAME);
+    let tool_matches = raw_input
+        .get("tool")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|raw_tool| raw_tool == tool);
+    server_matches && tool_matches
+}
+
+fn benchmark_tool_from_dotted_title(title: &str) -> Option<&str> {
+    let prefix = format!("mcp.{BENCHMARK_CONTAINER_MCP_SERVER_NAME}.");
+    let tool = title.strip_prefix(&prefix)?;
+    BENCHMARK_CONTAINER_MCP_TOOLS.contains(&tool).then_some(tool)
 }
 
 fn select_allow_option_id(request: &agent_client_protocol::schema::RequestPermissionRequest) -> Option<String> {
@@ -417,7 +457,7 @@ mod tests {
     #[test]
     fn benchmark_isolation_auto_approves_only_the_reserved_server() {
         let request = permission_request_with_title_and_raw_input(
-            "Approve MCP tool call",
+            "mcp.deepscientist-benchmark-container.benchmark_list",
             Some(json!({ "server_name": "deepscientist-benchmark-container" })),
             vec![allow_always_option("benchmark-allow"), reject_option("cancel")],
         );
@@ -445,6 +485,46 @@ mod tests {
             auto_approve_option_id_with_benchmark(&request, true).as_deref(),
             Some("benchmark-allow")
         );
+    }
+
+    #[test]
+    fn benchmark_isolation_accepts_permission_request_without_raw_input() {
+        let request = permission_request_with_title_and_raw_input(
+            "mcp.deepscientist-benchmark-container.benchmark_list",
+            None,
+            vec![allow_always_option("benchmark-allow"), reject_option("cancel")],
+        );
+
+        assert_eq!(
+            auto_approve_option_id_with_benchmark(&request, true).as_deref(),
+            Some("benchmark-allow")
+        );
+        assert_eq!(auto_approve_option_id_with_benchmark(&request, false), None);
+    }
+
+    #[test]
+    fn benchmark_isolation_rejects_unknown_dotted_benchmark_tool() {
+        let request = permission_request_with_title_and_raw_input(
+            "mcp.deepscientist-benchmark-container.shell",
+            None,
+            vec![allow_always_option("allow"), reject_option("cancel")],
+        );
+
+        assert_eq!(auto_approve_option_id_with_benchmark(&request, true), None);
+    }
+
+    #[test]
+    fn benchmark_isolation_rejects_raw_identity_that_disagrees_with_title() {
+        let request = permission_request_with_title_and_raw_input(
+            "mcp.deepscientist-benchmark-container.benchmark_list",
+            Some(json!({
+                "server": "deepscientist-benchmark-container",
+                "tool": "benchmark_exec"
+            })),
+            vec![allow_always_option("allow"), reject_option("cancel")],
+        );
+
+        assert_eq!(auto_approve_option_id_with_benchmark(&request, true), None);
     }
 
     #[test]
@@ -673,7 +753,7 @@ mod tests {
         router.start(runtime);
 
         let request = permission_request_with_title_and_raw_input(
-            "Approve MCP tool call",
+            "mcp.deepscientist-benchmark-container.benchmark_list",
             Some(json!({ "server_name": "deepscientist-benchmark-container" })),
             vec![allow_always_option("benchmark-allow"), reject_option("cancel")],
         );
