@@ -2,7 +2,7 @@ use crate::agent_runtime::AgentRuntime;
 use crate::error::AgentError;
 use crate::protocol::acp::{PermissionDecision, PermissionRequest};
 use crate::protocol::events::{AgentStreamEvent, permission_request_to_event_data};
-use agent_client_protocol::schema::PermissionOptionKind as SdkPermissionOptionKind;
+use agent_client_protocol::schema::{PermissionOptionKind as SdkPermissionOptionKind, ToolKind as SdkToolKind};
 use aionui_api_types::TEAM_MCP_SERVER_NAME;
 use aionui_common::Confirmation;
 use std::collections::HashMap;
@@ -210,11 +210,31 @@ fn auto_approve_option_id_with_benchmark(
 ) -> Option<String> {
     let team_server = extract_mcp_server_name(request)
         .is_some_and(|server_name| AUTO_APPROVE_MCP_SERVERS.contains(&server_name.as_str()));
-    let benchmark_server = benchmark_container_isolation && is_exact_benchmark_mcp_request(request);
+    let benchmark_server = benchmark_container_isolation
+        && (is_exact_benchmark_mcp_request(request) || is_correlated_benchmark_mcp_approval(request));
     if !team_server && !benchmark_server {
         return None;
     }
     select_allow_option_id(request)
+}
+
+fn is_correlated_benchmark_mcp_approval(request: &agent_client_protocol::schema::RequestPermissionRequest) -> bool {
+    let fields = &request.tool_call.fields;
+
+    // codex-acp 1.1.2 omits title/rawInput from a permission request when it
+    // correlated the approval with an earlier MCP tool-call update. This path
+    // is enabled only by the operator-owned benchmark isolation flag, whose
+    // runtime contract exposes exactly the five benchmark MCP tools.
+    fields.title.is_none()
+        && fields.raw_input.is_none()
+        && matches!(fields.kind, Some(SdkToolKind::Execute))
+        && !request.tool_call.tool_call_id.to_string().starts_with("elicitation-")
+        && request
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("is_mcp_tool_approval"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
 }
 
 fn is_exact_benchmark_mcp_request(request: &agent_client_protocol::schema::RequestPermissionRequest) -> bool {
@@ -342,6 +362,23 @@ mod tests {
             ),
             options,
         )
+    }
+
+    fn correlated_mcp_permission_request(
+        call_id: &str,
+        mcp_approval: bool,
+        options: Vec<PermissionOption>,
+    ) -> RequestPermissionRequest {
+        let mut request = RequestPermissionRequest::new(
+            "session-1",
+            SdkToolCallUpdate::new(
+                call_id.to_owned(),
+                ToolCallUpdateFields::new().kind(SdkToolKind::Execute),
+            ),
+            options,
+        );
+        request.meta = Some(serde_json::from_value(json!({ "is_mcp_tool_approval": mcp_approval })).unwrap());
+        request
     }
 
     fn allow_always_option(option_id: &'static str) -> PermissionOption {
@@ -500,6 +537,43 @@ mod tests {
             Some("benchmark-allow")
         );
         assert_eq!(auto_approve_option_id_with_benchmark(&request, false), None);
+    }
+
+    #[test]
+    fn benchmark_isolation_accepts_correlated_codex_acp_mcp_approval() {
+        let request = correlated_mcp_permission_request(
+            "call_00_exact",
+            true,
+            vec![allow_once_option("allow"), reject_option("cancel")],
+        );
+
+        assert_eq!(
+            auto_approve_option_id_with_benchmark(&request, true).as_deref(),
+            Some("allow")
+        );
+        assert_eq!(auto_approve_option_id_with_benchmark(&request, false), None);
+    }
+
+    #[test]
+    fn benchmark_isolation_rejects_unmarked_correlated_permission() {
+        let request = correlated_mcp_permission_request(
+            "call_00_exact",
+            false,
+            vec![allow_once_option("allow"), reject_option("cancel")],
+        );
+
+        assert_eq!(auto_approve_option_id_with_benchmark(&request, true), None);
+    }
+
+    #[test]
+    fn benchmark_isolation_rejects_uncorrelated_elicitation_permission() {
+        let request = correlated_mcp_permission_request(
+            "elicitation-deepscientist-benchmark-container",
+            true,
+            vec![allow_once_option("allow"), reject_option("cancel")],
+        );
+
+        assert_eq!(auto_approve_option_id_with_benchmark(&request, true), None);
     }
 
     #[test]
