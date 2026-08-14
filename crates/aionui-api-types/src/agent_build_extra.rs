@@ -71,6 +71,16 @@ pub struct AcpBuildExtra {
     pub mcp_server_ids: Option<Vec<String>>,
     #[serde(default)]
     pub session_mcp_servers: Vec<SessionMcpServer>,
+    /// Operator-owned isolation policy for Claude ACP sessions. This is kept
+    /// separate from prompt/Skill content so an evolvable candidate cannot
+    /// re-enable host filesystem or shell tools.
+    #[serde(default)]
+    pub disable_claude_builtin_tools: bool,
+    /// Operator-owned benchmark policy. When set, the ACP permission router
+    /// may auto-approve only the exact benchmark-container MCP server; it
+    /// never broadens approval for native host tools or other MCP servers.
+    #[serde(default)]
+    pub benchmark_container_isolation: bool,
     #[serde(default)]
     pub user_id: Option<String>,
 }
@@ -147,6 +157,13 @@ mod tests {
     fn acp_build_extra_parses_thought_level_seed() {
         let parsed: AcpBuildExtra = serde_json::from_str(r#"{"backend":"codex","thought_level":"high"}"#).unwrap();
         assert_eq!(parsed.thought_level.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn acp_build_extra_parses_claude_builtin_tool_isolation() {
+        let parsed: AcpBuildExtra =
+            serde_json::from_str(r#"{"backend":"claude","disable_claude_builtin_tools":true}"#).unwrap();
+        assert!(parsed.disable_claude_builtin_tools);
     }
 
     #[test]

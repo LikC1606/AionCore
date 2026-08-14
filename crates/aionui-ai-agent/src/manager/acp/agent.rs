@@ -28,12 +28,14 @@ use aionui_common::{
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
 use super::agent_session_flow::PromptOutcome;
 use super::error_mapping::AcpSendFailure;
+use super::mcp_startup_gate::McpStartupGate;
 
 /// The user-visible body inside an [`AgentError`].
 ///
@@ -367,6 +369,17 @@ pub struct AcpAgentManager {
 
     /// Mutex for serializing session operations (new/load/send).
     session_lock: Mutex<()>,
+
+    /// Bounded first-turn barrier for asynchronously starting MCP servers.
+    /// The gate is armed by session/new or session/load and consumed once;
+    /// subsequent turns reuse the same ACP process without a delay.
+    pub(super) mcp_startup_gate: McpStartupGate,
+
+    /// Prevent concurrent close paths (idle cleanup, Team replacement, and
+    /// explicit close) from sending multiple SIGKILL requests to the same
+    /// ACP process. The process itself remains reusable until one of those
+    /// paths wins this one-shot shutdown transition.
+    process_shutdown_started: AtomicBool,
 }
 
 impl AcpAgentManager {
@@ -465,7 +478,10 @@ impl AcpAgentManager {
                 AgentError::from(e)
             })?,
         };
-        let permission_router = Arc::new(PermissionRouter::new(permission_rx));
+        let permission_router = Arc::new(PermissionRouter::with_benchmark_container_isolation(
+            permission_rx,
+            params.config.benchmark_container_isolation,
+        ));
 
         let snapshot = params.session_snapshot.as_ref();
         let initial_mode = initial_mode_from_params(&params);
@@ -501,10 +517,12 @@ impl AcpAgentManager {
             process,
             protocol,
             session_lock: Mutex::new(()),
+            mcp_startup_gate: McpStartupGate::default(),
             permission_router,
             skill_manager,
             domain_event_tx,
             pipeline,
+            process_shutdown_started: AtomicBool::new(false),
         };
         Ok((manager, domain_event_rx, notification_rx))
     }
@@ -1035,6 +1053,14 @@ impl AcpAgentManager {
     /// flags) and prepends the appropriate block when set.
     async fn ensure_session_and_send(&self, data: &SendMessageData) -> Result<PromptOutcome, AcpSendFailure> {
         let sid = self.ensure_session_opened().await.map_err(AcpSendFailure::from)?;
+        if !self.mcp_startup_gate.wait().await {
+            info!(
+                conversation_id = %self.params.conversation_id,
+                session_id = %sid,
+                "ACP first prompt suppressed because MCP startup wait was cancelled"
+            );
+            return Ok(PromptOutcome::Cancelled { session_id: sid });
+        }
         self.runtime.reset_for_new_turn(ConversationStatus::Running);
         let raw_user_input = data.content.clone();
         let matched_command = {
@@ -1135,7 +1161,18 @@ impl AcpAgentManager {
     #[tracing::instrument(skip_all, fields(conversation_id = %self.params.conversation_id))]
     pub async fn warmup_session(&self) -> Result<(), AgentError> {
         info!("Warming up ACP session");
-        let result = self.ensure_session_opened().await.map(|_sid| ());
+        let result = match self.ensure_session_opened().await {
+            Ok(_) => {
+                if !self.mcp_startup_gate.wait().await {
+                    info!(
+                        conversation_id = %self.params.conversation_id,
+                        "ACP MCP startup wait was cancelled during warmup; keeping session reusable"
+                    );
+                }
+                Ok(())
+            }
+            Err(error) => Err(error),
+        };
         match &result {
             Ok(()) => info!("ACP session warmed up"),
             Err(e) => warn!(error = %ErrorChain(e), "ACP session warmup failed"),
@@ -1291,6 +1328,7 @@ impl crate::agent_task::IAgentTask for AcpAgentManager {
     #[tracing::instrument(skip_all, fields(conversation_id = %self.params.conversation_id))]
     async fn cancel(&self) -> Result<(), AgentError> {
         info!("Cancelling ACP session");
+        self.mcp_startup_gate.cancel_wait();
         let session_id = self.session.read().await.session_id().map(ToOwned::to_owned);
         if let Some(sid) = &session_id {
             self.protocol
@@ -1322,6 +1360,7 @@ impl crate::agent_task::IAgentTask for AcpAgentManager {
 
         // Mark closing to prevent reconnect attempts
         self.permission_router.set_closing();
+        self.mcp_startup_gate.cancel_wait();
 
         let backend = self.params.metadata.backend.as_deref().unwrap_or("unknown");
         let pid = self.process.pid();
@@ -1345,49 +1384,60 @@ impl crate::agent_task::IAgentTask for AcpAgentManager {
             log_idle_acp_cancel_skipped(&self.params.conversation_id, backend, pid);
         }
 
-        let process = Arc::clone(&self.process);
-        let grace = Duration::from_millis(ACP_KILL_GRACE_MS);
-        let conversation_id = self.params.conversation_id.clone();
-        let process_group_id = process.process_group_id();
-        let backend = backend.to_owned();
-        let idle_timeout = matches!(reason, Some(AgentKillReason::IdleTimeout));
+        if self
+            .process_shutdown_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let process = Arc::clone(&self.process);
+            let grace = Duration::from_millis(ACP_KILL_GRACE_MS);
+            let conversation_id = self.params.conversation_id.clone();
+            let process_group_id = process.process_group_id();
+            let backend = backend.to_owned();
+            let idle_timeout = matches!(reason, Some(AgentKillReason::IdleTimeout));
 
-        tokio::spawn(async move {
-            let started_at = now_ms();
-            match process.kill(grace).await {
-                Ok(()) => {
-                    if idle_timeout {
-                        info!(
+            tokio::spawn(async move {
+                let started_at = now_ms();
+                match process.kill(grace).await {
+                    Ok(()) => {
+                        if idle_timeout {
+                            info!(
+                                %conversation_id,
+                                backend,
+                                pid,
+                                process_group_id,
+                                elapsed_ms = now_ms().saturating_sub(started_at),
+                                result = "ok",
+                                "Idle kill: ACP process shutdown completed"
+                            );
+                        } else {
+                            debug!(%conversation_id, pid, process_group_id, "ACP process kill completed");
+                        }
+                    }
+                    Err(e) => {
+                        error!(
                             %conversation_id,
                             backend,
                             pid,
                             process_group_id,
                             elapsed_ms = now_ms().saturating_sub(started_at),
-                            result = "ok",
-                            "Idle kill: ACP process shutdown completed"
+                            result = "error",
+                            error = %ErrorChain(&e),
+                            "ACP process kill failed"
                         );
-                    } else {
-                        debug!(%conversation_id, pid, process_group_id, "ACP process kill completed");
                     }
                 }
-                Err(e) => {
-                    error!(
-                        %conversation_id,
-                        backend,
-                        pid,
-                        process_group_id,
-                        elapsed_ms = now_ms().saturating_sub(started_at),
-                        result = "error",
-                        error = %ErrorChain(&e),
-                        "Idle kill: ACP process shutdown completed"
-                    );
-                }
-            }
-        });
+            });
+        } else {
+            debug!(conversation_id = %self.params.conversation_id, pid, "ACP process shutdown already requested");
+        }
 
         self.permission_router.cancel_all();
 
-        if matches!(reason, Some(AgentKillReason::UserCancelTimeout)) {
+        if matches!(reason, Some(AgentKillReason::ExecutionComplete)) {
+            // The completed turn was already persisted. Releasing its CLI is
+            // operational cleanup, not a new terminal/error event.
+        } else if matches!(reason, Some(AgentKillReason::UserCancelTimeout)) {
             if let Ok(mut session) = self.session.try_write() {
                 session.record_close_reason(Some(CloseReason::UserCancel));
             }
@@ -1415,9 +1465,16 @@ impl AcpAgentManager {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
         let _ = crate::agent_task::IAgentTask::kill(self, reason);
         let process = Arc::clone(&self.process);
-        let grace = Duration::from_millis(ACP_KILL_GRACE_MS);
         Box::pin(async move {
-            let _ = process.kill(grace).await;
+            // `kill` owns the single shutdown request. Waiting here preserves
+            // the awaitable contract without issuing a second SIGKILL, which
+            // previously produced duplicate shutdown errors during session
+            // replacement.
+            let exited = tokio::time::timeout(Duration::from_secs(6), process.wait_for_exit()).await;
+            if exited.is_err() && process.is_running() {
+                process.force_kill_tree();
+                let _ = tokio::time::timeout(Duration::from_secs(1), process.wait_for_exit()).await;
+            }
         })
     }
 

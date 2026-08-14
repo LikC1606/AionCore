@@ -8,6 +8,7 @@ use crate::factory::acp_launch_policy::{AcpLaunchPolicyInput, apply_acp_launch_p
 use crate::factory::context::FactoryContext;
 use crate::manager::acp::{AcpAgentManager, CatalogForwarder};
 use crate::session_context::AcpSessionBuildContext;
+use crate::types::{AIONUI_BASE_URL_ENV, AIONUI_CONVERSATION_ID_ENV, AIONUI_RUNTIME_TOKEN_ENV, AIONUI_USER_ID_ENV};
 use agent_client_protocol::schema::{EnvVariable, HttpHeader, McpServer, McpServerHttp, McpServerSse, McpServerStdio};
 use aionui_api_types::{SessionMcpServer, SessionMcpTransport};
 use aionui_common::CommandSpec;
@@ -21,6 +22,8 @@ use aionui_runtime::{
 use tracing::{info, warn};
 
 use crate::runtime_status::{conversation_acp_tool_runtime_reporter, conversation_runtime_reporter};
+
+const BENCHMARK_CONTAINER_MCP_NAME: &str = "deepscientist-benchmark-container";
 
 pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
@@ -60,7 +63,8 @@ pub(super) async fn build(
             session_snapshot: build_context.session_snapshot.as_ref(),
             runtime_env: &ctx.runtime_env,
         },
-    );
+    )
+    .map_err(AgentError::bad_request)?;
     let session_snapshot = build_context.session_snapshot;
 
     // Load user-configured MCP servers from the DB so they reach
@@ -88,6 +92,7 @@ pub(super) async fn build(
     };
     let mut session_mcp_servers = user_mcp_servers;
     for server in &config.session_mcp_servers {
+        validate_required_session_mcp_server(server, &mcp_capabilities)?;
         if !session_server_supported_by_capabilities(server, &mcp_capabilities) {
             warn!(
                 ctx.conversation_id,
@@ -100,6 +105,11 @@ pub(super) async fn build(
         match session_server_to_sdk_mcp_server(server).await {
             Ok(server) => session_mcp_servers.push(server),
             Err(err) => {
+                if server.name == BENCHMARK_CONTAINER_MCP_NAME {
+                    return Err(AgentError::bad_request(format!(
+                        "benchmark-container MCP descriptor conversion failed: {err}"
+                    )));
+                }
                 warn!(
                     ctx.conversation_id,
                     server_id = %server.id,
@@ -110,6 +120,7 @@ pub(super) async fn build(
             }
         }
     }
+    bind_managed_team_mcp_runtime_env(&mut session_mcp_servers, &ctx.runtime_env);
 
     let params = Arc::new(
         assemble_acp_params(
@@ -165,6 +176,48 @@ pub(super) async fn build(
     deps.acp_agent_service.attach(ctx.conversation_id, domain_rx).await;
 
     Ok(instance)
+}
+
+const MANAGED_TEAM_MCP_PREFIX: &str = "ds-team-";
+const MANAGED_TEAM_RUNTIME_ENV_KEYS: [&str; 4] = [
+    AIONUI_BASE_URL_ENV,
+    AIONUI_USER_ID_ENV,
+    AIONUI_CONVERSATION_ID_ENV,
+    AIONUI_RUNTIME_TOKEN_ENV,
+];
+
+/// ACP agents launch session MCP servers themselves, so the environment of the
+/// parent agent process is not inherited by those stdio children.  Bind the
+/// current Core endpoint and scoped identity directly onto DeepScientist's
+/// managed Team MCP snapshots.  Third-party MCP servers are deliberately left
+/// untouched because the runtime token is a privileged local capability.
+fn bind_managed_team_mcp_runtime_env(servers: &mut [McpServer], runtime_env: &[(String, String)]) {
+    let values: Vec<(&str, &str)> = MANAGED_TEAM_RUNTIME_ENV_KEYS
+        .iter()
+        .filter_map(|key| {
+            runtime_env
+                .iter()
+                .rev()
+                .find(|(candidate, _)| candidate == key)
+                .map(|(_, value)| (*key, value.as_str()))
+        })
+        .collect();
+    if values.is_empty() {
+        return;
+    }
+
+    for server in servers {
+        let McpServer::Stdio(stdio) = server else {
+            continue;
+        };
+        if !stdio.name.starts_with(MANAGED_TEAM_MCP_PREFIX) {
+            continue;
+        }
+        for (key, value) in &values {
+            stdio.env.retain(|entry| entry.name != *key);
+            stdio.env.push(EnvVariable::new(*key, *value));
+        }
+    }
 }
 
 async fn resolve_agent_command_spec(
@@ -511,6 +564,18 @@ fn session_server_supported_by_capabilities(server: &SessionMcpServer, capabilit
     }
 }
 
+fn validate_required_session_mcp_server(
+    server: &SessionMcpServer,
+    capabilities: &AcpMcpCapabilities,
+) -> Result<(), AgentError> {
+    if server.name == BENCHMARK_CONTAINER_MCP_NAME && !session_server_supported_by_capabilities(server, capabilities) {
+        return Err(AgentError::bad_request(
+            "benchmark-container MCP transport is unsupported by the selected ACP agent",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -545,6 +610,105 @@ mod tests {
             created_at: 0,
             updated_at: 0,
         }
+    }
+
+    #[test]
+    fn managed_team_mcp_receives_current_runtime_identity_only() {
+        let mut servers = vec![
+            McpServer::Stdio(McpServerStdio::new("ds-team-runtime-0", "/bin/echo").env(vec![
+                EnvVariable::new(AIONUI_BASE_URL_ENV, "http://127.0.0.1:old"),
+                EnvVariable::new("ROLE_SCOPE", "lead"),
+            ])),
+            McpServer::Stdio(
+                McpServerStdio::new("third-party", "/bin/echo").env(vec![EnvVariable::new("THIRD_PARTY_KEY", "keep")]),
+            ),
+        ];
+        let runtime_env = vec![
+            (AIONUI_BASE_URL_ENV.to_owned(), "http://127.0.0.1:25808".to_owned()),
+            (AIONUI_USER_ID_ENV.to_owned(), "user-1".to_owned()),
+            (AIONUI_CONVERSATION_ID_ENV.to_owned(), "conv-1".to_owned()),
+            (AIONUI_RUNTIME_TOKEN_ENV.to_owned(), "runtime-token".to_owned()),
+        ];
+
+        bind_managed_team_mcp_runtime_env(&mut servers, &runtime_env);
+
+        let McpServer::Stdio(managed) = &servers[0] else {
+            panic!("managed server should remain stdio")
+        };
+        assert_eq!(
+            managed
+                .env
+                .iter()
+                .find(|entry| entry.name == AIONUI_BASE_URL_ENV)
+                .map(|entry| entry.value.as_str()),
+            Some("http://127.0.0.1:25808")
+        );
+        assert_eq!(
+            managed
+                .env
+                .iter()
+                .filter(|entry| entry.name == AIONUI_RUNTIME_TOKEN_ENV)
+                .count(),
+            1
+        );
+        assert!(
+            managed
+                .env
+                .iter()
+                .any(|entry| entry.name == "ROLE_SCOPE" && entry.value == "lead")
+        );
+
+        let McpServer::Stdio(third_party) = &servers[1] else {
+            panic!("third-party server should remain stdio")
+        };
+        assert_eq!(third_party.env.len(), 1);
+        assert_eq!(third_party.env[0].name, "THIRD_PARTY_KEY");
+    }
+
+    #[test]
+    fn benchmark_session_mcp_rejects_an_unsupported_transport() {
+        let server = SessionMcpServer {
+            id: BENCHMARK_CONTAINER_MCP_NAME.to_owned(),
+            name: BENCHMARK_CONTAINER_MCP_NAME.to_owned(),
+            transport: SessionMcpTransport::Stdio {
+                command: "/bin/echo".to_owned(),
+                args: Vec::new(),
+                env: std::collections::HashMap::new(),
+            },
+        };
+        let capabilities = AcpMcpCapabilities {
+            stdio: false,
+            http: true,
+            sse: true,
+        };
+
+        let error = validate_required_session_mcp_server(&server, &capabilities).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("benchmark-container MCP transport is unsupported")
+        );
+    }
+
+    #[test]
+    fn ordinary_session_mcp_keeps_compatibility_skip_semantics() {
+        let server = SessionMcpServer {
+            id: "optional-tool".to_owned(),
+            name: "optional-tool".to_owned(),
+            transport: SessionMcpTransport::Stdio {
+                command: "/bin/echo".to_owned(),
+                args: Vec::new(),
+                env: std::collections::HashMap::new(),
+            },
+        };
+        let capabilities = AcpMcpCapabilities {
+            stdio: false,
+            http: true,
+            sse: true,
+        };
+
+        assert!(validate_required_session_mcp_server(&server, &capabilities).is_ok());
+        assert!(!session_server_supported_by_capabilities(&server, &capabilities));
     }
 
     fn stdio_config_for_existing_command() -> String {

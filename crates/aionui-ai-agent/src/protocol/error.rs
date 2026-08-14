@@ -55,6 +55,7 @@ impl CloseReason {
             CloseReason::UserCancel => "Conversation cancelled".to_owned(),
             CloseReason::Killed { reason } => match reason {
                 Some(AgentKillReason::IdleTimeout) => "Agent killed: idle timeout".to_owned(),
+                Some(AgentKillReason::ExecutionComplete) => "Agent released after execution completed".to_owned(),
                 Some(AgentKillReason::AgentErrorRecovery) => "Agent killed: error recovery".to_owned(),
                 Some(AgentKillReason::TeamMcpRebuild) => "Agent killed: team MCP rebuild".to_owned(),
                 Some(AgentKillReason::TeamDeleted) => "Agent killed: team deleted".to_owned(),
@@ -290,6 +291,13 @@ impl AcpError {
     /// See ELECTRON-1HQ.
     /// `context` carries the session ID or method name for diagnostics.
     pub fn from_sdk(err: SdkError, context: &str) -> Self {
+        // Codex reports an expired/missing rollout as an internal error with
+        // the thread id nested in `data.details` (rather than using ACP's
+        // SessionNotFound code). Treat it as the same recoverable stale
+        // session condition before mapping the numeric error code.
+        if let Some(sid) = extract_session_not_found(err.data.as_ref()) {
+            return AcpError::SessionNotFound { session_id: sid };
+        }
         match err.code {
             ErrorCode::AuthRequired => AcpError::AuthRequired,
             ErrorCode::ParseError => AcpError::ProtocolParseError { message: err.message },
@@ -367,10 +375,21 @@ fn extract_session_not_found(data: Option<&serde_json::Value>) -> Option<String>
         serde_json::Value::String(s) => serde_json::from_str(s).ok()?,
         _ => return None,
     };
-    let msg = obj.get("error")?.as_str()?;
-    let prefix = "Session not found: ";
-    let sid = msg.strip_prefix(prefix)?.trim();
-    if sid.is_empty() { None } else { Some(sid.to_owned()) }
+    let messages = ["error", "details", "message"];
+    for key in messages {
+        let Some(msg) = obj.get(key).and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let sid = msg
+            .strip_prefix("Session not found: ")
+            .or_else(|| msg.strip_prefix("no rollout found for thread id "))
+            .map(str::trim)
+            .filter(|sid| !sid.is_empty());
+        if let Some(sid) = sid {
+            return Some(sid.to_owned());
+        }
+    }
+    None
 }
 
 fn extract_resource_not_found(data: Option<&serde_json::Value>) -> Option<String> {
@@ -665,6 +684,17 @@ mod tests {
         let acp = AcpError::from_sdk(sdk_err, "ctx");
         match acp {
             AcpError::SessionNotFound { session_id } => assert_eq!(session_id, "sess-ie"),
+            other => panic!("expected SessionNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_sdk_internal_with_codex_missing_rollout_data() {
+        let sdk_err = SdkError::internal_error().data(serde_json::json!({
+            "details": "no rollout found for thread id thread-stale"
+        }));
+        match AcpError::from_sdk(sdk_err, "session/load") {
+            AcpError::SessionNotFound { session_id } => assert_eq!(session_id, "thread-stale"),
             other => panic!("expected SessionNotFound, got {other:?}"),
         }
     }

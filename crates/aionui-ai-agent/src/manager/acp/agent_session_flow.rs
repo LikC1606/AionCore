@@ -40,6 +40,14 @@ impl AcpAgentManager {
         let req = self.params.new_session_request();
         let session_response = self.protocol.new_session(req).await?;
 
+        if self.mcp_startup_gate.arm_if_needed(self.params.mcp_servers.len()).await {
+            tracing::info!(
+                conversation_id = %self.params.conversation_id,
+                mcp_server_count = self.params.mcp_servers.len(),
+                "ACP MCP startup barrier armed after session/new"
+            );
+        }
+
         let sid = session_response.session_id.to_string();
 
         {
@@ -118,14 +126,7 @@ impl AcpAgentManager {
     /// subsequent `session/prompt` to surface the same error to the user.
     pub(super) async fn open_session_resume(&self, session_id: &str) -> Result<String, AgentError> {
         if agent_metadata_uses_meta_resume(&self.params.metadata) {
-            let mut meta = serde_json::Map::new();
-            let mut claude_code = serde_json::Map::new();
-            let mut options = serde_json::Map::new();
-            options.insert("resume".into(), Value::String(session_id.to_owned()));
-            claude_code.insert("options".into(), Value::Object(options));
-            meta.insert("claudeCode".into(), Value::Object(claude_code));
-
-            let req = self.params.new_session_request().meta(meta);
+            let req = self.params.new_session_request_with_resume(Some(session_id));
             let new_response = match self.protocol.new_session(req).await {
                 Ok(r) => r,
                 Err(e) if is_missing_resumed_session(&e, session_id) => {
@@ -133,6 +134,13 @@ impl AcpAgentManager {
                 }
                 Err(e) => return Err(e.into()),
             };
+            if self.mcp_startup_gate.arm_if_needed(self.params.mcp_servers.len()).await {
+                tracing::info!(
+                    conversation_id = %self.params.conversation_id,
+                    mcp_server_count = self.params.mcp_servers.len(),
+                    "ACP MCP startup barrier armed after resumed session/new"
+                );
+            }
             let new_sid = new_response.session_id.to_string();
 
             {
@@ -185,6 +193,13 @@ impl AcpAgentManager {
                 }
                 Err(e) => return Err(e.into()),
             };
+            if self.mcp_startup_gate.arm_if_needed(self.params.mcp_servers.len()).await {
+                tracing::info!(
+                    conversation_id = %self.params.conversation_id,
+                    mcp_server_count = self.params.mcp_servers.len(),
+                    "ACP MCP startup barrier armed after session/load"
+                );
+            }
 
             {
                 let mut session = self.session.write().await;

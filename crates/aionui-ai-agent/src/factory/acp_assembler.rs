@@ -3,6 +3,7 @@ use agent_client_protocol::schema::{EnvVariable, McpServer, McpServerStdio, NewS
 use aionui_api_types::AgentMetadata;
 use aionui_api_types::{AcpBuildExtra, TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig};
 use aionui_common::CommandSpec;
+use serde_json::{Map, Value};
 use std::path::PathBuf;
 
 /// Pre-computed workspace information.
@@ -38,12 +39,38 @@ pub struct AcpSessionParams {
 impl AcpSessionParams {
     /// Build a `NewSessionRequest` using the pre-computed MCP servers.
     pub fn new_session_request(&self) -> NewSessionRequest {
-        let req = NewSessionRequest::new(&self.workspace.path);
+        self.new_session_request_with_resume(None)
+    }
+
+    /// Build a fresh or Claude-meta-resume request while preserving the
+    /// operator-owned tool policy on both paths.
+    pub fn new_session_request_with_resume(&self, resume: Option<&str>) -> NewSessionRequest {
+        let mut req = NewSessionRequest::new(&self.workspace.path);
         if self.mcp_servers.is_empty() {
-            req
+            // Keep the payload compact when the frozen MCP snapshot is empty.
         } else {
-            req.mcp_servers(self.mcp_servers.clone())
+            req = req.mcp_servers(self.mcp_servers.clone());
         }
+
+        if self.metadata.backend.as_deref() == Some("claude")
+            && (self.config.disable_claude_builtin_tools || resume.is_some())
+        {
+            let mut options = Map::new();
+            if self.config.disable_claude_builtin_tools {
+                options.insert("tools".into(), Value::Array(Vec::new()));
+                options.insert("settingSources".into(), Value::Array(Vec::new()));
+                options.insert("strictMcpConfig".into(), Value::Bool(true));
+            }
+            if let Some(session_id) = resume {
+                options.insert("resume".into(), Value::String(session_id.to_owned()));
+            }
+            let mut claude_code = Map::new();
+            claude_code.insert("options".into(), Value::Object(options));
+            let mut meta = Map::new();
+            meta.insert("claudeCode".into(), Value::Object(claude_code));
+            req = req.meta(meta);
+        }
+        req
     }
 }
 
@@ -222,6 +249,54 @@ mod tests {
             Some(&["mcp-docs".to_owned()][..])
         );
         assert_eq!(params.mcp_servers.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn claude_session_request_disables_builtin_tools_on_new_and_resume() {
+        let config = AcpBuildExtra {
+            backend: Some("claude".into()),
+            disable_claude_builtin_tools: true,
+            ..Default::default()
+        };
+        let params = assemble_acp_params(
+            "conv-1".into(),
+            WorkspaceInfo {
+                path: "/tmp/workspace".into(),
+                is_custom: false,
+            },
+            test_metadata(),
+            CommandSpec::default(),
+            config,
+            Vec::new(),
+            None,
+            PathBuf::from("/tmp/data"),
+            false,
+        )
+        .await;
+
+        for request in [
+            params.new_session_request(),
+            params.new_session_request_with_resume(Some("session-1")),
+        ] {
+            let json = serde_json::to_value(request).unwrap();
+            assert_eq!(
+                json.pointer("/_meta/claudeCode/options/tools"),
+                Some(&serde_json::json!([]))
+            );
+            assert_eq!(
+                json.pointer("/_meta/claudeCode/options/settingSources"),
+                Some(&serde_json::json!([]))
+            );
+            assert_eq!(
+                json.pointer("/_meta/claudeCode/options/strictMcpConfig"),
+                Some(&serde_json::json!(true))
+            );
+        }
+        let resumed = serde_json::to_value(params.new_session_request_with_resume(Some("session-1"))).unwrap();
+        assert_eq!(
+            resumed.pointer("/_meta/claudeCode/options/resume"),
+            Some(&serde_json::json!("session-1"))
+        );
     }
 
     #[test]

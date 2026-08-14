@@ -3,10 +3,10 @@ use crate::manager::acp::mode_normalize::normalize_requested_mode;
 use crate::shared_kernel::PersistedSessionState;
 use aionui_api_types::{AcpBuildExtra, AgentMetadata};
 use aionui_common::CommandSpec;
+use serde_json::json;
 
 const CODEX_CONFIG_FLAG: &str = "-c";
-const CODEX_ENV_POLICY_INHERIT_ALL: &str = "shell_environment_policy.inherit=all";
-const CODEX_ENV_POLICY_CLEAR_INCLUDE_ONLY: &str = "shell_environment_policy.include_only=[]";
+const CODEX_CONFIG_ENV: &str = "CODEX_CONFIG";
 const CODEX_WINDOWS_UNELEVATED_SANDBOX: &str = "windows.sandbox=\"unelevated\"";
 
 pub(super) struct AcpLaunchPolicyInput<'a> {
@@ -16,14 +16,16 @@ pub(super) struct AcpLaunchPolicyInput<'a> {
     pub runtime_env: &'a [(String, String)],
 }
 
-pub(super) fn apply_acp_launch_policy(command_spec: &mut CommandSpec, input: AcpLaunchPolicyInput<'_>) {
-    apply_codex_runtime_config_args(
-        command_spec,
-        input.metadata,
-        initial_mode_from_build_context(input.metadata, input.config, input.session_snapshot).as_deref(),
-    );
+pub(super) fn apply_acp_launch_policy(
+    command_spec: &mut CommandSpec,
+    input: AcpLaunchPolicyInput<'_>,
+) -> Result<(), String> {
+    let initial_mode = initial_mode_from_build_context(input.metadata, input.config, input.session_snapshot);
+    apply_codex_runtime_config_args(command_spec, input.metadata, initial_mode.as_deref());
     append_runtime_env(command_spec, input.runtime_env);
+    append_codex_config_env(command_spec, input.metadata, initial_mode.as_deref(), input.runtime_env)?;
     append_claude_provider_env(command_spec, input.metadata);
+    Ok(())
 }
 
 fn append_runtime_env(command_spec: &mut CommandSpec, runtime_env: &[(String, String)]) {
@@ -37,6 +39,19 @@ fn append_runtime_env(command_spec: &mut CommandSpec, runtime_env: &[(String, St
 
 fn append_claude_provider_env(command_spec: &mut CommandSpec, metadata: &AgentMetadata) {
     if metadata.backend.as_deref() != Some("claude") {
+        return;
+    }
+
+    // A run-scoped provider environment is authoritative. Mixing it with the
+    // user's global cc-switch profile makes headless experiments depend on
+    // ambient desktop state and can silently replace credentials or routing.
+    // The final process environment still inherits these run-scoped values via
+    // agent_process_env; this guard only prevents a later cc-switch override.
+    if ["ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some())
+    {
+        tracing::info!("cc-switch: skipped because run-scoped Claude provider env is present");
         return;
     }
 
@@ -81,14 +96,49 @@ fn apply_codex_runtime_config_args(
         return;
     }
 
-    push_codex_config_arg(command_spec, CODEX_ENV_POLICY_INHERIT_ALL);
-    push_codex_config_arg(command_spec, CODEX_ENV_POLICY_CLEAR_INCLUDE_ONLY);
-
     let sandbox_mode = codex_sandbox_mode_for_requested_mode(initial_mode);
     push_codex_config_arg(command_spec, &format!("sandbox_mode=\"{sandbox_mode}\""));
     if sandbox_mode == "danger-full-access" {
         push_codex_config_arg(command_spec, CODEX_WINDOWS_UNELEVATED_SANDBOX);
     }
+}
+
+/// `codex-acp` 1.1.2 consumes configuration through its documented
+/// `CODEX_CONFIG` JSON environment variable. Its ACP entrypoint does not
+/// forward Codex's `-c` flags, so shell isolation must be injected here and
+/// bound to one deterministic object. Refuse any caller-provided value to
+/// avoid an ambiguous merge that could re-enable snapshots or login shells.
+fn append_codex_config_env(
+    command_spec: &mut CommandSpec,
+    metadata: &AgentMetadata,
+    initial_mode: Option<&str>,
+    runtime_env: &[(String, String)],
+) -> Result<(), String> {
+    if metadata.backend.as_deref() != Some("codex") {
+        return Ok(());
+    }
+    if command_spec.env.iter().any(|entry| entry.name == CODEX_CONFIG_ENV)
+        || runtime_env.iter().any(|(name, _)| name == CODEX_CONFIG_ENV)
+    {
+        return Err("Codex launch rejects a caller-provided CODEX_CONFIG".to_owned());
+    }
+    let sandbox_mode = codex_sandbox_mode_for_requested_mode(initial_mode);
+    let config = json!({
+        "allow_login_shell": false,
+        "shell_environment_policy": {
+            "inherit": "all",
+            "experimental_use_profile": false,
+            "include_only": [],
+            "exclude": ["DEEPSEEK_API_KEY"],
+        },
+        "features": {"shell_snapshot": false},
+        "sandbox_mode": sandbox_mode,
+    });
+    command_spec.env.push(aionui_common::EnvVar {
+        name: CODEX_CONFIG_ENV.to_owned(),
+        value: config.to_string(),
+    });
+    Ok(())
 }
 
 fn push_codex_config_arg(command_spec: &mut CommandSpec, value: &str) {
@@ -168,16 +218,13 @@ mod tests {
                 session_snapshot: None,
                 runtime_env: &[("AIONUI_CONVERSATION_ID".into(), "conv-1".into())],
             },
-        );
+        )
+        .expect("Codex launch policy should materialize CODEX_CONFIG");
 
         assert_eq!(
             command_spec.args,
             vec![
                 "codex-acp.js",
-                "-c",
-                "shell_environment_policy.inherit=all",
-                "-c",
-                "shell_environment_policy.include_only=[]",
                 "-c",
                 "sandbox_mode=\"danger-full-access\"",
                 "-c",
@@ -214,7 +261,8 @@ mod tests {
                 session_snapshot: None,
                 runtime_env: &[],
             },
-        );
+        )
+        .expect("Codex launch policy should materialize CODEX_CONFIG");
 
         assert!(
             command_spec
@@ -228,6 +276,86 @@ mod tests {
                 .iter()
                 .any(|arg| arg == CODEX_WINDOWS_UNELEVATED_SANDBOX)
         );
+    }
+
+    #[test]
+    fn apply_acp_launch_policy_materializes_codex_config_shell_lock() {
+        let mut command_spec = CommandSpec {
+            command: "node".into(),
+            args: vec!["codex-acp.js".into()],
+            env: vec![],
+            cwd: None,
+        };
+        let metadata = agent_metadata_with_backend(Some("codex"));
+
+        apply_acp_launch_policy(
+            &mut command_spec,
+            AcpLaunchPolicyInput {
+                metadata: &metadata,
+                config: &AcpBuildExtra::default(),
+                session_snapshot: None,
+                runtime_env: &[],
+            },
+        )
+        .expect("Codex launch policy should materialize CODEX_CONFIG");
+
+        let config = command_spec
+            .env
+            .iter()
+            .find(|entry| entry.name == CODEX_CONFIG_ENV)
+            .expect("Codex launch must inject CODEX_CONFIG");
+        let value: serde_json::Value = serde_json::from_str(&config.value).expect("valid CODEX_CONFIG JSON");
+        assert_eq!(value["allow_login_shell"], false);
+        assert_eq!(value["features"]["shell_snapshot"], false);
+        assert_eq!(value["shell_environment_policy"]["exclude"][0], "DEEPSEEK_API_KEY");
+        assert_eq!(value["shell_environment_policy"]["include_only"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn apply_acp_launch_policy_rejects_conflicting_codex_config() {
+        let mut command_spec = CommandSpec {
+            command: "node".into(),
+            args: vec!["codex-acp.js".into()],
+            env: vec![aionui_common::EnvVar {
+                name: CODEX_CONFIG_ENV.into(),
+                value: "{}".into(),
+            }],
+            cwd: None,
+        };
+        let metadata = agent_metadata_with_backend(Some("codex"));
+        let error = apply_acp_launch_policy(
+            &mut command_spec,
+            AcpLaunchPolicyInput {
+                metadata: &metadata,
+                config: &AcpBuildExtra::default(),
+                session_snapshot: None,
+                runtime_env: &[],
+            },
+        )
+        .expect_err("conflicting CODEX_CONFIG must fail closed");
+        assert!(error.contains("CODEX_CONFIG"));
+    }
+
+    #[test]
+    fn apply_acp_launch_policy_rejects_runtime_env_codex_config_override() {
+        let mut command_spec = CommandSpec {
+            command: "node".into(),
+            args: vec!["codex-acp.js".into()],
+            env: vec![],
+            cwd: None,
+        };
+        let metadata = agent_metadata_with_backend(Some("codex"));
+        let error = apply_acp_launch_policy(
+            &mut command_spec,
+            AcpLaunchPolicyInput {
+                metadata: &metadata,
+                config: &AcpBuildExtra::default(),
+                session_snapshot: None,
+                runtime_env: &[(CODEX_CONFIG_ENV.into(), "{\"features\":{}}".into())],
+            },
+        )
+        .expect_err("runtime CODEX_CONFIG override must fail closed");
+        assert!(error.contains("CODEX_CONFIG"));
     }
 
     #[test]
@@ -252,7 +380,8 @@ mod tests {
                 session_snapshot: Some(&snapshot),
                 runtime_env: &[],
             },
-        );
+        )
+        .expect("Codex launch policy should materialize CODEX_CONFIG");
 
         assert!(
             command_spec
@@ -287,7 +416,8 @@ mod tests {
                 session_snapshot: None,
                 runtime_env: &[],
             },
-        );
+        )
+        .expect("non-Codex launch policy should succeed");
 
         assert_eq!(command_spec.args, vec!["claude-agent-acp.js"]);
     }

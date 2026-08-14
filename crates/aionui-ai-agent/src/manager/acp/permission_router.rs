@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{debug, info};
 
+const BENCHMARK_CONTAINER_MCP_SERVER_NAME: &str = "deepscientist-benchmark-container";
 const AUTO_APPROVE_MCP_SERVERS: &[&str] = &[TEAM_MCP_SERVER_NAME];
 
 struct PendingPermission {
@@ -31,15 +32,27 @@ pub struct PermissionRouter {
     pending_permissions: StdMutex<HashMap<String, PendingPermission>>,
     /// Whether a graceful shutdown is in progress.
     closing: AtomicBool,
+    benchmark_container_isolation: bool,
 }
 
 impl PermissionRouter {
     /// Create a new permission router.
     pub fn new(permission_rx: mpsc::Receiver<PermissionRequest>) -> Self {
+        Self::with_benchmark_container_isolation(permission_rx, false)
+    }
+
+    /// Construct a router with the operator-owned benchmark MCP auto-approval
+    /// gate. The flag is supplied from the immutable ACP build extra, never
+    /// from model output or prompt content.
+    pub fn with_benchmark_container_isolation(
+        permission_rx: mpsc::Receiver<PermissionRequest>,
+        benchmark_container_isolation: bool,
+    ) -> Self {
         Self {
             permission_rx: Mutex::new(permission_rx),
             pending_permissions: StdMutex::new(HashMap::new()),
             closing: AtomicBool::new(false),
+            benchmark_container_isolation,
         }
     }
 
@@ -64,7 +77,9 @@ impl PermissionRouter {
                 let call_id = perm_req.request.tool_call.tool_call_id.to_string();
 
                 // Auto-approve team MCP tools without user interaction.
-                if let Some(option_id) = auto_approve_option_id(&perm_req.request) {
+                if let Some(option_id) =
+                    auto_approve_option_id_with_benchmark(&perm_req.request, this.benchmark_container_isolation)
+                {
                     info!(
                         conversation_id = %runtime.conversation_id(),
                         call_id,
@@ -177,9 +192,19 @@ fn is_auto_approve_tool(request: &agent_client_protocol::schema::RequestPermissi
     auto_approve_option_id(request).is_some()
 }
 
+#[cfg(test)]
 fn auto_approve_option_id(request: &agent_client_protocol::schema::RequestPermissionRequest) -> Option<String> {
+    auto_approve_option_id_with_benchmark(request, false)
+}
+
+fn auto_approve_option_id_with_benchmark(
+    request: &agent_client_protocol::schema::RequestPermissionRequest,
+    benchmark_container_isolation: bool,
+) -> Option<String> {
     let server_name = extract_mcp_server_name(request)?;
-    if !AUTO_APPROVE_MCP_SERVERS.contains(&server_name.as_str()) {
+    let team_server = AUTO_APPROVE_MCP_SERVERS.contains(&server_name.as_str());
+    let benchmark_server = benchmark_container_isolation && server_name == BENCHMARK_CONTAINER_MCP_SERVER_NAME;
+    if !team_server && !benchmark_server {
         return None;
     }
     select_allow_option_id(request)
@@ -214,15 +239,30 @@ fn extract_mcp_server_name(request: &agent_client_protocol::schema::RequestPermi
 fn extract_mcp_server_from_raw_input(
     request: &agent_client_protocol::schema::RequestPermissionRequest,
 ) -> Option<String> {
-    request
-        .tool_call
-        .fields
-        .raw_input
-        .as_ref()
-        .and_then(|raw_input| raw_input.get("server_name"))
+    let fields = &request.tool_call.fields;
+    let raw_input = fields.raw_input.as_ref()?;
+    if let Some(server_name) = raw_input
+        .get("server_name")
         .and_then(serde_json::Value::as_str)
         .filter(|server_name| !server_name.is_empty())
-        .map(str::to_owned)
+    {
+        return Some(server_name.to_owned());
+    }
+
+    // Codex ACP 0.146 emits the MCP identity as `server` + `tool` and
+    // renders the corresponding title as `mcp.<server>.<tool>`. Require all
+    // three values to agree so a native tool cannot gain approval merely by
+    // supplying an unrelated `server` argument.
+    let server = raw_input
+        .get("server")
+        .and_then(serde_json::Value::as_str)
+        .filter(|server| !server.is_empty())?;
+    let tool = raw_input
+        .get("tool")
+        .and_then(serde_json::Value::as_str)
+        .filter(|tool| !tool.is_empty())?;
+    let title = fields.title.as_deref()?;
+    (title == format!("mcp.{server}.{tool}")).then(|| server.to_owned())
 }
 
 fn extract_mcp_server_from_prefixed_title(title: &str) -> Option<&str> {
@@ -372,6 +412,64 @@ mod tests {
         );
 
         assert!(!is_auto_approve_tool(&request));
+    }
+
+    #[test]
+    fn benchmark_isolation_auto_approves_only_the_reserved_server() {
+        let request = permission_request_with_title_and_raw_input(
+            "Approve MCP tool call",
+            Some(json!({ "server_name": "deepscientist-benchmark-container" })),
+            vec![allow_always_option("benchmark-allow"), reject_option("cancel")],
+        );
+
+        assert_eq!(
+            auto_approve_option_id_with_benchmark(&request, true).as_deref(),
+            Some("benchmark-allow")
+        );
+        assert_eq!(auto_approve_option_id_with_benchmark(&request, false), None);
+    }
+
+    #[test]
+    fn benchmark_isolation_accepts_the_codex_0_146_mcp_wire_shape() {
+        let request = permission_request_with_title_and_raw_input(
+            "mcp.deepscientist-benchmark-container.benchmark_list",
+            Some(json!({
+                "arguments": { "path": "" },
+                "server": "deepscientist-benchmark-container",
+                "tool": "benchmark_list"
+            })),
+            vec![allow_always_option("benchmark-allow"), reject_option("cancel")],
+        );
+
+        assert_eq!(
+            auto_approve_option_id_with_benchmark(&request, true).as_deref(),
+            Some("benchmark-allow")
+        );
+    }
+
+    #[test]
+    fn benchmark_isolation_rejects_a_mismatched_codex_mcp_title() {
+        let request = permission_request_with_title_and_raw_input(
+            "shell",
+            Some(json!({
+                "server": "deepscientist-benchmark-container",
+                "tool": "benchmark_list"
+            })),
+            vec![allow_always_option("allow"), reject_option("cancel")],
+        );
+
+        assert_eq!(auto_approve_option_id_with_benchmark(&request, true), None);
+    }
+
+    #[test]
+    fn benchmark_isolation_does_not_auto_approve_a_lookalike_server() {
+        let request = permission_request_with_title_and_raw_input(
+            "Approve MCP tool call",
+            Some(json!({ "server_name": "deepscientist-benchmark-container-evil" })),
+            vec![allow_always_option("allow"), reject_option("cancel")],
+        );
+
+        assert_eq!(auto_approve_option_id_with_benchmark(&request, true), None);
     }
 
     #[test]
@@ -560,6 +658,38 @@ mod tests {
         assert!(matches!(
             decision,
             PermissionDecision::Selected { option_id } if option_id == "approved-for-session"
+        ));
+        assert!(router.get_confirmations().is_empty());
+    }
+
+    #[tokio::test]
+    async fn start_auto_approves_benchmark_mcp_only_when_isolation_is_enabled() {
+        let (permission_tx, permission_rx) = mpsc::channel(1);
+        let router = Arc::new(PermissionRouter::with_benchmark_container_isolation(
+            permission_rx,
+            true,
+        ));
+        let runtime = AgentRuntime::new("conv-1", "/tmp/workspace", 8);
+        router.start(runtime);
+
+        let request = permission_request_with_title_and_raw_input(
+            "Approve MCP tool call",
+            Some(json!({ "server_name": "deepscientist-benchmark-container" })),
+            vec![allow_always_option("benchmark-allow"), reject_option("cancel")],
+        );
+        let (response_tx, response_rx) = oneshot::channel();
+        permission_tx
+            .send(PermissionRequest { request, response_tx })
+            .await
+            .expect("permission request should be accepted");
+
+        let decision = tokio::time::timeout(Duration::from_secs(1), response_rx)
+            .await
+            .expect("benchmark auto approval should respond")
+            .expect("benchmark auto approval responder should stay open");
+        assert!(matches!(
+            decision,
+            PermissionDecision::Selected { option_id } if option_id == "benchmark-allow"
         ));
         assert!(router.get_confirmations().is_empty());
     }

@@ -227,6 +227,10 @@ pub enum RemoteAgentStatus {
 #[serde(rename_all = "snake_case")]
 pub enum AgentKillReason {
     IdleTimeout,
+    /// A headless executor durably captured a completed turn and is releasing
+    /// only the in-memory agent process. Conversation messages, artifacts,
+    /// and ACP resume state remain persisted.
+    ExecutionComplete,
     /// The ACP session ended a turn with a terminal error. The conversation is
     /// preserved; only the in-memory agent task is recycled before the next send
     /// so a potentially desynchronised upstream session is not reused.
