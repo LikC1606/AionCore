@@ -1,7 +1,7 @@
 use aionui_db::{
-    ConversationFilters, ConversationRowUpdate, IConversationRepository, MessagePageCursor, MessagePageDirection,
-    MessagePageParams, MessageRowUpdate, SqliteConversationRepository, init_database_memory, models::ConversationRow,
-    models::MessageRow,
+    ConversationFilters, ConversationMessageIdempotencyParams, ConversationMessageWriteResult, ConversationRowUpdate,
+    IConversationRepository, MessagePageCursor, MessagePageDirection, MessagePageParams, MessageRowUpdate,
+    SqliteConversationRepository, init_database_memory, models::ConversationRow, models::MessageRow,
 };
 
 const USER_ID: &str = "system_default_user";
@@ -44,6 +44,75 @@ fn make_message(conv_id: &str, content: &str) -> MessageRow {
         hidden: false,
         created_at: now,
     }
+}
+
+#[tokio::test]
+async fn list_team_bound_returns_only_valid_persisted_team_bindings() {
+    let (repo, _db) = setup().await;
+    let ordinary = make_conversation("ordinary");
+    let mut team_bound = make_conversation("team-bound");
+    team_bound.extra = serde_json::json!({ "teamId": "team-1", "slot_id": "lead" }).to_string();
+    repo.create(&ordinary).await.unwrap();
+    repo.create(&team_bound).await.unwrap();
+
+    let rows = repo.list_team_bound().await.unwrap();
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, team_bound.id);
+}
+
+#[tokio::test]
+async fn idempotent_message_write_reuses_receipt_and_rejects_changed_payload() {
+    let (repo, _db) = setup().await;
+    let conv = make_conversation("idempotent-message");
+    repo.create(&conv).await.unwrap();
+    let first = make_message(&conv.id, "hello");
+    let replay = make_message(&conv.id, "hello");
+    let identity = ConversationMessageIdempotencyParams {
+        key: "turn-request-1",
+        request_fingerprint: "fingerprint-1",
+        turn_id: "turn-original",
+    };
+
+    assert_eq!(
+        repo.insert_message_idempotent(&first, &identity).await.unwrap(),
+        ConversationMessageWriteResult::Inserted
+    );
+    let result = repo.insert_message_idempotent(&replay, &identity).await.unwrap();
+    let ConversationMessageWriteResult::Existing(receipt) = result else {
+        panic!("expected existing receipt");
+    };
+    assert_eq!(receipt.message_id, first.id);
+    assert_eq!(receipt.turn_id, "turn-original");
+
+    let conflict = repo
+        .insert_message_idempotent(
+            &replay,
+            &ConversationMessageIdempotencyParams {
+                request_fingerprint: "fingerprint-2",
+                ..identity
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        conflict,
+        ConversationMessageWriteResult::IdempotencyConflict {
+            existing_request_fingerprint
+        } if existing_request_fingerprint == "fingerprint-1"
+    ));
+
+    let messages = repo
+        .list_messages_page(
+            &conv.id,
+            &MessagePageParams {
+                limit: 20,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(messages.items.len(), 1);
 }
 
 fn make_artifact(conv_id: &str, artifact_id: &str) -> aionui_db::ConversationArtifactRow {

@@ -6,13 +6,13 @@ use aionui_conversation::{
     ConversationAgentTurnRequest, ConversationAgentTurnStarted, ConversationAgentTurnStatus, ConversationError,
     ConversationService,
 };
-use aionui_db::IConversationRepository;
 use aionui_db::models::MessageRow;
+use aionui_db::{ConversationFilters, IConversationRepository};
 use aionui_team::{
     AgentTurnCancellationPort, AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnOutcome, AgentTurnRequest,
-    AgentTurnStarted, AgentTurnStatus, TeamConversationBindingLookup, TeamConversationCreateRequest,
-    TeamConversationCreateResult, TeamConversationLookupPort, TeamConversationProvisioningPort, TeamError,
-    TeamProjectionMessageStore,
+    AgentTurnStarted, AgentTurnStatus, TeamConversationBindingLookup, TeamConversationCleanupCandidate,
+    TeamConversationCreateRequest, TeamConversationCreateResult, TeamConversationLookupPort,
+    TeamConversationProvisioningPort, TeamError, TeamProjectionMessageStore,
 };
 use async_trait::async_trait;
 use tracing::info;
@@ -282,6 +282,59 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
             .delete(user_id, conversation_id)
             .await
             .map_err(map_conversation_update_error)
+    }
+
+    async fn list_team_conversation_ids(&self, user_id: &str, team_id: &str) -> Result<Vec<String>, TeamError> {
+        let mut cursor = None;
+        let mut conversation_ids = Vec::new();
+        loop {
+            let page = self
+                .conversation_repo
+                .list_paginated(
+                    user_id,
+                    &ConversationFilters {
+                        cursor: cursor.clone(),
+                        limit: 100,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            for row in &page.items {
+                if aionui_api_types::TeamSessionBinding::team_id_marker_from_extra_str(&row.extra).as_deref()
+                    == Some(team_id)
+                {
+                    conversation_ids.push(row.id.clone());
+                }
+            }
+            if !page.has_more {
+                break;
+            }
+            cursor = page.items.last().map(|row| row.id.clone());
+            if cursor.is_none() {
+                break;
+            }
+        }
+        Ok(conversation_ids)
+    }
+
+    async fn list_team_conversation_cleanup_candidates(
+        &self,
+    ) -> Result<Vec<TeamConversationCleanupCandidate>, TeamError> {
+        Ok(self
+            .conversation_repo
+            .list_team_bound()
+            .await?
+            .into_iter()
+            .filter_map(|row| {
+                let team_id = aionui_api_types::TeamSessionBinding::team_id_marker_from_extra_str(&row.extra)?;
+                Some(TeamConversationCleanupCandidate {
+                    conversation_id: row.id,
+                    user_id: row.user_id,
+                    team_id,
+                    created_at: row.created_at,
+                })
+            })
+            .collect())
     }
 
     async fn lookup_team_binding_by_conversation(

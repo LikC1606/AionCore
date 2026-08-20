@@ -4,7 +4,8 @@ use aionui_common::constants::{is_team_capable, supports_team_cli_fallback, supp
 /// Determine if a backend supports team mode.
 ///
 /// Built-in Team MCP backends pass directly. Other backends use persisted
-/// `agent_capabilities` for MCP transport or shell/CLI fallback eligibility.
+/// `agent_capabilities` for stdio MCP transport or shell/CLI fallback
+/// eligibility.
 pub fn is_team_capable_backend(backend: &str, agent_capabilities: Option<&serde_json::Value>) -> bool {
     is_team_capable(backend, agent_capabilities)
 }
@@ -31,14 +32,15 @@ mod tests {
     }
 
     #[test]
-    fn acp_backend_mcp_transport_requires_stdio_or_http_capabilities() {
+    fn acp_backend_mcp_transport_requires_stdio_capability() {
         let caps_stdio = json!({"mcp_capabilities": {"stdio": true}});
         assert!(is_team_capable_backend("qwen", Some(&caps_stdio)));
         assert!(supports_team_mcp_backend("qwen", Some(&caps_stdio)));
 
         let caps_http = json!({"mcpCapabilities": {"http": true, "sse": true}});
         assert!(is_team_capable_backend("droid", Some(&caps_http)));
-        assert!(supports_team_mcp_backend("droid", Some(&caps_http)));
+        assert!(!supports_team_mcp_backend("droid", Some(&caps_http)));
+        assert!(supports_team_cli_fallback_backend(Some(&caps_http)));
 
         let caps_mcp = json!({"mcp": {"stdio": true}});
         assert!(is_team_capable_backend("goose", Some(&caps_mcp)));

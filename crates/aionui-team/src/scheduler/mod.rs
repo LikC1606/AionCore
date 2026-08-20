@@ -11,8 +11,7 @@ use tokio::sync::Mutex;
 use crate::error::TeamError;
 use crate::events::TeamEventEmitter;
 use crate::mailbox::Mailbox;
-use crate::task_board::TaskBoard;
-use crate::types::{MailboxMessage, TeamAgent, TeamTask, TeammateRole, TeammateStatus};
+use crate::types::{MailboxMessage, TeamAgent, TeammateRole, TeammateStatus};
 
 mod actions;
 mod agent_lifecycle;
@@ -93,7 +92,6 @@ pub type WakeTimeoutHandler = Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = 
 #[derive(Debug, Clone)]
 pub struct WakePayload {
     pub agent: TeamAgent,
-    pub tasks: Vec<TeamTask>,
     pub unread_messages: Vec<MailboxMessage>,
 }
 
@@ -117,7 +115,6 @@ pub struct TeammateManager {
     pub(crate) team_id: String,
     pub(crate) slots: Mutex<HashMap<String, AgentSlot>>,
     pub(crate) mailbox: Arc<Mailbox>,
-    pub(crate) task_board: Arc<TaskBoard>,
     pub(crate) events: TeamEventEmitter,
     pub(crate) active_wakes: DashSet<String>,
     // Reason: Finish / Error events may fire back-to-back for the same
@@ -132,7 +129,6 @@ impl TeammateManager {
         team_id: String,
         agents: &[TeamAgent],
         mailbox: Arc<Mailbox>,
-        task_board: Arc<TaskBoard>,
         broadcaster: Arc<dyn EventBroadcaster>,
     ) -> Self {
         let mut slots = HashMap::new();
@@ -153,7 +149,6 @@ impl TeammateManager {
             team_id,
             slots: Mutex::new(slots),
             mailbox,
-            task_board,
             events,
             active_wakes: DashSet::new(),
             finalized_turns: Arc::new(DashMap::new()),
@@ -172,10 +167,6 @@ impl TeammateManager {
     pub async fn list_agents(&self) -> Vec<TeamAgent> {
         let slots = self.slots.lock().await;
         slots.values().map(|s| s.agent.clone()).collect()
-    }
-
-    pub async fn list_tasks(&self) -> Result<Vec<TeamTask>, TeamError> {
-        self.task_board.list_tasks(&self.team_id).await
     }
 
     pub async fn find_lead_slot_id(&self) -> Option<String> {

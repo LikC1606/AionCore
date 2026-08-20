@@ -206,14 +206,17 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
         .iter()
         .map(|message| message.id.clone())
         .collect::<Vec<_>>();
-    let started_seen = Arc::new(AtomicBool::new(false));
+    let prompt_accepted_seen = Arc::new(AtomicBool::new(false));
     let coordinator = ctx.session.work_coordinator().clone();
     let cancellation_port = ctx.session.cancellation_port().clone();
     let user_id = ctx.user_id.clone();
     let conversation_id = input.conversation_id.clone();
     let callback_batch = batch.clone();
-    let callback_started = started_seen.clone();
+    let callback_started = prompt_accepted_seen.clone();
     let callback_emitter = ctx.session.team_event_emitter();
+    let callback_mailbox = Arc::clone(&ctx.mailbox);
+    let callback_team_id = ctx.team_id.clone();
+    let callback_slot_id = ctx.slot_id.clone();
     let on_started: AgentTurnStartedCallback = Arc::new(move |started: AgentTurnStarted| {
         let coordinator = coordinator.clone();
         let cancellation_port = cancellation_port.clone();
@@ -222,10 +225,14 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
         let batch = callback_batch.clone();
         let callback_started = callback_started.clone();
         let emitter = callback_emitter.clone();
+        let mailbox = Arc::clone(&callback_mailbox);
+        let team_id = callback_team_id.clone();
+        let slot_id = callback_slot_id.clone();
         Box::pin(async move {
             callback_started.store(true, Ordering::SeqCst);
             match coordinator.mark_started(&batch, &started.turn_id) {
                 StartCommitResult::Accepted => {
+                    mark_batch_messages_read(&mailbox, &team_id, &slot_id, &batch, "prompt_accepted").await;
                     if let Some(team_run_id) = started.team_run_id {
                         emitter.broadcast_child_turn(
                             TEAM_CHILD_TURN_STARTED_EVENT,
@@ -242,6 +249,7 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
                     }
                 }
                 StartCommitResult::CancelImmediately => {
+                    mark_batch_messages_read(&mailbox, &team_id, &slot_id, &batch, "prompt_accepted_cancelled").await;
                     if let Err(error) = cancellation_port
                         .cancel_agent_turn(&user_id, &conversation_id, &started.turn_id)
                         .await
@@ -292,7 +300,21 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
 
     let outcome = match ctx.turn_port.run_agent_turn(request).await {
         Ok(outcome) => outcome,
-        Err(error) if !started_seen.load(Ordering::SeqCst) && is_retryable_start_skip(&error) => {
+        Err(error) if !prompt_accepted_seen.load(Ordering::SeqCst) && batch.team_run_ids.is_empty() => {
+            warn!(
+                team_id = %ctx.team_id,
+                slot_id = %ctx.slot_id,
+                batch_id = %batch.batch_id,
+                error = %error,
+                "background agent turn did not start; retaining durable mailbox for reconciliation"
+            );
+            ctx.session
+                .work_coordinator()
+                .retry_start(&batch, "background_turn_start_failed");
+            let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Idle).await;
+            return ExecuteResult::WaitForSignal;
+        }
+        Err(error) if !prompt_accepted_seen.load(Ordering::SeqCst) && is_retryable_start_skip(&error) => {
             ctx.session.work_coordinator().retry_start(&batch, "already_running");
             let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Idle).await;
             return ExecuteResult::WaitForSignal;
@@ -305,14 +327,36 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
                 error = %error,
                 "agent turn start failed"
             );
-            mark_batch_messages_read(ctx, &batch).await;
+            mark_batch_messages_read(
+                &ctx.mailbox,
+                &ctx.team_id,
+                &ctx.slot_id,
+                &batch,
+                "terminal_start_failure",
+            )
+            .await;
             ctx.session.work_coordinator().fail_batch(&batch, "turn_start_failed");
             let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Error).await;
             return ExecuteResult::ContinueDraining;
         }
     };
 
-    mark_batch_messages_read(ctx, &batch).await;
+    if !prompt_accepted_seen.load(Ordering::SeqCst) && batch.team_run_ids.is_empty() {
+        warn!(
+            team_id = %ctx.team_id,
+            slot_id = %ctx.slot_id,
+            batch_id = %batch.batch_id,
+            status = ?outcome.status,
+            "background agent turn finished before prompt acceptance; retaining durable mailbox for reconciliation"
+        );
+        ctx.session
+            .work_coordinator()
+            .retry_start(&batch, "background_prompt_not_accepted");
+        let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Idle).await;
+        return ExecuteResult::WaitForSignal;
+    }
+
+    mark_batch_messages_read(&ctx.mailbox, &ctx.team_id, &ctx.slot_id, &batch, "terminal_completion").await;
     let terminal_status = if outcome.status.is_success() {
         (ctx.session.work_coordinator().complete_batch(&batch) == CommitResult::Committed)
             .then_some(TeamRunStatus::Completed)
@@ -366,17 +410,24 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
     ExecuteResult::ContinueDraining
 }
 
-async fn mark_batch_messages_read(ctx: &AgentLoopContext, batch: &WorkBatch) {
+async fn mark_batch_messages_read(
+    mailbox: &Mailbox,
+    team_id: &str,
+    slot_id: &str,
+    batch: &WorkBatch,
+    boundary: &'static str,
+) {
     if batch.mailbox_message_ids.is_empty() {
         return;
     }
-    if let Err(error) = ctx.mailbox.mark_read_batch(&batch.mailbox_message_ids).await {
+    if let Err(error) = mailbox.mark_read_batch(&batch.mailbox_message_ids).await {
         warn!(
-            team_id = %ctx.team_id,
-            slot_id = %ctx.slot_id,
+            team_id,
+            slot_id,
             batch_id = %batch.batch_id,
+            boundary,
             error = %error,
-            "team batch mailbox terminal mark-read failed"
+            "team batch mailbox mark-read failed"
         );
     }
 }

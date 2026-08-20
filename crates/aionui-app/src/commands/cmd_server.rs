@@ -20,6 +20,8 @@ use crate::bootstrap::{BootstrapError, BootstrapErrorCode, ParentExitSignal, Ser
 const LISTENING_EVENT_PREFIX: &str = "AIONCORE_LISTENING";
 const DYNAMIC_BACKEND_BIND_MAX_ATTEMPTS: usize = 50;
 const WORKER_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const TEAM_MAILBOX_RECOVERY_INTERVAL: Duration = Duration::from_secs(60);
+const TEAM_GIT_INTEGRATION_RECOVERY_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ShutdownReason {
@@ -277,6 +279,12 @@ pub(crate) async fn run_server(
     // SIGINT/SIGTERM.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let (shutdown_error_tx, shutdown_error_rx) = tokio::sync::oneshot::channel::<BootstrapError>();
+    let mailbox_recovery_handle = router_runtime
+        .team_service
+        .start_unread_mailbox_reconciler(shutdown_rx.clone(), TEAM_MAILBOX_RECOVERY_INTERVAL);
+    let git_integration_recovery_handle = router_runtime
+        .team_delivery_service
+        .start_pending_integration_reconciler(shutdown_rx.clone(), TEAM_GIT_INTEGRATION_RECOVERY_INTERVAL);
     let idle_cleanup_coordinator: Arc<dyn aionui_ai_agent::IdleCleanupCoordinator> =
         Arc::new(TeamIdleCleanupCoordinator::new(
             router_runtime.team_service.clone(),
@@ -296,7 +304,9 @@ pub(crate) async fn run_server(
 
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
-            match shutdown_signal(parent_exit).await {
+            let shutdown_result = shutdown_signal(parent_exit).await;
+            let _ = shutdown_tx.send(true);
+            match shutdown_result {
                 Err(error) => {
                     error.log_source();
                     tracing::error!(error = %error.stderr_line(), "shutdown signal handler failed");
@@ -321,7 +331,6 @@ pub(crate) async fn run_server(
                     }
                 }
             }
-            let _ = shutdown_tx.send(true);
         })
         .await
         .map_err(|error| {
@@ -343,6 +352,22 @@ pub(crate) async fn run_server(
             stage = "idle_scanner.join",
             error = %e,
             "idle scanner join failed"
+        );
+    }
+    if let Err(error) = mailbox_recovery_handle.await {
+        warn!(
+            code = "BOOTSTRAP_DEGRADED_TEAM_MAILBOX_RECOVERY",
+            stage = "team_mailbox_recovery.join",
+            error = %error,
+            "Team mailbox recovery reconciler join failed"
+        );
+    }
+    if let Err(error) = git_integration_recovery_handle.await {
+        warn!(
+            code = "BOOTSTRAP_DEGRADED_TEAM_GIT_INTEGRATION_RECOVERY",
+            stage = "team_git_integration_recovery.join",
+            error = %error,
+            "Team Git integration recovery reconciler join failed"
         );
     }
 

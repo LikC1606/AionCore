@@ -15,61 +15,41 @@ pub fn build_team_tool_usage(role: TeamPromptRole, transport: TeamToolTransport)
 }
 
 fn render_mcp_usage(role: TeamPromptRole, descriptors: &[TeamToolDescriptor]) -> String {
-    let mut text = String::from(
-        "You MUST use the `team_*` MCP tools for ALL team coordination.\n\
-Your platform may provide similarly named built-in tools. Do NOT use those.\n\
-Always use the `team_*` MCP tool versions.\n\
-Use `slot_id` values for all agent targets.\n\n\
-If a single `team_*` MCP tool call fails because of invalid arguments, schema mismatch, or role/permission constraints,\n\
-use \"$AIONUI_HELPER_BIN\" team capabilities or \"$AIONUI_HELPER_BIN\" team help to inspect the Team contract,\n\
-then retry the MCP tool call with corrected arguments.\n\
-If the `team_*` MCP tools are unavailable, missing, disconnected, or continue to fail after correction,\n\
-use the Team CLI fallback through \"$AIONUI_HELPER_BIN\" team ... commands to continue Team coordination.\n\n\
-For exact schema, run team capabilities.\n\n\
-| When | MCP tool | Input summary |\n\
-| --- | --- | --- |\n",
+    let names = descriptors
+        .iter()
+        .map(|tool| format!("`{}`", tool.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut text = format!(
+        "## Team Tools\nUse the native Team MCP tools. Current tools: {names}.\n\
+Use exact revisions returned by `team_inspect`; choose a stable idempotency key for each intended mutation.\n\
+Agent identity and team scope come from the authenticated runtime, never from arguments.\n"
     );
-    for tool in descriptors {
-        text.push_str(&format!(
-            "| {} | `{}` | {} |\n",
-            tool.when, tool.name, tool.input_summary
-        ));
-    }
+    text.push_str(
+        "MCP and Team CLI reach the same Team runtime. Do not switch transports for a semantic error; retry only errors explicitly marked retryable, reusing the same idempotency key.\n",
+    );
     if role == TeamPromptRole::Teammate {
-        text.push_str("\nLead-only tools are unavailable to teammates.\n");
+        text.push_str("Roster-management tools are unavailable unless listed above.\n");
     }
     text
 }
 
 fn render_cli_usage(role: TeamPromptRole, descriptors: &[TeamToolDescriptor]) -> String {
-    let mut text = String::from(
-        "You MUST use AionCore Team CLI for ALL team coordination:\n\
-\"$AIONUI_HELPER_BIN\" team ...\n\n\
-Run \"$AIONUI_HELPER_BIN\" team capabilities when you need command names,\n\
-stdin JSON schema, required fields, enum values, permissions, examples,\n\
-or error meanings.\n\n\
-Run \"$AIONUI_HELPER_BIN\" team help when you need a short readable guide.\n\n\
-Do not guess team_id, slot_id, role, permissions, or internal tokens.\n\
-Do not claim you used MCP tools in CLI transport.\n\
-Use slot_id values from this prompt, team context, or team members results\n\
-for all agent targets.\n\n\
-If the CLI returns schema_validation_failed, unknown_command, or permission_denied,\n\
-consult team capabilities or team help, correct the call, and retry at most once.\n\n\
-For exact schema, run team capabilities.\n\n\
-| When | CLI command | Canonical tool | Input summary |\n\
-| --- | --- | --- | --- |\n",
+    let commands = descriptors
+        .iter()
+        .map(|tool| format!("`team {}`", tool.cli_command.join(" ")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut text = format!(
+        "## Team Tools\nUse `\"$AIONUI_HELPER_BIN\" team ...` with stdin JSON. Current commands: {commands}.\n\
+Run `\"$AIONUI_HELPER_BIN\" team capabilities` only when an exact schema is needed.\n\
+Use revisions from `team inspect`; identity and team scope come from the authenticated runtime.\n"
     );
-    for tool in descriptors {
-        text.push_str(&format!(
-            "| {} | `team {}` | `{}` | {} |\n",
-            tool.when,
-            tool.cli_command.join(" "),
-            tool.name,
-            tool.input_summary
-        ));
-    }
+    text.push_str(
+        "MCP and Team CLI reach the same Team runtime. Do not switch transports for a semantic error; retry only errors explicitly marked retryable, reusing the same idempotency key.\n",
+    );
     if role == TeamPromptRole::Teammate {
-        text.push_str("\nLead-only tools are unavailable to teammates.\n");
+        text.push_str("Roster-management commands are unavailable unless listed above.\n");
     }
     text
 }
@@ -83,26 +63,32 @@ mod tests {
         let usage = build_team_tool_usage(TeamPromptRole::Teammate, TeamToolTransport::CliAssumed);
         assert!(usage.contains("\"$AIONUI_HELPER_BIN\" team"));
         assert!(usage.contains("team send-message"));
+        assert!(usage.contains("team inspect"));
+        assert!(usage.contains("same Team runtime"));
+        assert!(usage.contains("explicitly marked retryable"));
         assert!(!usage.contains("team spawn-agent"));
-        assert!(usage.contains("Lead-only tools are unavailable to teammates"));
+        assert!(usage.contains("Roster-management commands are unavailable"));
+        assert!(!usage.contains("team task"));
     }
 
     #[test]
     fn mcp_lead_usage_includes_lead_tools() {
         let usage = build_team_tool_usage(TeamPromptRole::Lead, TeamToolTransport::Mcp);
-        assert!(usage.contains("team_*` MCP tools"));
+        assert!(usage.contains("native Team MCP tools"));
         assert!(usage.contains("team_spawn_agent"));
-        assert!(usage.contains("\"$AIONUI_HELPER_BIN\" team capabilities"));
-        assert!(usage.contains("retry the MCP tool call with corrected arguments"));
-        assert!(usage.contains("use the Team CLI fallback"));
+        assert!(usage.contains("team_inspect"));
+        assert!(usage.contains("idempotency key"));
+        assert!(usage.contains("same Team runtime"));
+        assert!(usage.contains("explicitly marked retryable"));
+        assert!(!usage.contains("fallback"));
     }
 
     #[test]
     fn mcp_teammate_usage_includes_shared_fallback_guidance() {
         let usage = build_team_tool_usage(TeamPromptRole::Teammate, TeamToolTransport::Mcp);
-        assert!(usage.contains("\"$AIONUI_HELPER_BIN\" team capabilities"));
-        assert!(usage.contains("retry the MCP tool call with corrected arguments"));
-        assert!(usage.contains("use the Team CLI fallback"));
-        assert!(usage.contains("Lead-only tools are unavailable to teammates"));
+        assert!(usage.contains("team_inspect"));
+        assert!(usage.contains("team_progress"));
+        assert!(!usage.contains("team_spawn_agent"));
+        assert!(usage.contains("Roster-management tools are unavailable"));
     }
 }

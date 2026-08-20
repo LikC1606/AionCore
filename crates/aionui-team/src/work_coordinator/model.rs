@@ -235,6 +235,9 @@ pub(crate) struct RunBinding {
 
 pub(crate) trait RunCausalityPort: Send + Sync {
     fn bind_enqueue(&self, request: &EnqueueRequest) -> RunBinding;
+    /// Attach system-initiated work to an active run, or open a dedicated
+    /// lifecycle run when the team is otherwise idle.
+    fn bind_system_enqueue(&self, request: &EnqueueRequest) -> RunBinding;
     fn abort_binding(&self, binding: &RunBinding);
     fn apply_work_summary(&self, summary: RunWorkSummary);
 }

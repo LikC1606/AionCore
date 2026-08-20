@@ -126,6 +126,91 @@ struct SendMessageParams {
     /// Absolute attachment paths to forward to the target agent.
     #[serde(default)]
     files: Vec<String>,
+    /// Stable key for safely retrying the same message.
+    #[serde(default)]
+    idempotency_key: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct InspectParams {
+    #[serde(default)]
+    work_item_id: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct DelegateParams {
+    idempotency_key: String,
+    #[serde(default)]
+    parent_work_item_id: Option<String>,
+    subject: String,
+    #[serde(default)]
+    description: Option<String>,
+    assignee_member_id: String,
+    delivery_requirement: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ProgressParams {
+    idempotency_key: String,
+    work_item_id: String,
+    expected_work_revision: u64,
+    action: String,
+    #[serde(default)]
+    context: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GitSubmissionParams {
+    content_revision: u64,
+    head_commit: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SubmitParams {
+    idempotency_key: String,
+    work_item_id: String,
+    expected_work_revision: u64,
+    kind: String,
+    evidence: String,
+    #[serde(default)]
+    git: Option<GitSubmissionParams>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ReviewParams {
+    idempotency_key: String,
+    work_item_id: String,
+    expected_work_revision: u64,
+    #[serde(default)]
+    expected_delivery_revision: Option<u64>,
+    decision: String,
+    #[serde(default)]
+    feedback: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct IntegrateParams {
+    idempotency_key: String,
+    work_item_id: String,
+    expected_work_revision: u64,
+    expected_delivery_revision: u64,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct CancelParams {
+    idempotency_key: String,
+    work_item_id: String,
+    expected_work_revision: u64,
+    #[serde(default)]
+    expected_delivery_revision: Option<u64>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -136,83 +221,6 @@ struct SpawnAgentParams {
     /// Assistant identifier from the available assistants catalog.
     #[serde(default)]
     assistant_id: Option<String>,
-}
-
-#[derive(Deserialize, schemars::JsonSchema)]
-struct TaskCreateParams {
-    /// Task subject.
-    subject: String,
-    /// Task description.
-    #[serde(default)]
-    description: Option<String>,
-    /// Owning agent slot_id.
-    #[serde(default)]
-    owner: Option<String>,
-    /// Task IDs this task depends on.
-    #[serde(default)]
-    blocked_by: Option<Vec<String>>,
-}
-
-#[derive(Deserialize, schemars::JsonSchema)]
-struct TaskUpdateParams {
-    /// Task ID to update.
-    task_id: String,
-    /// New status: pending, in_progress, completed, deleted.
-    #[serde(default)]
-    status: Option<String>,
-    /// New description.
-    #[serde(default)]
-    description: Option<String>,
-    /// New owning agent slot_id.
-    #[serde(default)]
-    owner: Option<String>,
-    /// New dependency list.
-    #[serde(default)]
-    blocked_by: Option<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-#[serde(untagged)]
-enum TaskListStatusParam {
-    Single(String),
-    Many(Vec<String>),
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct TaskListParams {
-    /// Return only tasks owned by this exact agent slot_id.
-    #[serde(default)]
-    owner: Option<String>,
-    /// Return only tasks with the requested status or statuses.
-    #[serde(default)]
-    status: Option<TaskListStatusParam>,
-    /// Include deleted tasks when status is omitted. Defaults server-side to true.
-    #[serde(default)]
-    include_deleted: Option<bool>,
-    /// Maximum number of returned tasks. The TCP server validates and clamps.
-    #[serde(default)]
-    limit: Option<i64>,
-}
-
-impl TaskListParams {
-    fn into_json(self) -> serde_json::Value {
-        let status = match self.status {
-            Some(TaskListStatusParam::Single(value)) => serde_json::json!(value),
-            Some(TaskListStatusParam::Many(values)) => serde_json::json!(values),
-            None => serde_json::Value::Null,
-        };
-        let mut args = serde_json::json!({
-            "owner": self.owner,
-            "status": status,
-            "include_deleted": self.include_deleted,
-            "limit": self.limit,
-        });
-        args.as_object_mut()
-            .expect("task list params must serialize to object")
-            .retain(|_, value| !value.is_null());
-        args
-    }
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -250,7 +258,7 @@ struct DescribeAssistantParams {
 impl TeamStdioServer {
     #[tool(
         name = "team_send_message",
-        description = "Send a message to a teammate or broadcast to all (to=\"*\"). When delegating work that depends on user attachments, forward their absolute paths in files."
+        description = "Send a message to a teammate, to the team leader (to=\"leader\"), or broadcast to all (to=\"*\"). When delegating work that depends on user attachments, forward their absolute paths in files."
     )]
     async fn send_message(&self, Parameters(params): Parameters<SendMessageParams>) -> CallToolResult {
         self.forward_to_tcp(
@@ -259,6 +267,131 @@ impl TeamStdioServer {
                 "to": params.to,
                 "message": params.message,
                 "files": params.files,
+                "idempotency_key": params.idempotency_key,
+            }),
+        )
+        .await
+    }
+
+    #[tool(
+        name = "team_inspect",
+        description = "Inspect canonical Team work visible to the authenticated member. Returns current revisions and server-computed allowed_actions. Omit work_item_id for the scoped list."
+    )]
+    async fn inspect(&self, Parameters(params): Parameters<InspectParams>) -> CallToolResult {
+        self.forward_to_tcp(
+            "team_inspect",
+            &serde_json::json!({ "work_item_id": params.work_item_id }),
+        )
+        .await
+    }
+
+    #[tool(
+        name = "team_delegate",
+        description = "Create and queue a canonical WorkItem for a direct subordinate. The runtime durably notifies and wakes the assignee after the command commits. Actor identity comes from the authenticated member credential, never from this payload."
+    )]
+    async fn delegate(&self, Parameters(params): Parameters<DelegateParams>) -> CallToolResult {
+        self.forward_to_tcp(
+            "team_delegate",
+            &serde_json::json!({
+                "idempotency_key": params.idempotency_key,
+                "parent_work_item_id": params.parent_work_item_id,
+                "subject": params.subject,
+                "description": params.description,
+                "assignee_member_id": params.assignee_member_id,
+                "delivery_requirement": params.delivery_requirement,
+            }),
+        )
+        .await
+    }
+
+    #[tool(
+        name = "team_progress",
+        description = "Advance assigned canonical work with action start, block, or resume. Block requires concise context, which is committed atomically with the state change and controller notification. Start and resume must not include context. The authenticated member must be the WorkItem assignee."
+    )]
+    async fn progress(&self, Parameters(params): Parameters<ProgressParams>) -> CallToolResult {
+        self.forward_to_tcp(
+            "team_progress",
+            &serde_json::json!({
+                "idempotency_key": params.idempotency_key,
+                "work_item_id": params.work_item_id,
+                "expected_work_revision": params.expected_work_revision,
+                "action": params.action,
+                "context": params.context,
+            }),
+        )
+        .await
+    }
+
+    #[tool(
+        name = "team_submit",
+        description = "Commit a submission and concise evidence atomically with the reviewer notification. Use kind=inline without a result body, or kind=git with the next unused content revision and immutable head commit. Inspect existing deliveries after changes are requested; Git assignment is resolved from the WorkItem."
+    )]
+    async fn submit(&self, Parameters(params): Parameters<SubmitParams>) -> CallToolResult {
+        self.forward_to_tcp(
+            "team_submit",
+            &serde_json::json!({
+                "idempotency_key": params.idempotency_key,
+                "work_item_id": params.work_item_id,
+                "expected_work_revision": params.expected_work_revision,
+                "kind": params.kind,
+                "evidence": params.evidence,
+                "git": params.git.map(|git| serde_json::json!({
+                    "content_revision": git.content_revision,
+                    "head_commit": git.head_commit,
+                })),
+            }),
+        )
+        .await
+    }
+
+    #[tool(
+        name = "team_review",
+        description = "Review a submitted canonical WorkItem and accept it, request changes, or reject it. Request changes requires concise feedback, which is committed atomically with the assignee notification. Git acceptance atomically queues the integrator notification. The authenticated member must be its reviewer."
+    )]
+    async fn review(&self, Parameters(params): Parameters<ReviewParams>) -> CallToolResult {
+        self.forward_to_tcp(
+            "team_review",
+            &serde_json::json!({
+                "idempotency_key": params.idempotency_key,
+                "work_item_id": params.work_item_id,
+                "expected_work_revision": params.expected_work_revision,
+                "expected_delivery_revision": params.expected_delivery_revision,
+                "decision": params.decision,
+                "feedback": params.feedback,
+            }),
+        )
+        .await
+    }
+
+    #[tool(
+        name = "team_integrate",
+        description = "Integrate the exact accepted Git delivery for a canonical WorkItem. The authenticated member must be its bound integrator. This is the only supported way to change the integration target: never run raw git merge, cherry-pick, rebase, reset, update-ref, or force-move the target branch. Repository coordinates and merged evidence are derived and verified by the server."
+    )]
+    async fn integrate(&self, Parameters(params): Parameters<IntegrateParams>) -> CallToolResult {
+        self.forward_to_tcp(
+            "team_integrate",
+            &serde_json::json!({
+                "idempotency_key": params.idempotency_key,
+                "work_item_id": params.work_item_id,
+                "expected_work_revision": params.expected_work_revision,
+                "expected_delivery_revision": params.expected_delivery_revision,
+            }),
+        )
+        .await
+    }
+
+    #[tool(
+        name = "team_cancel",
+        description = "Cancel a canonical WorkItem controlled by the authenticated member."
+    )]
+    async fn cancel(&self, Parameters(params): Parameters<CancelParams>) -> CallToolResult {
+        self.forward_to_tcp(
+            "team_cancel",
+            &serde_json::json!({
+                "idempotency_key": params.idempotency_key,
+                "work_item_id": params.work_item_id,
+                "expected_work_revision": params.expected_work_revision,
+                "expected_delivery_revision": params.expected_delivery_revision,
             }),
         )
         .await
@@ -277,46 +410,6 @@ impl TeamStdioServer {
             }),
         )
         .await
-    }
-
-    #[tool(name = "team_task_create", description = "Create a new task on the team task board.")]
-    async fn task_create(&self, Parameters(params): Parameters<TaskCreateParams>) -> CallToolResult {
-        self.forward_to_tcp(
-            "team_task_create",
-            &serde_json::json!({
-                "subject": params.subject,
-                "description": params.description,
-                "owner": params.owner,
-                "blocked_by": params.blocked_by,
-            }),
-        )
-        .await
-    }
-
-    #[tool(
-        name = "team_task_update",
-        description = "Update an existing task on the team task board."
-    )]
-    async fn task_update(&self, Parameters(params): Parameters<TaskUpdateParams>) -> CallToolResult {
-        self.forward_to_tcp(
-            "team_task_update",
-            &serde_json::json!({
-                "task_id": params.task_id,
-                "status": params.status,
-                "description": params.description,
-                "owner": params.owner,
-                "blocked_by": params.blocked_by,
-            }),
-        )
-        .await
-    }
-
-    #[tool(
-        name = "team_task_list",
-        description = "List tasks on the team task board. Pass {} for the full board, or use owner/status/include_deleted/limit for filtered views."
-    )]
-    async fn task_list(&self, Parameters(params): Parameters<TaskListParams>) -> CallToolResult {
-        self.forward_to_tcp("team_task_list", &params.into_json()).await
     }
 
     #[tool(
@@ -733,44 +826,74 @@ mod tests {
     }
 
     #[test]
-    fn task_list_params_accept_filter_arguments() {
-        let parsed = serde_json::from_value::<TaskListParams>(json!({
-            "owner": "worker-1",
-            "status": ["pending", "in_progress"],
-            "include_deleted": false,
-            "limit": 50
+    fn send_message_params_accept_optional_idempotency_key() {
+        let keyed = serde_json::from_value::<SendMessageParams>(json!({
+            "to": "worker-1",
+            "message": "retryable",
+            "idempotency_key": "stdio-call-1"
         }))
-        .expect("task_list filters should parse");
+        .unwrap();
+        assert_eq!(keyed.idempotency_key.as_deref(), Some("stdio-call-1"));
 
-        let forwarded = parsed.into_json();
-        assert_eq!(forwarded["owner"], "worker-1");
-        assert_eq!(forwarded["status"], json!(["pending", "in_progress"]));
-        assert_eq!(forwarded["include_deleted"], false);
-        assert_eq!(forwarded["limit"], 50);
+        let unkeyed = serde_json::from_value::<SendMessageParams>(json!({
+            "to": "worker-1",
+            "message": "legacy"
+        }))
+        .unwrap();
+        assert_eq!(unkeyed.idempotency_key, None);
     }
 
     #[test]
-    fn task_list_params_reject_unknown_fields() {
-        let parsed = serde_json::from_value::<TaskListParams>(json!({
-            "slot_id": "worker-1"
+    fn integrate_params_reject_server_owned_git_evidence() {
+        let parsed = serde_json::from_value::<IntegrateParams>(json!({
+            "idempotency_key": "integrate-1",
+            "work_item_id": "work-1",
+            "expected_work_revision": 5,
+            "expected_delivery_revision": 1,
+            "merged_commit": "self-reported"
         }));
         assert!(parsed.is_err());
-        assert!(parsed.unwrap_err().to_string().contains("unknown field"));
+        let error = match parsed {
+            Ok(_) => panic!("server-owned Git integration evidence must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("unknown field"));
     }
 
     #[test]
-    fn team_stdio_task_list_schema_exposes_filters() {
+    fn git_submit_params_reject_server_owned_assignment_coordinates() {
+        let parsed = serde_json::from_value::<SubmitParams>(json!({
+            "idempotency_key": "submit-1",
+            "work_item_id": "work-1",
+            "expected_work_revision": 2,
+            "kind": "git",
+            "evidence": "Ready for review",
+            "git": {
+                "content_revision": 1,
+                "head_commit": "0123456789abcdef0123456789abcdef01234567",
+                "branch_ref": "refs/heads/forged"
+            }
+        }));
+        assert!(parsed.is_err());
+        let error = match parsed {
+            Ok(_) => panic!("server-owned Git assignment coordinates must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn team_stdio_send_message_schema_exposes_optional_idempotency_key() {
         let router = TeamStdioServer::tool_router();
-        let tools = router.list_all();
-        let task_list = tools
-            .iter()
-            .find(|tool| tool.name == "team_task_list")
-            .expect("team_task_list tool missing");
-        let properties = task_list.input_schema["properties"].as_object().unwrap();
-        assert!(properties.contains_key("owner"));
-        assert!(properties.contains_key("status"));
-        assert!(properties.contains_key("include_deleted"));
-        assert!(properties.contains_key("limit"));
+        let tool = router
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "team_send_message")
+            .expect("team_send_message tool missing");
+        let properties = tool.input_schema["properties"].as_object().unwrap();
+        assert!(properties.contains_key("idempotency_key"));
+        let required = tool.input_schema["required"].as_array().unwrap();
+        assert!(!required.contains(&json!("idempotency_key")));
     }
 
     #[test]
@@ -903,7 +1026,7 @@ mod tests {
             slot_id: "dummy-slot".into(),
         };
 
-        let result = server.forward_to_tcp("team_task_list", &json!({})).await;
+        let result = server.forward_to_tcp("team_inspect", &json!({})).await;
 
         accept_task.await.unwrap();
         assert_eq!(result.is_error, Some(true));
@@ -952,7 +1075,7 @@ mod tests {
             slot_id: "dummy-slot".into(),
         };
 
-        let result = server.forward_to_tcp("team_task_list", &json!({})).await;
+        let result = server.forward_to_tcp("team_inspect", &json!({})).await;
 
         accept_task.await.unwrap();
         assert_eq!(result.is_error, Some(true));
@@ -1021,7 +1144,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn task_list_forwards_filter_arguments() {
+    async fn send_message_forwards_optional_idempotency_key() {
         let listener = TcpListener::bind((CONNECT_HOST, 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let accept_task = tokio::spawn(async move {
@@ -1037,25 +1160,18 @@ mod tests {
 
             let call = read_frame(&mut socket).await.unwrap();
             let call_value: serde_json::Value = serde_json::from_slice(&call).unwrap();
-            assert_eq!(call_value["params"]["name"], json!("team_task_list"));
-            assert_eq!(call_value["params"]["arguments"]["owner"], json!("worker-1"));
-            assert_eq!(
-                call_value["params"]["arguments"]["status"],
-                json!(["pending", "in_progress"])
-            );
-            assert_eq!(call_value["params"]["arguments"]["include_deleted"], json!(false));
-            assert_eq!(call_value["params"]["arguments"]["limit"], json!(50));
+            assert_eq!(call_value["params"]["name"], json!("team_send_message"));
+            let arguments = &call_value["params"]["arguments"];
+            assert_eq!(arguments["to"], json!("worker-1"));
+            assert_eq!(arguments["message"], json!("retryable"));
+            assert_eq!(arguments["idempotency_key"], json!("stdio-call-1"));
 
             let tool_response = serde_json::to_vec(&json!({
                 "jsonrpc": "2.0",
                 "id": 2,
                 "result": {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": "[]"
-                        }
-                    ]
+                    "content": [{ "type": "text", "text": "ok" }],
+                    "isError": false
                 }
             }))
             .unwrap();
@@ -1064,20 +1180,80 @@ mod tests {
         let server = TeamStdioServer {
             port,
             token: "dummy-token".into(),
-            slot_id: "dummy-slot".into(),
-        };
-        let args = TaskListParams {
-            owner: Some("worker-1".into()),
-            status: Some(TaskListStatusParam::Many(vec!["pending".into(), "in_progress".into()])),
-            include_deleted: Some(false),
-            limit: Some(50),
+            slot_id: "lead-1".into(),
         };
 
-        let result = server.forward_to_tcp("team_task_list", &args.into_json()).await;
+        let result = server
+            .send_message(Parameters(SendMessageParams {
+                to: "worker-1".into(),
+                message: "retryable".into(),
+                files: Vec::new(),
+                idempotency_key: Some("stdio-call-1".into()),
+            }))
+            .await;
 
         accept_task.await.unwrap();
-        assert_ne!(result.is_error, Some(true));
-        assert_eq!(first_text(&result), "[]");
+        assert_eq!(result.is_error, Some(false));
+        assert_eq!(first_text(&result), "ok");
+    }
+
+    #[tokio::test]
+    async fn integrate_forwards_only_canonical_identity_and_revisions() {
+        let listener = TcpListener::bind((CONNECT_HOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept_task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _init = read_frame(&mut socket).await.unwrap();
+            let init_response = serde_json::to_vec(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {}
+            }))
+            .unwrap();
+            write_frame(&mut socket, &init_response).await.unwrap();
+
+            let call = read_frame(&mut socket).await.unwrap();
+            let call_value: serde_json::Value = serde_json::from_slice(&call).unwrap();
+            assert_eq!(call_value["params"]["name"], json!("team_integrate"));
+            assert_eq!(
+                call_value["params"]["arguments"],
+                json!({
+                    "idempotency_key": "integrate-stdio-1",
+                    "work_item_id": "work-1",
+                    "expected_work_revision": 5,
+                    "expected_delivery_revision": 1
+                })
+            );
+
+            let tool_response = serde_json::to_vec(&json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "content": [{ "type": "text", "text": "merged" }],
+                    "isError": false
+                }
+            }))
+            .unwrap();
+            write_frame(&mut socket, &tool_response).await.unwrap();
+        });
+        let server = TeamStdioServer {
+            port,
+            token: "dummy-token".into(),
+            slot_id: "lead-1".into(),
+        };
+
+        let result = server
+            .integrate(Parameters(IntegrateParams {
+                idempotency_key: "integrate-stdio-1".into(),
+                work_item_id: "work-1".into(),
+                expected_work_revision: 5,
+                expected_delivery_revision: 1,
+            }))
+            .await;
+
+        accept_task.await.unwrap();
+        assert_eq!(result.is_error, Some(false));
+        assert_eq!(first_text(&result), "merged");
     }
 
     #[test]

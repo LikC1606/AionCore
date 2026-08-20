@@ -11,7 +11,7 @@ use aionui_api_types::{
 use aionui_common::{AgentKillReason, generate_id};
 use aionui_db::ITeamRepository;
 use aionui_realtime::EventBroadcaster;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::error::TeamError;
 use crate::event_loop::EventLoopRegistry;
@@ -31,8 +31,8 @@ use crate::prompts::{build_lead_prompt_for_transport, build_teammate_prompt_for_
 use crate::provisioning::PersistSpawnedAgentRequest;
 use crate::scheduler::{TeammateManager, normalize_name};
 use crate::service::TeamSessionService;
-use crate::task_board::TaskBoard;
 use crate::team_run::{TeamRunManager, target_role_for};
+use crate::tool_executor::TeamToolContext;
 use crate::types::{MailboxMessageType, Team, TeamAgent, TeammateRole, TeammateStatus};
 use crate::work_coordinator::{
     CausalBinding, CommitResult, EnqueueCommit, EnqueueDisposition, EnqueueLease, EnqueueRequest, ReconcileDecision,
@@ -83,7 +83,6 @@ pub struct TeamSession {
     team: Team,
     scheduler: Arc<TeammateManager>,
     mailbox: Arc<Mailbox>,
-    task_board: Arc<TaskBoard>,
     mcp_server: TeamMcpServer,
     backend_binary_path: Arc<PathBuf>,
     task_manager: Arc<dyn IWorkerTaskManager>,
@@ -167,7 +166,6 @@ impl TeamSession {
         prompt_dump: TeamPromptDumpConfig,
     ) -> Result<Self, TeamError> {
         let mailbox = Arc::new(Mailbox::new(repo.clone()));
-        let task_board = Arc::new(TaskBoard::new(repo));
         let member_runtimes = Arc::new(MemberRuntimeRegistry::new(generate_id()));
         let team_run_manager = Arc::new(TeamRunManager::new(
             team.id.clone(),
@@ -183,7 +181,6 @@ impl TeamSession {
             team.id.clone(),
             &team.agents,
             mailbox.clone(),
-            task_board.clone(),
             broadcaster.clone(),
         ));
 
@@ -210,7 +207,6 @@ impl TeamSession {
             team,
             scheduler,
             mailbox,
-            task_board,
             mcp_server,
             backend_binary_path,
             task_manager,
@@ -277,7 +273,7 @@ impl TeamSession {
         TeamMcpStdioConfig {
             team_id: self.team.id.clone(),
             port: self.mcp_server.port(),
-            token: self.mcp_server.auth_token().to_owned(),
+            token: self.mcp_server.ensure_slot_credential(slot_id),
             slot_id: slot_id.to_owned(),
             binary_path: self.backend_binary_path.to_string_lossy().into_owned(),
         }
@@ -299,9 +295,16 @@ impl TeamSession {
     }
 
     pub(crate) async fn prepare_next_batch(&self, slot_id: &str) -> Result<PrepareBatchResult, TeamError> {
+        // Reaching this method means the slot event loop was signalled by
+        // durable work (including mailbox recovery after a restart). That is
+        // real demand, so a dormant Worker may be started without requiring a
+        // second user message.
+        self.start_member_runtime_on_demand(slot_id).await?;
         let agent = self.scheduler.get_agent(slot_id).await?;
         let runtime_constraint = match self.member_runtimes.snapshot(slot_id) {
-            MemberRuntimeSnapshot::Absent if self.event_loops.has(slot_id) => RuntimeConstraint::Ready,
+            MemberRuntimeSnapshot::Absent if self.service.upgrade().is_none() && self.event_loops.has(slot_id) => {
+                RuntimeConstraint::Ready
+            }
             MemberRuntimeSnapshot::Absent => RuntimeConstraint::Starting { operation_id: 0 },
             MemberRuntimeSnapshot::Attaching { operation_id } => RuntimeConstraint::Starting { operation_id },
             MemberRuntimeSnapshot::Ready => RuntimeConstraint::Ready,
@@ -312,9 +315,9 @@ impl TeamSession {
             MemberRuntimeSnapshot::Removing { operation_id } => RuntimeConstraint::Removing { operation_id },
             MemberRuntimeSnapshot::SessionStopped => RuntimeConstraint::SessionStopped,
         };
-        let update = self
-            .work_coordinator
-            .set_runtime_constraint(slot_id, runtime_constraint);
+        let update =
+            self.work_coordinator
+                .set_runtime_constraint(slot_id, target_role_for(agent.role), runtime_constraint);
         if !update.terminal_message_ids.is_empty() {
             self.mailbox.mark_read_batch(&update.terminal_message_ids).await?;
         }
@@ -341,21 +344,31 @@ impl TeamSession {
                     .into_iter()
                     .filter(|message| claimed_ids.contains(message.id.as_str()))
                     .collect::<Vec<_>>();
-                let tasks = match self.scheduler.list_tasks().await {
-                    Ok(tasks) => tasks,
-                    Err(error) => {
-                        self.work_coordinator.retry_start(&batch, "batch_prepare_failed");
-                        return Err(error);
+                let work_summary = if let Some(service) = self.service.upgrade() {
+                    let context = TeamToolContext {
+                        team_id: self.team.id.clone(),
+                        caller_slot_id: agent.slot_id.clone(),
+                        caller_role: agent.role,
+                        user_id: Some(self.user_id.clone()),
+                        conversation_id: Some(agent.conversation_id.clone()),
+                        transport: TeamToolTransport::Mcp,
+                    };
+                    match service.canonical_work_prompt_summary(&context).await {
+                        Ok(summary) => summary,
+                        Err(error) => {
+                            warn!(
+                                team_id = %self.team.id,
+                                slot_id,
+                                error_code = ?error.code,
+                                "canonical Team work summary unavailable for wake prompt"
+                            );
+                            None
+                        }
                     }
+                } else {
+                    None
                 };
-                let current_slot_ids = self
-                    .scheduler
-                    .list_agents()
-                    .await
-                    .into_iter()
-                    .map(|member| member.slot_id)
-                    .collect();
-                let wake_body = build_wake_payload(&agent, &tasks, &claimed_unread, &current_slot_ids);
+                let wake_body = build_wake_payload(&agent, &claimed_unread, work_summary.as_deref());
                 let needs_role_prompt = self.scheduler.take_needs_role_prompt(slot_id).await;
                 let first_message = if needs_role_prompt {
                     let tool_transport = self.team_tool_transport_for_agent(&agent).await?;
@@ -491,13 +504,29 @@ impl TeamSession {
         content: &str,
         files: Option<Vec<String>>,
     ) -> Result<TeamRunAckResponse, TeamError> {
+        self.send_message_with_idempotency(content, files, None).await
+    }
+
+    pub async fn send_message_with_idempotency(
+        &self,
+        content: &str,
+        files: Option<Vec<String>>,
+        idempotency_key: Option<&str>,
+    ) -> Result<TeamRunAckResponse, TeamError> {
         let lead_slot_id = self
             .scheduler
             .find_lead_slot_id()
             .await
             .ok_or_else(|| TeamError::AgentNotFound("no lead agent in team".into()))?;
-        self.enqueue_user_message(&lead_slot_id, TeamRunTargetRole::Lead, content, files)
-            .await
+        self.enqueue_user_message(
+            &lead_slot_id,
+            TeamRunTargetRole::Lead,
+            content,
+            files,
+            idempotency_key.map(|_| "lead"),
+            idempotency_key,
+        )
+        .await
     }
 
     pub async fn send_message_to_agent(
@@ -505,10 +534,19 @@ impl TeamSession {
         slot_id: &str,
         content: &str,
         files: Option<Vec<String>>,
+        idempotency_key: Option<&str>,
     ) -> Result<TeamRunAckResponse, TeamError> {
         let agent = self.scheduler.get_agent(slot_id).await?;
-        self.enqueue_user_message(slot_id, target_role_for(agent.role), content, files)
-            .await
+        let role = target_role_for(agent.role);
+        self.enqueue_user_message(
+            slot_id,
+            role,
+            content,
+            files,
+            idempotency_key.map(|_| slot_id),
+            idempotency_key,
+        )
+        .await
     }
 
     async fn enqueue_user_message(
@@ -517,6 +555,8 @@ impl TeamSession {
         role: TeamRunTargetRole,
         content: &str,
         files: Option<Vec<String>>,
+        idempotency_scope: Option<&str>,
+        idempotency_key: Option<&str>,
     ) -> Result<TeamRunAckResponse, TeamError> {
         self.publish_runtime_constraint(slot_id).await?;
         let agent = self.scheduler.get_agent(slot_id).await?;
@@ -531,25 +571,51 @@ impl TeamSession {
             source,
             binding: CausalBinding::UserVisible,
         })?;
-        let mailbox_message = match self
-            .mailbox
-            .write_with_files(
-                &self.team.id,
-                slot_id,
-                "user",
-                MailboxMessageType::Message,
-                content,
-                None,
-                files.as_deref(),
-            )
-            .await
-        {
+        let mailbox_write = match (idempotency_scope, idempotency_key) {
+            (Some(scope), Some(key)) => {
+                self.mailbox
+                    .write_with_files_idempotent(
+                        &self.team.id,
+                        slot_id,
+                        "user",
+                        MailboxMessageType::Message,
+                        content,
+                        None,
+                        files.as_deref(),
+                        scope,
+                        key,
+                    )
+                    .await
+            }
+            (None, None) => self
+                .mailbox
+                .write_with_files(
+                    &self.team.id,
+                    slot_id,
+                    "user",
+                    MailboxMessageType::Message,
+                    content,
+                    None,
+                    files.as_deref(),
+                )
+                .await
+                .map(|message| crate::mailbox::MailboxWrite {
+                    message,
+                    replayed: false,
+                }),
+            _ => Err(TeamError::InvalidRequest(
+                "mailbox idempotency scope and key must be present together".into(),
+            )),
+        };
+        let mailbox_message = match mailbox_write {
             Ok(message) => message,
             Err(error) => {
                 self.work_coordinator.abort_enqueue(&lease, "mailbox_write_failed");
                 return Err(error);
             }
         };
+        let mailbox_replayed = mailbox_message.replayed;
+        let mailbox_message = mailbox_message.message;
 
         let projection = TeamMessageProjection::new(self.projection_store.clone(), self.broadcaster.clone());
         let request = TeamProjectionRequest::user_visible(
@@ -558,6 +624,7 @@ impl TeamSession {
             &agent.conversation_id,
             content,
             files.unwrap_or_default(),
+            &mailbox_message.id,
         );
         if let Err(error) = projection.project(request).await {
             warn!(
@@ -572,6 +639,13 @@ impl TeamSession {
         let commit = self
             .commit_persisted_enqueue(&lease, mailbox_message.id.clone())
             .await?;
+        debug!(
+            team_id = %self.team.id,
+            slot_id,
+            mailbox_message_id = %mailbox_message.id,
+            mailbox_replayed,
+            "user message mailbox enqueue resolved"
+        );
         self.event_loops.notify(slot_id);
         let snapshot = self.work_coordinator.snapshot();
         let run = self
@@ -590,8 +664,12 @@ impl TeamSession {
     }
 
     async fn publish_runtime_constraint(&self, slot_id: &str) -> Result<(), TeamError> {
+        self.start_member_runtime_on_demand(slot_id).await?;
+        let agent = self.scheduler.get_agent(slot_id).await?;
         let constraint = match self.member_runtimes.snapshot(slot_id) {
-            MemberRuntimeSnapshot::Absent if self.event_loops.has(slot_id) => RuntimeConstraint::Ready,
+            MemberRuntimeSnapshot::Absent if self.service.upgrade().is_none() && self.event_loops.has(slot_id) => {
+                RuntimeConstraint::Ready
+            }
             MemberRuntimeSnapshot::Absent => RuntimeConstraint::Starting { operation_id: 0 },
             MemberRuntimeSnapshot::Attaching { operation_id } => RuntimeConstraint::Starting { operation_id },
             MemberRuntimeSnapshot::Ready => RuntimeConstraint::Ready,
@@ -602,19 +680,58 @@ impl TeamSession {
             MemberRuntimeSnapshot::Removing { operation_id } => RuntimeConstraint::Removing { operation_id },
             MemberRuntimeSnapshot::SessionStopped => RuntimeConstraint::SessionStopped,
         };
-        let update = self.work_coordinator.set_runtime_constraint(slot_id, constraint);
+        let update = self
+            .work_coordinator
+            .set_runtime_constraint(slot_id, target_role_for(agent.role), constraint);
         if !update.terminal_message_ids.is_empty() {
             self.mailbox.mark_read_batch(&update.terminal_message_ids).await?;
         }
         Ok(())
     }
 
-    pub(crate) async fn send_agent_message_from_agent(
+    async fn start_member_runtime_on_demand(&self, slot_id: &str) -> Result<(), TeamError> {
+        let Some(service) = self.service.upgrade() else {
+            return Ok(());
+        };
+        let agent = self.scheduler.get_agent(slot_id).await?;
+        let reservation = match self.member_runtimes.snapshot(slot_id) {
+            MemberRuntimeSnapshot::Ready if self.task_manager.get_task(&agent.conversation_id).is_some() => {
+                return Ok(());
+            }
+            MemberRuntimeSnapshot::Ready => self.member_runtimes.reserve_repair(slot_id),
+            MemberRuntimeSnapshot::Absent => self.member_runtimes.reserve_attach(slot_id, false),
+            MemberRuntimeSnapshot::Failed { .. } => self.member_runtimes.reserve_attach(slot_id, true),
+            MemberRuntimeSnapshot::Attaching { .. } | MemberRuntimeSnapshot::Removing { .. } => return Ok(()),
+            MemberRuntimeSnapshot::SessionStopped => {
+                return Err(TeamError::InvalidRequest(
+                    "team session stopped before member runtime could start".to_owned(),
+                ));
+            }
+        };
+        let ReserveAttach::Start(_) = &reservation else {
+            return Ok(());
+        };
+        let captured_session = service
+            .capture_published_session(self)
+            .ok_or_else(|| TeamError::SessionNotFound(self.team.id.clone()))?;
+        spawn_attach_agent_process_bg(
+            service,
+            captured_session,
+            self.user_id.clone(),
+            agent,
+            self.task_manager.clone(),
+            reservation,
+        );
+        Ok(())
+    }
+
+    pub(crate) async fn send_agent_message_from_agent_with_idempotency(
         &self,
         from_slot_id: &str,
         to_slot_id: &str,
         content: &str,
         files: Option<Vec<String>>,
+        idempotency_key: Option<&str>,
     ) -> Result<AgentMessageQueueResult, TeamError> {
         let to_agent = self.scheduler.get_agent(to_slot_id).await?;
         let from_agent = self.scheduler.get_agent(from_slot_id).await?;
@@ -627,25 +744,58 @@ impl TeamSession {
                 caller_slot_id: from_slot_id.to_owned(),
             },
         })?;
-        let mailbox_message = match self
-            .mailbox
-            .write_with_files(
-                &self.team.id,
-                to_slot_id,
-                from_slot_id,
-                MailboxMessageType::Message,
-                content,
-                None,
-                files.as_deref(),
+        let idempotency_scope = idempotency_key.map(|_| {
+            format!(
+                "mcp:{}:{from_slot_id}:{}:{to_slot_id}",
+                from_slot_id.len(),
+                to_slot_id.len()
             )
-            .await
-        {
+        });
+        let mailbox_write = match (idempotency_scope.as_deref(), idempotency_key) {
+            (Some(scope), Some(key)) => {
+                self.mailbox
+                    .write_with_files_idempotent(
+                        &self.team.id,
+                        to_slot_id,
+                        from_slot_id,
+                        MailboxMessageType::Message,
+                        content,
+                        None,
+                        files.as_deref(),
+                        scope,
+                        key,
+                    )
+                    .await
+            }
+            (None, None) => self
+                .mailbox
+                .write_with_files(
+                    &self.team.id,
+                    to_slot_id,
+                    from_slot_id,
+                    MailboxMessageType::Message,
+                    content,
+                    None,
+                    files.as_deref(),
+                )
+                .await
+                .map(|message| crate::mailbox::MailboxWrite {
+                    message,
+                    replayed: false,
+                }),
+            _ => Err(TeamError::InvalidRequest(
+                "mailbox idempotency scope and key must be present together".into(),
+            )),
+        };
+        let mailbox_message = match mailbox_write {
             Ok(message) => message,
             Err(error) => {
                 self.work_coordinator.abort_enqueue(&lease, "mailbox_write_failed");
                 return Err(error);
             }
         };
+        let mailbox_replayed = mailbox_message.replayed;
+        let mailbox_message = mailbox_message.message;
 
         let projection = TeamMessageProjection::new(self.projection_store.clone(), self.broadcaster.clone());
         let request = TeamProjectionRequest {
@@ -678,7 +828,17 @@ impl TeamSession {
             );
         }
 
-        let commit = self.commit_persisted_enqueue(&lease, mailbox_message.id).await?;
+        let commit = self
+            .commit_persisted_enqueue(&lease, mailbox_message.id.clone())
+            .await?;
+        debug!(
+            team_id = %self.team.id,
+            from_slot_id,
+            to_slot_id,
+            mailbox_message_id = %mailbox_message.id,
+            mailbox_replayed,
+            "agent message mailbox enqueue resolved"
+        );
         self.event_loops.notify(to_slot_id);
         Ok(AgentMessageQueueResult {
             team_run_id: commit.team_run_id,
@@ -802,6 +962,46 @@ impl TeamSession {
         self.enqueue_existing_work(slot_id, source, None, CausalBinding::ActiveRunOrBackground)
             .await?;
         Ok(())
+    }
+
+    /// Re-notifies live event loops for durable mailbox demand that was not
+    /// paired with an in-memory wake (for example after a process interruption).
+    pub(crate) async fn notify_recoverable_unread_mailbox(
+        &self,
+        reason: &'static str,
+    ) -> Result<Vec<String>, TeamError> {
+        let mut notified_slots = Vec::new();
+        for agent in self.scheduler.list_agents().await {
+            let has_recoverable_unread = self
+                .mailbox
+                .peek_unread(&self.team.id, &agent.slot_id)
+                .await?
+                .into_iter()
+                .any(|message| message.from_agent_id != agent.slot_id);
+            if !has_recoverable_unread {
+                continue;
+            }
+            if !self.event_loops.has(&agent.slot_id) {
+                warn!(
+                    team_id = %self.team.id,
+                    slot_id = %agent.slot_id,
+                    reason,
+                    "recoverable unread mailbox has no live Team event loop"
+                );
+                continue;
+            }
+            self.event_loops.notify(&agent.slot_id);
+            notified_slots.push(agent.slot_id);
+        }
+        if !notified_slots.is_empty() {
+            debug!(
+                team_id = %self.team.id,
+                notified_slot_count = notified_slots.len(),
+                reason,
+                "recoverable unread Team mailbox event loops notified"
+            );
+        }
+        Ok(notified_slots)
     }
 
     pub(crate) async fn try_start_recovery_drain(&self, reason: &'static str) -> Result<Vec<String>, TeamError> {
@@ -1020,7 +1220,7 @@ impl TeamSession {
                 "team run {team_run_id} is not active"
             )));
         }
-        let outcome = self.work_coordinator.pause_slot(slot_id);
+        let outcome = self.work_coordinator.pause_slot(slot_id)?;
         if let Some(target) = outcome.cancel_target {
             if let Some(turn_id) = target.turn_id {
                 let agent = self.scheduler.get_agent(slot_id).await?;
@@ -1126,6 +1326,7 @@ impl TeamSession {
 
     pub async fn add_agent(&self, agent: &TeamAgent) {
         self.scheduler.add_agent(agent).await;
+        self.mcp_server.ensure_slot_credential(&agent.slot_id);
     }
 
     /// Reserve the runtime lifecycle before a newly persisted member becomes
@@ -1136,6 +1337,7 @@ impl TeamSession {
 
     pub(crate) async fn add_manual_agent(&self, agent: &TeamAgent) -> Result<(), TeamError> {
         self.scheduler.add_agent(agent).await;
+        self.mcp_server.ensure_slot_credential(&agent.slot_id);
         let lead_slot_id = self
             .scheduler
             .find_lead_slot_id()
@@ -1263,6 +1465,7 @@ impl TeamSession {
     }
 
     pub async fn remove_agent(&self, slot_id: &str) -> Result<(), TeamError> {
+        let agent = self.scheduler.get_agent(slot_id).await?;
         let removal = match self.member_runtimes.begin_remove(slot_id) {
             BeginRemove::Join(waiter) => {
                 let _ = waiter.wait().await;
@@ -1273,6 +1476,7 @@ impl TeamSession {
         if let BeginRemove::Start(lease) = &removal {
             self.work_coordinator.set_runtime_constraint(
                 slot_id,
+                target_role_for(agent.role),
                 RuntimeConstraint::Removing {
                     operation_id: lease.operation_id(),
                 },
@@ -1285,7 +1489,6 @@ impl TeamSession {
         if let Some(target) = work.cancel_target
             && let Some(turn_id) = target.turn_id
         {
-            let agent = self.scheduler.get_agent(slot_id).await?;
             let _ = self
                 .cancellation_port
                 .cancel_agent_turn(&self.user_id, &agent.conversation_id, &turn_id)
@@ -1293,6 +1496,7 @@ impl TeamSession {
         }
         self.event_loops.remove(slot_id);
         let conversation_id = self.scheduler.remove_agent(slot_id).await?;
+        self.mcp_server.revoke_slot_credential(slot_id);
         if let Some(conversation_id) = conversation_id {
             self.task_manager
                 .kill_and_wait(&conversation_id, Some(AgentKillReason::TeamDeleted))
@@ -1385,6 +1589,7 @@ impl TeamSession {
         // Step 5: attach to the in-memory scheduler so wake-from-lead finds
         // the new slot immediately.
         self.scheduler.add_agent(&new_agent).await;
+        self.mcp_server.ensure_slot_credential(&new_agent.slot_id);
 
         // Step 6: welcome message. The mailbox write is the source of truth —
         // if the wake never fires (e.g. warmup raced), the next caller-triggered
@@ -1474,10 +1679,6 @@ impl TeamSession {
     pub fn mailbox(&self) -> &Arc<Mailbox> {
         &self.mailbox
     }
-
-    pub fn task_board(&self) -> &Arc<TaskBoard> {
-        &self.task_board
-    }
 }
 
 pub(crate) fn spawn_attach_agent_process_bg(
@@ -1491,6 +1692,12 @@ pub(crate) fn spawn_attach_agent_process_bg(
     tokio::spawn(async move {
         let outcome = match reservation {
             ReserveAttach::Start(lease) => {
+                service.broadcast_agent_runtime_status(
+                    session.team_id(),
+                    &agent,
+                    TeamAgentRuntimeStatus::Pending,
+                    None,
+                );
                 attach_member_runtime(
                     Arc::clone(&service),
                     Arc::clone(&session),
@@ -1523,9 +1730,11 @@ pub(crate) fn spawn_attach_agent_process_bg(
         }
 
         let _ = service.with_published_session(&session, |current| {
-            current
-                .work_coordinator
-                .set_runtime_constraint(&agent.slot_id, RuntimeConstraint::Ready);
+            current.work_coordinator.set_runtime_constraint(
+                &agent.slot_id,
+                target_role_for(agent.role),
+                RuntimeConstraint::Ready,
+            );
             current.event_loops.notify(&agent.slot_id);
         });
     });
@@ -1542,10 +1751,14 @@ pub(crate) async fn attach_member_runtime(
     let started_at = Instant::now();
     let operation_id = lease.operation_id();
     let generation = session.generation().to_owned();
-    session
-        .work_coordinator
-        .set_runtime_constraint(&agent.slot_id, RuntimeConstraint::Starting { operation_id });
-    service.publish_member_runtime_starting_if_current(&session);
+    session.work_coordinator.set_runtime_constraint(
+        &agent.slot_id,
+        target_role_for(agent.role),
+        RuntimeConstraint::Starting { operation_id },
+    );
+    if agent.role == TeammateRole::Lead {
+        service.publish_member_runtime_starting_if_current(&session);
+    }
     info!(
         team_id = session.team_id(),
         slot_id = agent.slot_id,
@@ -1557,14 +1770,19 @@ pub(crate) async fn attach_member_runtime(
         "team member runtime attach started"
     );
 
-    let attach_result = TeamSession::attach_spawned_agent_process(
-        &service,
-        &agent,
-        session.mcp_stdio_config(&agent.slot_id),
-        &user_id,
-        &task_manager,
-    )
-    .await;
+    let attach_result = match service.acquire_runtime_start_permit(session.team_id()).await {
+        Ok(_start_permit) => {
+            TeamSession::attach_spawned_agent_process(
+                &service,
+                &agent,
+                session.mcp_stdio_config(&agent.slot_id),
+                &user_id,
+                &task_manager,
+            )
+            .await
+        }
+        Err(error) => Err(error),
+    };
     if let Err(error) = attach_result {
         service
             .cleanup_stale_member_runtime_task(&session, &agent.conversation_id)
@@ -1583,6 +1801,7 @@ pub(crate) async fn attach_member_runtime(
                 .await;
             let update = session.work_coordinator.set_runtime_constraint(
                 &agent.slot_id,
+                target_role_for(agent.role),
                 RuntimeConstraint::Failed {
                     operation_id,
                     classification: failure.classification,
@@ -1654,6 +1873,7 @@ pub(crate) async fn attach_member_runtime(
                 session.member_runtimes.commit_failed(&lease, failure.clone());
                 session.work_coordinator.set_runtime_constraint(
                     &agent.slot_id,
+                    target_role_for(agent.role),
                     RuntimeConstraint::Failed {
                         operation_id,
                         classification: failure.classification,
@@ -1683,9 +1903,11 @@ pub(crate) async fn attach_member_runtime(
         cleanup_stale_attach(&service, &session, &agent, operation_id, &generation, started_at).await;
         return lease.waiter().wait().await;
     }
-    session
-        .work_coordinator
-        .set_runtime_constraint(&agent.slot_id, RuntimeConstraint::Ready);
+    session.work_coordinator.set_runtime_constraint(
+        &agent.slot_id,
+        target_role_for(agent.role),
+        RuntimeConstraint::Ready,
+    );
     session.event_loops.notify(&agent.slot_id);
 
     if !service.publish_member_runtime_ready_if_current(&session, &agent) {
@@ -2002,8 +2224,10 @@ mod tests {
     fn make_team() -> Team {
         Team {
             id: "t1".into(),
+            user_id: "user-test".into(),
             name: "Test Team".into(),
             workspace: "/tmp/test-team".into(),
+            workspace_mode: "shared".into(),
             agents: vec![
                 TeamAgent {
                     slot_id: "lead-1".into(),
@@ -2031,6 +2255,7 @@ mod tests {
                 },
             ],
             lead_agent_id: Some("lead-1".into()),
+            session_mode: None,
             created_at: 1000,
             updated_at: 1000,
         }
@@ -2116,10 +2341,13 @@ mod tests {
     #[tokio::test]
     async fn mcp_stdio_config_for_agent() {
         let session = start_session().await;
-        let config = session.mcp_stdio_config("lead-1");
-        assert_eq!(config.team_id, "t1");
-        assert_eq!(config.slot_id, "lead-1");
-        assert_eq!(config.port, session.mcp_server.port());
+        let lead_config = session.mcp_stdio_config("lead-1");
+        let worker_config = session.mcp_stdio_config("worker-1");
+        assert_eq!(lead_config.team_id, "t1");
+        assert_eq!(lead_config.slot_id, "lead-1");
+        assert_eq!(lead_config.port, session.mcp_server.port());
+        assert_ne!(lead_config.token, worker_config.token);
+        assert_eq!(worker_config.token, session.mcp_stdio_config("worker-1").token);
         session.stop();
     }
 
@@ -2183,7 +2411,7 @@ mod tests {
         .await
         .unwrap();
         session
-            .send_message_to_agent("worker-1", "Do this task", None)
+            .send_message_to_agent("worker-1", "Do this task", None, None)
             .await
             .unwrap();
 
@@ -2197,23 +2425,28 @@ mod tests {
     #[tokio::test]
     async fn send_message_to_unknown_agent_returns_error() {
         let session = start_session().await;
-        let result = session.send_message_to_agent("nonexistent", "Hello", None).await;
+        let result = session.send_message_to_agent("nonexistent", "Hello", None, None).await;
         assert!(result.is_err());
         session.stop();
     }
 
     #[tokio::test]
-    async fn shutdown_without_active_run_queues_background_work() {
+    async fn shutdown_without_active_run_opens_system_lifecycle_run() {
         let session = start_session().await;
 
         session
             .shutdown_agent("lead-1", "worker-1", Some("done".into()))
             .await
-            .expect("background caller may queue shutdown work");
+            .expect("leader may queue shutdown work while the team is idle");
 
         let unread = session.mailbox().peek_unread("t1", "worker-1").await.unwrap();
         assert_eq!(unread.len(), 1);
-        assert!(session.team_run_manager().current_active_run_id().is_none());
+        let payload = session
+            .team_run_manager()
+            .current_payload(&session.work_coordinator.snapshot())
+            .expect("shutdown wake must open a lifecycle run");
+        assert_eq!(payload.source, aionui_api_types::TeamRunSource::SystemLifecycle);
+        assert!(!payload.has_user_intervention);
         session.stop();
     }
 
@@ -2235,12 +2468,18 @@ mod tests {
         };
         session.add_agent(&new_agent).await;
 
+        let new_credential = session.mcp_stdio_config("new-1").token;
+        assert!(!new_credential.is_empty());
+        assert_ne!(new_credential, session.mcp_stdio_config("lead-1").token);
+        assert_eq!(new_credential, session.mcp_stdio_config("new-1").token);
+
         let agents = session.scheduler.list_agents().await;
         assert_eq!(agents.len(), 3);
 
         session.remove_agent("new-1").await.unwrap();
         let agents = session.scheduler.list_agents().await;
         assert_eq!(agents.len(), 2);
+        assert!(session.mcp_server.credential_for_slot("new-1").is_none());
 
         session.stop();
     }
@@ -2552,7 +2791,7 @@ mod tests {
         let (session, _repo) = start_session_with(empty_task_manager()).await;
         session
             .work_coordinator
-            .set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+            .set_runtime_constraint("lead-1", TeamRunTargetRole::Lead, RuntimeConstraint::Ready);
         let lease = session
             .work_coordinator
             .acquire_enqueue(EnqueueRequest {
@@ -2587,28 +2826,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_next_batch_requeues_claim_when_task_snapshot_fails() {
-        let (session, repo) = start_session_with(empty_task_manager()).await;
-        let session = Arc::new(session);
-        session.send_message("retry after task read", None).await.unwrap();
-        repo.state.lock().unwrap().fail_task_lists = true;
-        register_test_event_loop(&session, "lead-1");
-
-        let error = match session.prepare_next_batch("lead-1").await {
-            Err(error) => error,
-            Ok(_) => panic!("task snapshot failure must be returned"),
-        };
-
-        assert!(matches!(error, TeamError::Database(_)));
-        let slot = session.work_coordinator.slot_snapshot("lead-1").unwrap();
-        assert_eq!(slot.state, SlotPhase::Queued);
-        assert!(slot.active_batch.is_none());
-        assert_eq!(slot.queued_foreground_count, 1);
-        session.stop();
-    }
-
-    #[tokio::test]
-    async fn background_turn_is_reported_running_without_a_team_run() {
+    async fn shutdown_turn_is_reported_running_inside_a_system_run() {
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let repo: Arc<dyn ITeamRepository> = Arc::new(MockTeamRepo::new());
@@ -2642,7 +2860,12 @@ mod tests {
         let slot = session.work_coordinator.slot_snapshot("worker-1").unwrap();
         assert_eq!(slot.state, SlotPhase::Running);
         assert_eq!(slot.active_turn_id.as_deref(), Some("turn-background"));
-        assert!(session.team_run_manager.current_active_run_id().is_none());
+        let payload = session
+            .team_run_manager
+            .current_payload(&session.work_coordinator.snapshot())
+            .expect("shutdown turn must stay inside a lifecycle run");
+        assert_eq!(payload.source, aionui_api_types::TeamRunSource::SystemLifecycle);
+        assert_eq!(payload.status, aionui_api_types::TeamRunStatus::Running);
 
         release_tx.send(()).unwrap();
         session.stop();
@@ -2712,7 +2935,7 @@ mod tests {
         let session = start_session().await;
 
         let ack = session
-            .send_message_to_agent("worker-1", "wait for runtime", None)
+            .send_message_to_agent("worker-1", "wait for runtime", None, None)
             .await
             .unwrap();
 
@@ -2771,7 +2994,7 @@ mod tests {
         let old_emitter = Arc::new(TeamEventEmitter::new("t1".into(), old_broadcaster));
         let old_runs = Arc::new(TeamRunManager::new("t1".into(), old_emitter));
         let old_coordinator = SlotWorkCoordinator::new("t1".into(), "old-generation".into(), old_runs);
-        old_coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+        old_coordinator.set_runtime_constraint("lead-1", TeamRunTargetRole::Lead, RuntimeConstraint::Ready);
         let lease = old_coordinator
             .acquire_enqueue(EnqueueRequest {
                 slot_id: "lead-1".into(),
@@ -2789,7 +3012,7 @@ mod tests {
         let new_emitter = Arc::new(TeamEventEmitter::new("t1".into(), new_broadcaster));
         let new_runs = Arc::new(TeamRunManager::new("t1".into(), new_emitter));
         let new_coordinator = SlotWorkCoordinator::new("t1".into(), "new-generation".into(), new_runs);
-        new_coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+        new_coordinator.set_runtime_constraint("lead-1", TeamRunTargetRole::Lead, RuntimeConstraint::Ready);
         assert_eq!(
             new_coordinator.mark_started(&old_batch, "turn-old"),
             crate::work_coordinator::StartCommitResult::StaleOwner
@@ -2842,7 +3065,7 @@ mod tests {
         let (session, _repo) = start_session_with(empty_task_manager()).await;
 
         session
-            .send_message_to_agent("worker-1", "do X", Some(vec!["/tmp/x.md".into()]))
+            .send_message_to_agent("worker-1", "do X", Some(vec!["/tmp/x.md".into()]), None)
             .await
             .unwrap();
 

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use aionui_api_types::{TeamRunStatus, TeamRunTargetRole};
+use aionui_api_types::{TeamRunSource, TeamRunStatus, TeamRunTargetRole};
 
 use crate::events::TeamEventEmitter;
 use crate::team_run::TeamRunManager;
@@ -19,7 +19,7 @@ fn coordinator_and_manager() -> (Arc<SlotWorkCoordinator>, Arc<TeamRunManager>) 
         "generation-1".into(),
         manager.clone(),
     ));
-    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    coordinator.set_runtime_constraint("lead-1", TeamRunTargetRole::Lead, RuntimeConstraint::Ready);
     (coordinator, manager)
 }
 
@@ -88,6 +88,7 @@ fn runtime_failure_fails_the_related_run() {
     coordinator.commit_enqueue(&lease, Some("m1".into())).unwrap();
     coordinator.set_runtime_constraint(
         "lead-1",
+        TeamRunTargetRole::Lead,
         RuntimeConstraint::Failed {
             operation_id: 7,
             classification: "attach_failed",
@@ -136,7 +137,7 @@ fn accepted_event_is_emitted_only_after_the_durable_enqueue_commits() {
     let emitter = Arc::new(TeamEventEmitter::new("team-1".into(), broadcaster.clone()));
     let manager = Arc::new(TeamRunManager::new("team-1".into(), emitter));
     let coordinator = SlotWorkCoordinator::new("team-1".into(), "generation-1".into(), manager);
-    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    coordinator.set_runtime_constraint("lead-1", TeamRunTargetRole::Lead, RuntimeConstraint::Ready);
 
     let lease = acquire(&coordinator, CausalBinding::UserVisible);
     assert!(broadcaster.events_by_name("team.runAccepted").is_empty());
@@ -148,8 +149,8 @@ fn accepted_event_is_emitted_only_after_the_durable_enqueue_commits() {
 #[test]
 fn mcp_message_inherits_the_callers_running_batch_causality() {
     let (coordinator, manager) = coordinator_and_manager();
-    coordinator.set_runtime_constraint("worker-1", RuntimeConstraint::Ready);
-    coordinator.set_runtime_constraint("worker-2", RuntimeConstraint::Ready);
+    coordinator.set_runtime_constraint("worker-1", TeamRunTargetRole::Teammate, RuntimeConstraint::Ready);
+    coordinator.set_runtime_constraint("worker-2", TeamRunTargetRole::Teammate, RuntimeConstraint::Ready);
 
     let user = acquire(&coordinator, CausalBinding::UserVisible);
     let run_id = user.team_run_id.clone().unwrap();
@@ -207,7 +208,7 @@ fn mcp_message_inherits_the_callers_running_batch_causality() {
             },
         })
         .unwrap();
-    assert_eq!(background_child.team_run_id, None);
+    assert_eq!(background_child.team_run_id, unrelated_user.team_run_id);
 
     coordinator.abort_enqueue(&background_child, "test_complete");
     coordinator.abort_enqueue(&unrelated_user, "test_complete");
@@ -216,9 +217,36 @@ fn mcp_message_inherits_the_callers_running_batch_causality() {
 }
 
 #[test]
+fn inherit_running_batch_without_active_run_opens_system_lifecycle_run() {
+    let (coordinator, manager) = coordinator_and_manager();
+    coordinator.set_runtime_constraint("worker-1", TeamRunTargetRole::Teammate, RuntimeConstraint::Ready);
+
+    let lease = coordinator
+        .acquire_enqueue(EnqueueRequest {
+            slot_id: "worker-1".into(),
+            role: TeamRunTargetRole::Teammate,
+            source: WorkSource::McpSendMessage,
+            binding: CausalBinding::InheritRunningBatch {
+                caller_slot_id: "lead-1".into(),
+            },
+        })
+        .unwrap();
+    assert!(lease.team_run_id.is_some());
+
+    coordinator.commit_enqueue(&lease, Some("m-system".into())).unwrap();
+    let ReconcileDecision::Claim(_) = coordinator.next("worker-1") else {
+        panic!("run-scoped wake must be claimable");
+    };
+
+    let payload = manager.current_payload(&coordinator.snapshot()).unwrap();
+    assert_eq!(payload.source, TeamRunSource::SystemLifecycle);
+    assert!(!payload.has_user_intervention);
+}
+
+#[test]
 fn published_dynamic_attach_failure_blocks_only_related_work_and_preserves_healthy_runtimes() {
     let (coordinator, manager) = coordinator_and_manager();
-    coordinator.set_runtime_constraint("worker-1", RuntimeConstraint::Ready);
+    coordinator.set_runtime_constraint("worker-1", TeamRunTargetRole::Teammate, RuntimeConstraint::Ready);
     let user = coordinator
         .acquire_enqueue(EnqueueRequest {
             slot_id: "worker-1".into(),
@@ -240,6 +268,7 @@ fn published_dynamic_attach_failure_blocks_only_related_work_and_preserves_healt
 
     coordinator.set_runtime_constraint(
         "worker-1",
+        TeamRunTargetRole::Teammate,
         RuntimeConstraint::Failed {
             operation_id: 9,
             classification: "attach_failed",
@@ -256,8 +285,8 @@ fn published_dynamic_attach_failure_blocks_only_related_work_and_preserves_healt
 #[test]
 fn manual_or_leader_add_during_run_inherits_run_causality() {
     let (coordinator, _manager) = coordinator_and_manager();
-    coordinator.set_runtime_constraint("worker-1", RuntimeConstraint::Ready);
-    coordinator.set_runtime_constraint("worker-2", RuntimeConstraint::Ready);
+    coordinator.set_runtime_constraint("worker-1", TeamRunTargetRole::Teammate, RuntimeConstraint::Ready);
+    coordinator.set_runtime_constraint("worker-2", TeamRunTargetRole::Teammate, RuntimeConstraint::Ready);
     let user = acquire(&coordinator, CausalBinding::UserVisible);
     let run_id = user.team_run_id.clone().unwrap();
     coordinator.commit_enqueue(&user, Some("m-user".into())).unwrap();

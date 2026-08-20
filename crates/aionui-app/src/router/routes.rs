@@ -1,5 +1,6 @@
 //! Top-level router assembly: middleware stack + module route merges.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -26,6 +27,7 @@ use aionui_channel::weixin_login_route;
 use aionui_common::ApiErrorLogContext;
 use aionui_conversation::{conversation_ops_routes, conversation_routes};
 use aionui_cron::cron_routes;
+use aionui_db::{ITeamRepository, SqliteTeamRepository};
 use aionui_extension::{extension_routes, hub_routes, skill_routes};
 use aionui_file::file_routes;
 use aionui_mcp::mcp_routes;
@@ -33,7 +35,7 @@ use aionui_office::{office_proxy_routes, office_routes};
 use aionui_realtime::{WsHandlerState, ws_upgrade_handler};
 use aionui_shell::shell_routes;
 use aionui_system::{connection_test_routes, system_routes};
-use aionui_team::{TeamSessionService, team_routes};
+use aionui_team::{TeamDeliveryService, TeamSessionService, team_routes};
 
 use crate::services::AppServices;
 
@@ -44,6 +46,7 @@ use super::trace::with_access_log;
 
 pub struct RouterRuntime {
     pub team_service: Arc<TeamSessionService>,
+    pub team_delivery_service: Arc<TeamDeliveryService>,
 }
 
 /// Create the application router with all routes and global middleware.
@@ -63,18 +66,73 @@ pub async fn create_router_with_runtime(services: &AppServices) -> Result<(Route
     let boot = Instant::now();
     tracing::info!("startup: router assembly started");
 
-    // Bridge event bus → WebSocket manager: forward all broadcast events
-    // to connected WebSocket clients.
+    // Bridge the internal event bus to WebSocket clients. Team payloads are
+    // owner-scoped at this boundary; a missing or malformed owner mapping is
+    // dropped rather than downgraded to a global broadcast.
     let mut event_rx = services.event_bus.subscribe();
     let ws_manager = services.ws_manager.clone();
+    let team_repo = SqliteTeamRepository::new(services.database.pool().clone());
+    let jwt_service = services.jwt_service.clone();
+    let local = services.local;
     tokio::spawn(async move {
+        let mut team_owners = match team_repo.list_teams().await {
+            Ok(teams) => teams
+                .into_iter()
+                .map(|team| (team.id, team.user_id))
+                .collect::<HashMap<_, _>>(),
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to preload Team WebSocket ownership map");
+                HashMap::new()
+            }
+        };
+        let resolve_user = move |token: &str| jwt_service.verify(token).ok().map(|claims| claims.user_id);
+
         while let Ok(event) = event_rx.recv().await {
-            ws_manager.broadcast_all(event);
+            if !event.name.starts_with("team.") {
+                ws_manager.broadcast_all(event);
+                continue;
+            }
+
+            let Some(team_id) = event.data.get("team_id").and_then(serde_json::Value::as_str) else {
+                tracing::warn!(event_name = %event.name, "Team WebSocket event without team_id was dropped");
+                continue;
+            };
+            let owner_user_id = match team_repo.get_team(team_id).await {
+                Ok(Some(team)) => {
+                    team_owners.insert(team_id.to_owned(), team.user_id.clone());
+                    Some(team.user_id)
+                }
+                Ok(None) => team_owners.remove(team_id),
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        event_name = %event.name,
+                        team_id,
+                        "Team WebSocket ownership lookup failed; event was dropped"
+                    );
+                    None
+                }
+            };
+            let Some(owner_user_id) = owner_user_id else {
+                tracing::warn!(
+                    event_name = %event.name,
+                    team_id,
+                    "Team WebSocket event has no authorized owner mapping and was dropped"
+                );
+                continue;
+            };
+
+            if local {
+                ws_manager.broadcast_all(event);
+            } else {
+                ws_manager.broadcast_to_user(&owner_user_id, event, &resolve_user);
+            }
         }
     });
 
     let (states, channel_components) = build_module_states(services).await?;
     let team_service = states.team.service.clone();
+    let team_delivery_service = states.team.delivery_service.clone();
     tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "startup: module states built");
 
     // Start channel orchestrator (message loop)
@@ -115,7 +173,13 @@ pub async fn create_router_with_runtime(services: &AppServices) -> Result<(Route
         elapsed_ms = boot.elapsed().as_millis(),
         "startup: router assembly completed"
     );
-    Ok((router, RouterRuntime { team_service }))
+    Ok((
+        router,
+        RouterRuntime {
+            team_service,
+            team_delivery_service,
+        },
+    ))
 }
 
 /// Create the application router with custom module states.

@@ -67,9 +67,13 @@ pub enum TeamToolTransport {
 pub enum TeamToolName {
     TeamMembers,
     TeamSendMessage,
-    TeamTaskCreate,
-    TeamTaskUpdate,
-    TeamTaskList,
+    TeamInspect,
+    TeamDelegate,
+    TeamProgress,
+    TeamSubmit,
+    TeamReview,
+    TeamIntegrate,
+    TeamCancel,
     TeamListAssistants,
     TeamDescribeAssistant,
     TeamSpawnAgent,
@@ -82,9 +86,13 @@ impl TeamToolName {
         match self {
             Self::TeamMembers => "team_members",
             Self::TeamSendMessage => "team_send_message",
-            Self::TeamTaskCreate => "team_task_create",
-            Self::TeamTaskUpdate => "team_task_update",
-            Self::TeamTaskList => "team_task_list",
+            Self::TeamInspect => "team_inspect",
+            Self::TeamDelegate => "team_delegate",
+            Self::TeamProgress => "team_progress",
+            Self::TeamSubmit => "team_submit",
+            Self::TeamReview => "team_review",
+            Self::TeamIntegrate => "team_integrate",
+            Self::TeamCancel => "team_cancel",
             Self::TeamListAssistants => "team_list_assistants",
             Self::TeamDescribeAssistant => "team_describe_assistant",
             Self::TeamSpawnAgent => "team_spawn_agent",
@@ -97,9 +105,13 @@ impl TeamToolName {
         Some(match value {
             "team_members" => Self::TeamMembers,
             "team_send_message" => Self::TeamSendMessage,
-            "team_task_create" => Self::TeamTaskCreate,
-            "team_task_update" => Self::TeamTaskUpdate,
-            "team_task_list" => Self::TeamTaskList,
+            "team_inspect" => Self::TeamInspect,
+            "team_delegate" => Self::TeamDelegate,
+            "team_progress" => Self::TeamProgress,
+            "team_submit" => Self::TeamSubmit,
+            "team_review" => Self::TeamReview,
+            "team_integrate" => Self::TeamIntegrate,
+            "team_cancel" => Self::TeamCancel,
             "team_list_assistants" => Self::TeamListAssistants,
             "team_describe_assistant" => Self::TeamDescribeAssistant,
             "team_spawn_agent" => Self::TeamSpawnAgent,
@@ -141,12 +153,16 @@ pub enum TeamToolErrorCode {
     SchemaValidationFailed,
     PermissionDenied,
     TeamNotFound,
+    WorkItemNotFound,
     ConversationNotFound,
     AgentNotFound,
     NotInTeam,
     TransportUnavailable,
     RuntimeContextMissing,
     RuntimeAuthFailed,
+    RevisionConflict,
+    BusinessRuleViolation,
+    Internal,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -274,9 +290,18 @@ pub fn team_tool_descriptors_for_role(role: TeamToolRole) -> Vec<TeamToolDescrip
 }
 
 pub fn team_tool_descriptor(name: &str) -> Option<TeamToolDescriptor> {
-    team_tool_descriptors()
+    tool_specs()
         .into_iter()
-        .find(|descriptor| descriptor.name == name)
+        .find(|spec| spec.name.as_str() == name)
+        .map(|spec| TeamToolDescriptor {
+            name: spec.name.as_str().to_owned(),
+            permission: spec.permission,
+            description: spec.description.to_owned(),
+            input_schema: spec.input_schema,
+            cli_command: spec.cli_command.iter().map(|part| (*part).to_owned()).collect(),
+            when: spec.when.to_owned(),
+            input_summary: spec.input_summary.to_owned(),
+        })
 }
 
 pub fn cli_command_for_tool(name: &str) -> Option<&'static [&'static str]> {
@@ -322,107 +347,222 @@ fn tool_specs() -> Vec<TeamToolSpec> {
         TeamToolSpec {
             name: TeamToolName::TeamSendMessage,
             permission: TeamToolPermission::AnyTeamAgent,
-            description: "Send a message to a teammate or broadcast to all (to=\"*\"). When delegating work that depends on user attachments, forward their absolute paths in files.",
+            description: "Send a message to a teammate, to the team leader (to=\"leader\"), or broadcast to all (to=\"*\"). When delegating work that depends on user attachments, forward their absolute paths in files.",
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
-                    "to": { "type": "string", "description": "Target agent slot_id or \"*\" for broadcast" },
+                    "to": { "type": "string", "description": "Target agent slot_id, \"leader\" for the current team leader, or \"*\" for broadcast" },
                     "message": { "type": "string", "description": "Message content" },
                     "files": {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Absolute attachment paths to forward to the target agent"
+                    },
+                    "idempotency_key": {
+                        "type": "string",
+                        "description": "Optional stable key for safely retrying the same message"
                     }
                 },
                 "required": ["to", "message"]
             }),
             cli_command: &["send-message"],
             when: "Send teammate message",
-            input_summary: "to, message",
+            input_summary: "to, message, optional idempotency_key",
         },
         TeamToolSpec {
-            name: TeamToolName::TeamTaskCreate,
+            name: TeamToolName::TeamInspect,
             permission: TeamToolPermission::AnyTeamAgent,
-            description: "Create a new task on the team task board.",
+            description: "Inspect canonical Team work visible to the authenticated member. Returns current revisions and server-computed allowed_actions. Omit work_item_id for the scoped list.",
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
-                    "subject": { "type": "string", "description": "Task subject" },
-                    "description": { "type": "string", "description": "Task description" },
-                    "owner": { "type": "string", "description": "Owning agent slotId" },
-                    "blocked_by": { "type": "array", "items": { "type": "string" }, "description": "Task IDs this task depends on" }
-                },
-                "required": ["subject"]
-            }),
-            cli_command: &["task", "create"],
-            when: "Create task",
-            input_summary: "subject, optional owner/deps",
-        },
-        TeamToolSpec {
-            name: TeamToolName::TeamTaskUpdate,
-            permission: TeamToolPermission::AnyTeamAgent,
-            description: "Update an existing task on the team task board.",
-            input_schema: json!({
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "task_id": { "type": "string", "description": "Task ID to update" },
-                    "status": { "type": "string", "enum": ["pending", "in_progress", "completed", "deleted"], "description": "New status" },
-                    "description": { "type": "string", "description": "New description" },
-                    "owner": { "type": "string", "description": "New owning agent slotId" },
-                    "blocked_by": { "type": "array", "items": { "type": "string" }, "description": "New dependency list" }
-                },
-                "required": ["task_id"]
-            }),
-            cli_command: &["task", "update"],
-            when: "Update task",
-            input_summary: "task_id, optional status/owner/deps",
-        },
-        TeamToolSpec {
-            name: TeamToolName::TeamTaskList,
-            permission: TeamToolPermission::AnyTeamAgent,
-            description: "List tasks on the team task board. Pass {} for the full board, or use owner/status/include_deleted/limit for filtered views.",
-            input_schema: json!({
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "owner": {
-                        "type": "string",
-                        "description": "Return only tasks owned by this exact agent slot_id"
-                    },
-                    "status": {
-                        "description": "Return only tasks with these statuses. Accepts one status string or an array of status strings.",
-                        "anyOf": [
-                            {
-                                "type": "string",
-                                "enum": ["pending", "in_progress", "completed", "deleted"]
-                            },
-                            {
-                                "type": "array",
-                                "minItems": 1,
-                                "items": {
-                                    "type": "string",
-                                    "enum": ["pending", "in_progress", "completed", "deleted"]
-                                }
-                            }
-                        ]
-                    },
-                    "include_deleted": {
-                        "type": "boolean",
-                        "description": "When status is omitted, include deleted tasks. Defaults to true so {} returns the full board."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "description": "Maximum number of returned tasks. Values above 200 are clamped to 200."
-                    }
+                    "work_item_id": { "type": "string", "description": "Optional exact WorkItem ID" }
                 }
             }),
-            cli_command: &["task", "list"],
-            when: "List tasks",
-            input_summary: "owner, status, include_deleted, limit",
+            cli_command: &["inspect"],
+            when: "Inspect canonical work",
+            input_summary: "optional work_item_id",
+        },
+        TeamToolSpec {
+            name: TeamToolName::TeamDelegate,
+            permission: TeamToolPermission::AnyTeamAgent,
+            description: "Create and queue a canonical WorkItem for a direct subordinate. The runtime durably notifies and wakes the assignee after the command commits. Actor identity comes from the authenticated member credential, never from this payload.",
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "idempotency_key": { "type": "string" },
+                    "parent_work_item_id": { "type": "string" },
+                    "subject": { "type": "string" },
+                    "description": { "type": "string" },
+                    "assignee_member_id": { "type": "string" },
+                    "delivery_requirement": { "type": "string", "enum": ["none", "git"] }
+                },
+                "required": ["idempotency_key", "subject", "assignee_member_id", "delivery_requirement"]
+            }),
+            cli_command: &["delegate"],
+            when: "Delegate work",
+            input_summary: "idempotency_key, subject, assignee_member_id, delivery_requirement",
+        },
+        TeamToolSpec {
+            name: TeamToolName::TeamProgress,
+            permission: TeamToolPermission::AnyTeamAgent,
+            description: "Advance assigned canonical work with action start, block, or resume. Block requires concise context, which is committed atomically with the state change and controller notification. Start and resume must not include context. The authenticated member must be the WorkItem assignee.",
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "idempotency_key": { "type": "string" },
+                    "work_item_id": { "type": "string" },
+                    "expected_work_revision": { "type": "integer", "minimum": 0 },
+                    "action": { "type": "string", "enum": ["start", "block", "resume"] },
+                    "context": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 4000,
+                        "description": "Required only for block; explains the blocker to the controller"
+                    }
+                },
+                "required": ["idempotency_key", "work_item_id", "expected_work_revision", "action"],
+                "allOf": [
+                    {
+                        "if": { "properties": { "action": { "const": "block" } }, "required": ["action"] },
+                        "then": { "required": ["context"] }
+                    },
+                    {
+                        "if": { "properties": { "action": { "enum": ["start", "resume"] } }, "required": ["action"] },
+                        "then": { "not": { "required": ["context"] } }
+                    }
+                ]
+            }),
+            cli_command: &["progress"],
+            when: "Start, block, or resume work",
+            input_summary: "idempotency_key, work_item_id, expected_work_revision, action, block context",
+        },
+        TeamToolSpec {
+            name: TeamToolName::TeamSubmit,
+            permission: TeamToolPermission::AnyTeamAgent,
+            description: "Commit a submission and concise evidence atomically with the reviewer notification. Use kind=inline without a result body, or kind=git with the next unused content revision and immutable head commit. Inspect existing deliveries after changes are requested; Git assignment is resolved from the WorkItem.",
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "idempotency_key": { "type": "string" },
+                    "work_item_id": { "type": "string" },
+                    "expected_work_revision": { "type": "integer", "minimum": 0 },
+                    "kind": { "type": "string", "enum": ["inline", "git"] },
+                    "evidence": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 8000,
+                        "description": "Concise result, validation, and handoff evidence for the reviewer"
+                    },
+                    "git": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "content_revision": { "type": "integer", "minimum": 1 },
+                            "head_commit": { "type": "string", "minLength": 1 }
+                        },
+                        "required": ["content_revision", "head_commit"]
+                    }
+                },
+                "required": ["idempotency_key", "work_item_id", "expected_work_revision", "kind", "evidence"],
+                "allOf": [
+                    {
+                        "if": { "properties": { "kind": { "const": "git" } }, "required": ["kind"] },
+                        "then": { "required": ["git"] }
+                    },
+                    {
+                        "if": { "properties": { "kind": { "const": "inline" } }, "required": ["kind"] },
+                        "then": { "not": { "required": ["git"] } }
+                    }
+                ]
+            }),
+            cli_command: &["submit"],
+            when: "Submit inline or Git work",
+            input_summary: "idempotency_key, work_item_id, expected_work_revision, kind, evidence, optional git",
+        },
+        TeamToolSpec {
+            name: TeamToolName::TeamReview,
+            permission: TeamToolPermission::AnyTeamAgent,
+            description: "Review a submitted canonical WorkItem and accept it, request changes, or reject it. Request changes requires concise feedback, which is committed atomically with the assignee notification. Git acceptance atomically queues the integrator notification. The authenticated member must be its reviewer.",
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "idempotency_key": { "type": "string" },
+                    "work_item_id": { "type": "string" },
+                    "expected_work_revision": { "type": "integer", "minimum": 0 },
+                    "expected_delivery_revision": { "type": "integer", "minimum": 0 },
+                    "decision": { "type": "string", "enum": ["accept", "request_changes", "reject"] },
+                    "feedback": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 4000,
+                        "description": "Required only for request_changes"
+                    }
+                },
+                "required": ["idempotency_key", "work_item_id", "expected_work_revision", "decision"],
+                "allOf": [
+                    {
+                        "if": { "properties": { "decision": { "const": "request_changes" } }, "required": ["decision"] },
+                        "then": { "required": ["feedback"] }
+                    },
+                    {
+                        "if": { "properties": { "decision": { "enum": ["accept", "reject"] } }, "required": ["decision"] },
+                        "then": { "not": { "required": ["feedback"] } }
+                    }
+                ]
+            }),
+            cli_command: &["review"],
+            when: "Review submitted work",
+            input_summary: "idempotency_key, work_item_id, revisions, decision, request_changes feedback",
+        },
+        TeamToolSpec {
+            name: TeamToolName::TeamIntegrate,
+            permission: TeamToolPermission::AnyTeamAgent,
+            description: "Integrate the exact accepted Git delivery for a canonical WorkItem. The authenticated member must be its bound integrator. This is the only supported way to change the integration target: never run raw git merge, cherry-pick, rebase, reset, update-ref, or force-move the target branch. Repository coordinates and merged evidence are derived and verified by the server.",
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "idempotency_key": { "type": "string" },
+                    "work_item_id": { "type": "string" },
+                    "expected_work_revision": { "type": "integer", "minimum": 0 },
+                    "expected_delivery_revision": { "type": "integer", "minimum": 0 }
+                },
+                "required": [
+                    "idempotency_key",
+                    "work_item_id",
+                    "expected_work_revision",
+                    "expected_delivery_revision"
+                ]
+            }),
+            cli_command: &["integrate"],
+            when: "Integrate accepted Git delivery",
+            input_summary: "idempotency_key, work_item_id, expected_work_revision, expected_delivery_revision",
+        },
+        TeamToolSpec {
+            name: TeamToolName::TeamCancel,
+            permission: TeamToolPermission::AnyTeamAgent,
+            description: "Cancel a canonical WorkItem controlled by the authenticated member.",
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "idempotency_key": { "type": "string" },
+                    "work_item_id": { "type": "string" },
+                    "expected_work_revision": { "type": "integer", "minimum": 0 },
+                    "expected_delivery_revision": { "type": "integer", "minimum": 0 }
+                },
+                "required": ["idempotency_key", "work_item_id", "expected_work_revision"]
+            }),
+            cli_command: &["cancel"],
+            when: "Cancel controlled work",
+            input_summary: "idempotency_key, work_item_id, revisions",
         },
         TeamToolSpec {
             name: TeamToolName::TeamListAssistants,
@@ -516,7 +656,7 @@ mod tests {
     #[test]
     fn descriptor_count_and_names_are_unique() {
         let descriptors = team_tool_descriptors();
-        assert_eq!(descriptors.len(), 10);
+        assert_eq!(descriptors.len(), 14);
         let names = descriptors
             .iter()
             .map(|descriptor| descriptor.name.as_str())
@@ -541,9 +681,13 @@ mod tests {
         let cases = [
             ("team_members", vec!["members"]),
             ("team_send_message", vec!["send-message"]),
-            ("team_task_create", vec!["task", "create"]),
-            ("team_task_update", vec!["task", "update"]),
-            ("team_task_list", vec!["task", "list"]),
+            ("team_inspect", vec!["inspect"]),
+            ("team_delegate", vec!["delegate"]),
+            ("team_progress", vec!["progress"]),
+            ("team_submit", vec!["submit"]),
+            ("team_review", vec!["review"]),
+            ("team_integrate", vec!["integrate"]),
+            ("team_cancel", vec!["cancel"]),
             ("team_list_assistants", vec!["list-assistants"]),
             ("team_describe_assistant", vec!["describe-assistant"]),
             ("team_spawn_agent", vec!["spawn-agent"]),
@@ -567,6 +711,8 @@ mod tests {
         assert!(!names.contains(&"team_rename_agent".to_owned()));
         assert!(!names.contains(&"team_shutdown_agent".to_owned()));
         assert!(names.contains(&"team_send_message".to_owned()));
+        assert!(names.contains(&"team_inspect".to_owned()));
+        assert!(names.contains(&"team_progress".to_owned()));
     }
 
     #[test]
@@ -583,5 +729,113 @@ mod tests {
         let required = descriptor.input_schema["required"].as_array().unwrap();
         assert!(required.contains(&json!("name")));
         assert!(required.contains(&json!("assistant_id")));
+    }
+
+    #[test]
+    fn send_message_schema_documents_stable_leader_alias() {
+        let descriptor = team_tool_descriptor("team_send_message").expect("send descriptor");
+        assert!(descriptor.description.contains("to=\"leader\""));
+        assert!(
+            descriptor.input_schema["properties"]["to"]["description"]
+                .as_str()
+                .expect("to description")
+                .contains("\"leader\"")
+        );
+        assert_eq!(
+            descriptor.input_schema["properties"]["idempotency_key"]["type"],
+            "string"
+        );
+        let required = descriptor.input_schema["required"].as_array().unwrap();
+        assert!(!required.contains(&json!("idempotency_key")));
+    }
+
+    #[test]
+    fn canonical_work_schemas_never_accept_an_actor_identity() {
+        for name in [
+            "team_delegate",
+            "team_progress",
+            "team_submit",
+            "team_review",
+            "team_integrate",
+            "team_cancel",
+        ] {
+            let descriptor = team_tool_descriptor(name).expect("canonical descriptor");
+            let properties = descriptor.input_schema["properties"].as_object().unwrap();
+            assert!(!properties.contains_key("actor_member_id"));
+            assert!(!properties.contains_key("caller_slot_id"));
+            assert!(!properties.contains_key("team_id"));
+            assert_eq!(descriptor.input_schema["additionalProperties"], false);
+        }
+    }
+
+    #[test]
+    fn git_submit_schema_accepts_only_delivery_evidence() {
+        let descriptor = team_tool_descriptor("team_submit").expect("submit descriptor");
+        let required = descriptor.input_schema["required"].as_array().unwrap();
+        assert!(required.contains(&json!("evidence")));
+        assert_eq!(descriptor.input_schema["properties"]["evidence"]["maxLength"], 8000);
+        let git = &descriptor.input_schema["properties"]["git"];
+        let properties = git["properties"].as_object().expect("git properties");
+        assert_eq!(properties.len(), 2);
+        assert!(properties.contains_key("content_revision"));
+        assert!(properties.contains_key("head_commit"));
+        assert!(!properties.contains_key("repository_id"));
+        assert!(!properties.contains_key("base_commit"));
+        assert!(!properties.contains_key("branch_ref"));
+        assert_eq!(properties["head_commit"]["minLength"], 1);
+        assert_eq!(git["additionalProperties"], false);
+    }
+
+    #[test]
+    fn git_submit_schema_requires_git_payload_for_git_kind() {
+        let descriptor = team_tool_descriptor("team_submit").expect("submit descriptor");
+        let conditions = descriptor.input_schema["allOf"].as_array().expect("submit conditions");
+
+        assert!(conditions.iter().any(|condition| {
+            condition["if"]["properties"]["kind"]["const"] == "git"
+                && condition["if"]["required"] == json!(["kind"])
+                && condition["then"]["required"] == json!(["git"])
+        }));
+    }
+
+    #[test]
+    fn inline_submit_schema_forbids_git_payload() {
+        let descriptor = team_tool_descriptor("team_submit").expect("submit descriptor");
+        let conditions = descriptor.input_schema["allOf"].as_array().expect("submit conditions");
+
+        assert!(conditions.iter().any(|condition| {
+            condition["if"]["properties"]["kind"]["const"] == "inline"
+                && condition["if"]["required"] == json!(["kind"])
+                && condition["then"]["not"]["required"] == json!(["git"])
+        }));
+    }
+
+    #[test]
+    fn progress_and_review_schemas_bind_context_to_the_command() {
+        let progress = team_tool_descriptor("team_progress").expect("progress descriptor");
+        assert_eq!(progress.input_schema["properties"]["context"]["maxLength"], 4000);
+        assert!(progress.description.contains("committed atomically"));
+
+        let review = team_tool_descriptor("team_review").expect("review descriptor");
+        assert_eq!(review.input_schema["properties"]["feedback"]["maxLength"], 4000);
+        assert!(review.description.contains("committed atomically"));
+    }
+
+    #[test]
+    fn integrate_schema_accepts_only_canonical_identity_and_revisions() {
+        let descriptor = team_tool_descriptor("team_integrate").expect("integrate descriptor");
+        assert_eq!(descriptor.permission, TeamToolPermission::AnyTeamAgent);
+        let properties = descriptor.input_schema["properties"].as_object().unwrap();
+        assert_eq!(properties.len(), 4);
+        for field in [
+            "idempotency_key",
+            "work_item_id",
+            "expected_work_revision",
+            "expected_delivery_revision",
+        ] {
+            assert!(properties.contains_key(field));
+        }
+        assert!(descriptor.description.contains("only supported way"));
+        assert_eq!(descriptor.input_schema["additionalProperties"], false);
     }
 }

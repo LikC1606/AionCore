@@ -38,12 +38,16 @@ pub(crate) fn data() -> Value {
             "schema_validation_failed",
             "permission_denied",
             "team_not_found",
+            "work_item_not_found",
             "conversation_not_found",
             "agent_not_found",
             "not_in_team",
             "transport_unavailable",
             "runtime_context_missing",
-            "runtime_auth_failed"
+            "runtime_auth_failed",
+            "revision_conflict",
+            "business_rule_violation",
+            "internal"
         ]
     })
 }

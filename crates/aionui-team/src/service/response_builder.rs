@@ -9,10 +9,13 @@ impl TeamSessionService {
 
         Ok(TeamResponse {
             id: team.id.clone(),
+            user_id: team.user_id.clone(),
             name: team.name.clone(),
             workspace: team.workspace.clone(),
+            workspace_mode: team.workspace_mode.clone(),
             assistants: agents,
             leader_assistant_id: team.lead_agent_id.clone(),
+            session_mode: team.session_mode.clone(),
             created_at: team.created_at,
             updated_at: team.updated_at,
         })

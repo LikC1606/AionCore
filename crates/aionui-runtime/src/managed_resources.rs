@@ -104,6 +104,7 @@ pub fn materialize_directory(source_root: &Path, target_root: &Path) -> std::io:
         fs::remove_dir_all(target_root)?;
     }
     fs::create_dir_all(target_root)?;
+    let mut directory_permissions = Vec::new();
 
     for entry in WalkDir::new(source_root) {
         let entry = entry?;
@@ -119,7 +120,10 @@ pub fn materialize_directory(source_root: &Path, target_root: &Path) -> std::io:
         let target_path = target_root.join(relative);
         if entry.file_type().is_dir() {
             fs::create_dir_all(&target_path)?;
-            copy_permissions(entry.path(), &target_path)?;
+            // Keep target directories writable while descendants are copied.
+            // Applying a bundled 0555 mode here would make the remaining walk
+            // fail with EACCES even though the source tree is valid.
+            directory_permissions.push((entry.path().to_path_buf(), target_path));
             continue;
         }
 
@@ -135,7 +139,12 @@ pub fn materialize_directory(source_root: &Path, target_root: &Path) -> std::io:
             fs::create_dir_all(parent)?;
         }
         fs::copy(entry.path(), &target_path)?;
-        copy_permissions(entry.path(), &target_path)?;
+        copy_materialized_permissions(entry.path(), &target_path, false)?;
+    }
+
+    directory_permissions.sort_by_key(|(_, target)| std::cmp::Reverse(target.components().count()));
+    for (source, target) in directory_permissions {
+        copy_materialized_permissions(&source, &target, true)?;
     }
 
     Ok(())
@@ -186,9 +195,26 @@ fn default_bundled_root() -> Option<PathBuf> {
     Some(exe_dir.join("managed-resources"))
 }
 
-fn copy_permissions(source: &Path, target: &Path) -> std::io::Result<()> {
+fn copy_materialized_permissions(source: &Path, target: &Path, is_directory: bool) -> std::io::Result<()> {
     let metadata = fs::metadata(source)?;
-    fs::set_permissions(target, metadata.permissions())
+    let mut permissions = metadata.permissions();
+
+    // Bundled resources are immutable inputs, while their per-runtime copy is
+    // operational state. Keep the source's execute bits, but make the copy
+    // writable by its owner so Node/Codex can initialize caches and the
+    // runtime can clean up the assignment directory without thawing the
+    // shared source tree.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let owner_bits = if is_directory { 0o700 } else { 0o600 };
+        permissions.set_mode(permissions.mode() | owner_bits);
+    }
+    #[cfg(not(unix))]
+    permissions.set_readonly(false);
+
+    fs::set_permissions(target, permissions)
 }
 
 fn copy_symlink(source: &Path, target: &Path) -> std::io::Result<()> {
@@ -310,5 +336,59 @@ mod tests {
             fs::read_link(&copied_link).expect("read link"),
             PathBuf::from("../lib/node_modules/npm/bin/npm-cli.js")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_directory_keeps_source_read_only_and_target_writable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source");
+        let source_bin = source.join("bin");
+        fs::create_dir_all(&source_bin).expect("create source");
+        fs::write(source_bin.join("node"), b"managed runtime\n").expect("write source file");
+        fs::set_permissions(source_bin.join("node"), fs::Permissions::from_mode(0o444)).expect("freeze source file");
+        fs::set_permissions(&source_bin, fs::Permissions::from_mode(0o555)).expect("freeze source dir");
+
+        let target = temp.path().join("target");
+        materialize_directory(&source, &target).expect("materialize read-only source");
+
+        assert_eq!(
+            fs::read(target.join("bin/node")).expect("read target"),
+            b"managed runtime\n"
+        );
+        assert_eq!(
+            fs::metadata(target.join("bin"))
+                .expect("target metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        assert_eq!(
+            fs::metadata(target.join("bin/node"))
+                .expect("target file metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+        assert_eq!(
+            fs::metadata(&source_bin).expect("source metadata").permissions().mode() & 0o777,
+            0o555
+        );
+        assert_eq!(
+            fs::metadata(source_bin.join("node"))
+                .expect("source file metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o444
+        );
+
+        fs::set_permissions(&source_bin, fs::Permissions::from_mode(0o755)).expect("thaw source cleanup");
+        fs::set_permissions(source_bin.join("node"), fs::Permissions::from_mode(0o644))
+            .expect("thaw source file cleanup");
     }
 }

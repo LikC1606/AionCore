@@ -33,7 +33,7 @@ async fn team_capabilities_prints_contract_without_runtime_env() {
     let stdout: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(stdout["success"], true);
     assert_eq!(stdout["data"]["contract"], "agent-facing-team-cli");
-    assert_eq!(stdout["data"]["tools"].as_array().unwrap().len(), 10);
+    assert_eq!(stdout["data"]["tools"].as_array().unwrap().len(), 14);
     let spawn = stdout["data"]["tools"]
         .as_array()
         .unwrap()
@@ -42,6 +42,13 @@ async fn team_capabilities_prints_contract_without_runtime_env() {
         .unwrap();
     assert_eq!(spawn["lead_only"], true);
     assert!(spawn["stdin_json_schema"]["properties"]["assistant_id"].is_object());
+    let integrate = stdout["data"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "team_integrate")
+        .unwrap();
+    assert_eq!(integrate["cli_command"], serde_json::json!(["integrate"]));
 }
 
 #[tokio::test]

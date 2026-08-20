@@ -162,8 +162,13 @@ fn status_for_error(code: TeamToolErrorCode) -> StatusCode {
         TeamToolErrorCode::PermissionDenied | TeamToolErrorCode::NotInTeam => StatusCode::FORBIDDEN,
         TeamToolErrorCode::ConversationNotFound
         | TeamToolErrorCode::TeamNotFound
+        | TeamToolErrorCode::WorkItemNotFound
         | TeamToolErrorCode::AgentNotFound => StatusCode::NOT_FOUND,
         TeamToolErrorCode::UnknownTool | TeamToolErrorCode::SchemaValidationFailed => StatusCode::BAD_REQUEST,
-        TeamToolErrorCode::TransportUnavailable | TeamToolErrorCode::RuntimeContextMissing => StatusCode::CONFLICT,
+        TeamToolErrorCode::TransportUnavailable
+        | TeamToolErrorCode::RuntimeContextMissing
+        | TeamToolErrorCode::RevisionConflict
+        | TeamToolErrorCode::BusinessRuleViolation => StatusCode::CONFLICT,
+        TeamToolErrorCode::Internal => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }

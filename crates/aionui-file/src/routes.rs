@@ -12,9 +12,14 @@ use aionui_api_types::{
     ApiResponse, BrowseDirectoryQuery, BrowseDirectoryResponse, CancelZipRequest, CopyFilesRequest, CopyFilesResponse,
     CreateTempFileRequest, DirOrFileResponse, FetchRemoteImageRequest, FileChangeInfoResponse, FileMetadataResponse,
     FileWatchRequest, GetFileMetadataRequest, GetFilesByDirRequest, GetImageBase64Request, ListWorkspaceFilesRequest,
-    ReadFileBufferRequest, ReadFileRequest, RemoveEntryRequest, RenameRequest, RenameResponse, SnapshotBaselineRequest,
-    SnapshotCompareResponse, SnapshotDiscardRequest, SnapshotInfoResponse, SnapshotStageRequest,
-    SnapshotWorkspaceRequest, WorkspaceFlatFileResponse, WorkspaceOfficeWatchRequest, WriteFileRequest, ZipRequest,
+    ProjectGitBlobRequest, ProjectGitBlobResponse, ProjectGitCommitRequest, ProjectGitCommitResponse,
+    ProjectGitDiffRequest, ProjectGitDiffResponse, ProjectGitDiscoverRequest, ProjectGitDiscoverResponse,
+    ProjectGitFrontierResponse, ProjectGitGraphRequest, ProjectGitGraphResponse, ProjectGitPreflightRequest,
+    ProjectGitPreflightResponse, ProjectGitTreeRequest, ProjectGitTreeResponse, ProjectGitWorkingDiffRequest,
+    ProjectGitWorkingDiffResponse, ProjectGitWorkingTreeResponse, ReadFileBufferRequest, ReadFileRequest,
+    RemoveEntryRequest, RenameRequest, RenameResponse, SnapshotBaselineRequest, SnapshotCompareResponse,
+    SnapshotDiscardRequest, SnapshotInfoResponse, SnapshotStageRequest, SnapshotWorkspaceRequest,
+    WorkspaceFlatFileResponse, WorkspaceOfficeWatchRequest, WriteFileRequest, ZipRequest,
 };
 use aionui_common::ApiError;
 use aionui_common::constants::UPLOAD_MAX_SIZE;
@@ -123,6 +128,16 @@ pub fn file_routes(state: FileRouterState) -> Router {
     Router::new()
         // A. Core file operations
         .route("/api/fs/browse", get(browse_directory))
+        .route("/api/fs/project-git/preflight", post(project_git_preflight))
+        .route("/api/fs/project-git/discover", post(project_git_discover))
+        .route("/api/fs/project-git/graph", post(project_git_graph))
+        .route("/api/fs/project-git/frontier", post(project_git_frontier))
+        .route("/api/fs/project-git/commit", post(project_git_commit))
+        .route("/api/fs/project-git/diff", post(project_git_diff))
+        .route("/api/fs/project-git/tree", post(project_git_tree))
+        .route("/api/fs/project-git/blob", post(project_git_blob))
+        .route("/api/fs/project-git/working-tree", post(project_git_working_tree))
+        .route("/api/fs/project-git/working-diff", post(project_git_working_diff))
         .route("/api/fs/dir", post(get_files_by_dir))
         .route("/api/fs/list", post(list_workspace_files))
         .route("/api/fs/metadata", post(get_file_metadata))
@@ -182,6 +197,141 @@ async fn browse_directory(
     .await
     .map_err(|e| ApiError::Internal(format!("browse task failed: {}", e)))??;
 
+    Ok(Json(ApiResponse::ok(response)))
+}
+
+async fn project_git_preflight(
+    State(state): State<FileRouterState>,
+    body: Result<Json<ProjectGitPreflightRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<ProjectGitPreflightResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let workspace = req.workspace.trim();
+    if workspace.is_empty() {
+        return Err(ApiError::BadRequest("workspace is required".to_owned()));
+    }
+    let workspace = browse::resolve_browse_path(workspace, &state.browse_roots.get())?;
+    let include_status = req.include_status.unwrap_or(true);
+    let response = tokio::task::spawn_blocking(move || {
+        crate::project_git::preflight_workspace_with_status(workspace, include_status)
+    })
+    .await
+    .map_err(|error| ApiError::Internal(format!("Git preflight task failed: {error}")))??;
+    Ok(Json(ApiResponse::ok(response)))
+}
+
+fn resolve_project_git_workspace(state: &FileRouterState, workspace: &str) -> Result<PathBuf, ApiError> {
+    let workspace = workspace.trim();
+    if workspace.is_empty() {
+        return Err(ApiError::BadRequest("workspace is required".to_owned()));
+    }
+    browse::resolve_browse_path(workspace, &state.browse_roots.get()).map_err(ApiError::from)
+}
+
+async fn project_git_discover(
+    State(state): State<FileRouterState>,
+    body: Result<Json<ProjectGitDiscoverRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<ProjectGitDiscoverResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let workspace = resolve_project_git_workspace(&state, &req.workspace)?;
+    let response = tokio::task::spawn_blocking(move || crate::project_git::discover_workspace(workspace))
+        .await
+        .map_err(|error| ApiError::Internal(format!("Git discover task failed: {error}")))??;
+    Ok(Json(ApiResponse::ok(response)))
+}
+
+async fn project_git_graph(
+    State(state): State<FileRouterState>,
+    body: Result<Json<ProjectGitGraphRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<ProjectGitGraphResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let workspace = resolve_project_git_workspace(&state, &req.workspace)?;
+    let response = tokio::task::spawn_blocking(move || crate::project_git::graph(req, workspace))
+        .await
+        .map_err(|error| ApiError::Internal(format!("Git graph task failed: {error}")))??;
+    Ok(Json(ApiResponse::ok(response)))
+}
+
+async fn project_git_frontier(
+    State(state): State<FileRouterState>,
+    body: Result<Json<ProjectGitDiscoverRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<ProjectGitFrontierResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let workspace = resolve_project_git_workspace(&state, &req.workspace)?;
+    let response = tokio::task::spawn_blocking(move || crate::project_git::frontier(workspace))
+        .await
+        .map_err(|error| ApiError::Internal(format!("Git frontier task failed: {error}")))??;
+    Ok(Json(ApiResponse::ok(response)))
+}
+
+async fn project_git_commit(
+    State(state): State<FileRouterState>,
+    body: Result<Json<ProjectGitCommitRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<ProjectGitCommitResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let workspace = resolve_project_git_workspace(&state, &req.workspace)?;
+    let response = tokio::task::spawn_blocking(move || crate::project_git::commit_detail(req, workspace))
+        .await
+        .map_err(|error| ApiError::Internal(format!("Git commit task failed: {error}")))??;
+    Ok(Json(ApiResponse::ok(response)))
+}
+
+async fn project_git_diff(
+    State(state): State<FileRouterState>,
+    body: Result<Json<ProjectGitDiffRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<ProjectGitDiffResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let workspace = resolve_project_git_workspace(&state, &req.workspace)?;
+    let response = tokio::task::spawn_blocking(move || crate::project_git::committed_diff(req, workspace))
+        .await
+        .map_err(|error| ApiError::Internal(format!("Git diff task failed: {error}")))??;
+    Ok(Json(ApiResponse::ok(response)))
+}
+
+async fn project_git_tree(
+    State(state): State<FileRouterState>,
+    body: Result<Json<ProjectGitTreeRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<ProjectGitTreeResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let workspace = resolve_project_git_workspace(&state, &req.workspace)?;
+    let response = tokio::task::spawn_blocking(move || crate::project_git::tree(req, workspace))
+        .await
+        .map_err(|error| ApiError::Internal(format!("Git tree task failed: {error}")))??;
+    Ok(Json(ApiResponse::ok(response)))
+}
+
+async fn project_git_blob(
+    State(state): State<FileRouterState>,
+    body: Result<Json<ProjectGitBlobRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<ProjectGitBlobResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let workspace = resolve_project_git_workspace(&state, &req.workspace)?;
+    let response = tokio::task::spawn_blocking(move || crate::project_git::blob(req, workspace))
+        .await
+        .map_err(|error| ApiError::Internal(format!("Git blob task failed: {error}")))??;
+    Ok(Json(ApiResponse::ok(response)))
+}
+
+async fn project_git_working_tree(
+    State(state): State<FileRouterState>,
+    body: Result<Json<ProjectGitDiscoverRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<ProjectGitWorkingTreeResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let workspace = resolve_project_git_workspace(&state, &req.workspace)?;
+    let response = tokio::task::spawn_blocking(move || crate::project_git::working_tree(workspace))
+        .await
+        .map_err(|error| ApiError::Internal(format!("Git working-tree task failed: {error}")))??;
+    Ok(Json(ApiResponse::ok(response)))
+}
+
+async fn project_git_working_diff(
+    State(state): State<FileRouterState>,
+    body: Result<Json<ProjectGitWorkingDiffRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<ProjectGitWorkingDiffResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let workspace = resolve_project_git_workspace(&state, &req.workspace)?;
+    let response = tokio::task::spawn_blocking(move || crate::project_git::working_diff(req, workspace))
+        .await
+        .map_err(|error| ApiError::Internal(format!("Git working-diff task failed: {error}")))??;
     Ok(Json(ApiResponse::ok(response)))
 }
 

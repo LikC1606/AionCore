@@ -145,11 +145,15 @@ impl TeamAgent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Team {
     pub id: String,
+    pub user_id: String,
     pub name: String,
     pub workspace: String,
+    pub workspace_mode: String,
     pub agents: Vec<TeamAgent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lead_agent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_mode: Option<String>,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
 }
@@ -209,78 +213,23 @@ pub struct MailboxMessage {
 }
 
 // ---------------------------------------------------------------------------
-// TaskStatus
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TaskStatus {
-    Pending,
-    InProgress,
-    Completed,
-    Deleted,
-}
-
-impl fmt::Display for TaskStatus {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Pending => write!(f, "pending"),
-            Self::InProgress => write!(f, "in_progress"),
-            Self::Completed => write!(f, "completed"),
-            Self::Deleted => write!(f, "deleted"),
-        }
-    }
-}
-
-impl TaskStatus {
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "pending" => Some(Self::Pending),
-            "in_progress" => Some(Self::InProgress),
-            "completed" => Some(Self::Completed),
-            "deleted" => Some(Self::Deleted),
-            _ => None,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// TeamTask
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TeamTask {
-    pub id: String,
-    pub team_id: String,
-    pub subject: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    pub status: TaskStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub owner: Option<String>,
-    pub blocked_by: Vec<String>,
-    pub blocks: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<serde_json::Value>,
-    pub created_at: TimestampMs,
-    pub updated_at: TimestampMs,
-}
-
-// ---------------------------------------------------------------------------
 // Conversion helpers: DB rows ↔ domain types
 // ---------------------------------------------------------------------------
 
-use aionui_db::models::{MailboxMessageRow, TeamRow, TeamTaskRow};
+use aionui_db::models::{MailboxMessageRow, TeamRow};
 
 impl Team {
     pub fn from_row(row: &TeamRow) -> Result<Self, serde_json::Error> {
         let agents: Vec<TeamAgent> = serde_json::from_str(&row.agents)?;
         Ok(Self {
             id: row.id.clone(),
+            user_id: row.user_id.clone(),
             name: row.name.clone(),
             workspace: row.workspace.clone(),
+            workspace_mode: row.workspace_mode.clone(),
             agents,
             lead_agent_id: row.lead_agent_id.clone(),
+            session_mode: row.session_mode.clone(),
             created_at: row.created_at,
             updated_at: row.updated_at,
         })
@@ -289,10 +238,13 @@ impl Team {
     pub fn to_response(&self) -> TeamResponse {
         TeamResponse {
             id: self.id.clone(),
+            user_id: self.user_id.clone(),
             name: self.name.clone(),
             workspace: self.workspace.clone(),
+            workspace_mode: self.workspace_mode.clone(),
             assistants: self.agents.iter().map(|a| a.to_response()).collect(),
             leader_assistant_id: self.lead_agent_id.clone(),
+            session_mode: self.session_mode.clone(),
             created_at: self.created_at,
             updated_at: self.updated_at,
         }
@@ -318,28 +270,6 @@ impl MailboxMessage {
             files,
             read: row.read,
             created_at: row.created_at,
-        })
-    }
-}
-
-impl TeamTask {
-    pub fn from_row(row: &TeamTaskRow) -> Result<Self, serde_json::Error> {
-        let status = TaskStatus::parse(&row.status).unwrap_or(TaskStatus::Pending);
-        let blocked_by: Vec<String> = serde_json::from_str(&row.blocked_by)?;
-        let blocks: Vec<String> = serde_json::from_str(&row.blocks)?;
-        let metadata: Option<serde_json::Value> = row.metadata.as_deref().map(serde_json::from_str).transpose()?;
-        Ok(Self {
-            id: row.id.clone(),
-            team_id: row.team_id.clone(),
-            subject: row.subject.clone(),
-            description: row.description.clone(),
-            status,
-            owner: row.owner.clone(),
-            blocked_by,
-            blocks,
-            metadata,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
         })
     }
 }
@@ -473,39 +403,6 @@ mod tests {
             let json = serde_json::to_string(&mt).unwrap();
             let parsed: MailboxMessageType = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, mt);
-        }
-    }
-
-    // -- TaskStatus -----------------------------------------------------------
-
-    #[test]
-    fn task_status_display() {
-        assert_eq!(TaskStatus::Pending.to_string(), "pending");
-        assert_eq!(TaskStatus::InProgress.to_string(), "in_progress");
-        assert_eq!(TaskStatus::Completed.to_string(), "completed");
-        assert_eq!(TaskStatus::Deleted.to_string(), "deleted");
-    }
-
-    #[test]
-    fn task_status_parse_all_variants() {
-        assert_eq!(TaskStatus::parse("pending"), Some(TaskStatus::Pending));
-        assert_eq!(TaskStatus::parse("in_progress"), Some(TaskStatus::InProgress));
-        assert_eq!(TaskStatus::parse("completed"), Some(TaskStatus::Completed));
-        assert_eq!(TaskStatus::parse("deleted"), Some(TaskStatus::Deleted));
-        assert_eq!(TaskStatus::parse("bad"), None);
-    }
-
-    #[test]
-    fn task_status_serde_roundtrip() {
-        for status in [
-            TaskStatus::Pending,
-            TaskStatus::InProgress,
-            TaskStatus::Completed,
-            TaskStatus::Deleted,
-        ] {
-            let json = serde_json::to_string(&status).unwrap();
-            let parsed: TaskStatus = serde_json::from_str(&json).unwrap();
-            assert_eq!(parsed, status);
         }
     }
 
@@ -646,6 +543,9 @@ mod tests {
         };
         let team = Team::from_row(&row).unwrap();
         assert_eq!(team.id, "t1");
+        assert_eq!(team.user_id, "system_default_user");
+        assert_eq!(team.workspace_mode, "shared");
+        assert_eq!(team.session_mode, None);
         assert_eq!(team.agents.len(), 1);
         assert_eq!(team.agents[0].slot_id, "s1");
         assert_eq!(team.lead_agent_id.as_deref(), Some("s1"));
@@ -655,8 +555,10 @@ mod tests {
     fn team_to_response() {
         let team = Team {
             id: "t1".into(),
+            user_id: "u1".into(),
             name: "Alpha".into(),
             workspace: "/workspace/team".into(),
+            workspace_mode: "shared".into(),
             agents: vec![TeamAgent {
                 slot_id: "s1".into(),
                 name: "Lead".into(),
@@ -670,12 +572,16 @@ mod tests {
                 cli_path: None,
             }],
             lead_agent_id: Some("s1".into()),
+            session_mode: Some("full_auto".into()),
             created_at: 1000,
             updated_at: 2000,
         };
         let resp = team.to_response();
         assert_eq!(resp.id, "t1");
+        assert_eq!(resp.user_id, "u1");
         assert_eq!(resp.name, "Alpha");
+        assert_eq!(resp.workspace_mode, "shared");
+        assert_eq!(resp.session_mode.as_deref(), Some("full_auto"));
         assert_eq!(resp.assistants.len(), 1);
         assert_eq!(resp.assistants[0].slot_id, "s1");
         assert_eq!(resp.leader_assistant_id.as_deref(), Some("s1"));
@@ -797,88 +703,5 @@ mod tests {
         assert!(json.get("type").is_some(), "field must serialize as 'type'");
         assert!(json.get("msgType").is_none(), "must not serialize as 'msgType'");
         assert_eq!(json["type"], "message");
-    }
-
-    // -- TeamTask from_row ----------------------------------------------------
-
-    #[test]
-    fn team_task_from_row_success() {
-        let row = TeamTaskRow {
-            id: "tk1".into(),
-            team_id: "t1".into(),
-            subject: "Implement".into(),
-            description: Some("Details".into()),
-            status: "in_progress".into(),
-            owner: Some("a1".into()),
-            blocked_by: r#"["tk0"]"#.into(),
-            blocks: r#"["tk2"]"#.into(),
-            metadata: Some(r#"{"priority":"high"}"#.into()),
-            created_at: 1000,
-            updated_at: 2000,
-        };
-        let task = TeamTask::from_row(&row).unwrap();
-        assert_eq!(task.status, TaskStatus::InProgress);
-        assert_eq!(task.blocked_by, vec!["tk0"]);
-        assert_eq!(task.blocks, vec!["tk2"]);
-        assert!(task.metadata.is_some());
-    }
-
-    #[test]
-    fn team_task_from_row_empty_deps() {
-        let row = TeamTaskRow {
-            id: "tk1".into(),
-            team_id: "t1".into(),
-            subject: "Simple".into(),
-            description: None,
-            status: "pending".into(),
-            owner: None,
-            blocked_by: "[]".into(),
-            blocks: "[]".into(),
-            metadata: None,
-            created_at: 0,
-            updated_at: 0,
-        };
-        let task = TeamTask::from_row(&row).unwrap();
-        assert_eq!(task.status, TaskStatus::Pending);
-        assert!(task.blocked_by.is_empty());
-        assert!(task.blocks.is_empty());
-        assert!(task.metadata.is_none());
-    }
-
-    #[test]
-    fn team_task_from_row_unknown_status_defaults_to_pending() {
-        let row = TeamTaskRow {
-            id: "tk1".into(),
-            team_id: "t1".into(),
-            subject: "S".into(),
-            description: None,
-            status: "unknown".into(),
-            owner: None,
-            blocked_by: "[]".into(),
-            blocks: "[]".into(),
-            metadata: None,
-            created_at: 0,
-            updated_at: 0,
-        };
-        let task = TeamTask::from_row(&row).unwrap();
-        assert_eq!(task.status, TaskStatus::Pending);
-    }
-
-    #[test]
-    fn team_task_from_row_invalid_blocked_by_json() {
-        let row = TeamTaskRow {
-            id: "tk1".into(),
-            team_id: "t1".into(),
-            subject: "S".into(),
-            description: None,
-            status: "pending".into(),
-            owner: None,
-            blocked_by: "not-json".into(),
-            blocks: "[]".into(),
-            metadata: None,
-            created_at: 0,
-            updated_at: 0,
-        };
-        assert!(TeamTask::from_row(&row).is_err());
     }
 }

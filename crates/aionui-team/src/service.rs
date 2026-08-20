@@ -1,11 +1,25 @@
 mod describe_support;
 mod response_builder;
 pub(crate) mod spawn_support;
+pub(crate) mod team_command;
+mod team_delivery;
+mod team_query;
+mod team_work;
+mod team_work_runtime;
 
-use std::collections::HashSet;
+pub use team_command::TeamCommandService;
+pub use team_delivery::{
+    BeginGitIntegrationRequest, GitIntegrationRecoveryReport, TeamDeliveryError, TeamDeliveryService,
+    TeamIntegrationReceipt, TeamIntegrationResolution,
+};
+pub use team_query::{TeamQueryError, TeamQueryService};
+pub use team_work::TeamWorkCoordinator;
+pub(crate) use team_work::{DelegateWorkItem, TeamWorkCoordinatorError};
+
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Weak};
-use std::time::Instant;
+use std::sync::{Arc, OnceLock, Weak};
+use std::time::{Duration, Instant};
 
 use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, AgentInstance, IWorkerTaskManager, IdleCleanupCoordinator};
 use aionui_api_types::{
@@ -21,8 +35,9 @@ use aionui_db::{
     ITeamRepository, UpdateTeamParams,
 };
 use aionui_realtime::EventBroadcaster;
-use dashmap::DashMap;
-use tokio::task::JoinSet;
+use dashmap::{DashMap, DashSet};
+use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, RwLock, Semaphore, watch};
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, info, warn};
 
 use crate::error::TeamError;
@@ -30,6 +45,7 @@ use crate::event_loop::{AgentLoopContext, EventLoopRegistrationError};
 use crate::events::{
     TEAM_CREATED_EVENT, TEAM_REMOVED_EVENT, TEAM_RENAMED_EVENT, TEAM_SESSION_STATUS_CHANGED_EVENT, TeamEventEmitter,
 };
+use crate::mailbox::user_message_fingerprint;
 use crate::mcp::TeamMcpStdioConfig;
 use crate::member_runtime::{
     AttachLease, AttachOutcome, AttachWaiter, BeginRemove, MemberRuntimeFailure, MemberRuntimeSnapshot, ReserveAttach,
@@ -42,11 +58,13 @@ use crate::runtime_tools::{
     ResolvedTeamToolContext, agent_for_conversation, error_payload, execute_with_scheduler, role_to_tool_role,
 };
 use crate::session::{AgentMessageQueueResult, TeamSession, attach_member_runtime, spawn_attach_agent_process_bg};
-use crate::team_run::TeamRunManager;
+use crate::team_run::{TeamRunManager, target_role_for};
 use crate::types::{Team, TeamAgent, TeammateRole};
 use crate::work_coordinator::RuntimeConstraint;
 use crate::work_source::WorkSource;
 use crate::workspace::validate_create_workspace_path;
+
+use self::team_work_runtime::TeamWorkRuntimeService;
 
 pub(crate) fn inherit_team_workspace(extra: &mut serde_json::Value, workspace: &str) {
     if !workspace.trim().is_empty() {
@@ -57,6 +75,57 @@ pub(crate) fn inherit_team_workspace(extra: &mut serde_json::Value, workspace: &
 struct SessionEntry {
     session: Arc<TeamSession>,
     slow_monitor_handle: tokio::task::JoinHandle<()>,
+}
+
+/// A receipt for a caller supplied idempotency key.  This lives on the
+/// service, rather than on `TeamSession`, because a session can be rebuilt
+/// while the Team remains healthy (for example after a missing Codex rollout).
+struct IdempotencyReceipt {
+    created_at: Instant,
+    fingerprint: String,
+    result: Arc<AsyncMutex<Option<TeamRunAckResponse>>>,
+}
+
+const IDEMPOTENCY_RECEIPT_LIMIT: usize = 2_048;
+const IDEMPOTENCY_RECEIPT_RETENTION: Duration = Duration::from_secs(15 * 60);
+const IDEMPOTENCY_KEY_MAX_LEN: usize = 240;
+const MAILBOX_RECOVERY_BATCH_SIZE: u32 = 100;
+const ORPHAN_TEAM_CONVERSATION_GRACE_MS: TimestampMs = 5 * 60 * 1_000;
+
+struct ActiveTeamProvisioning {
+    team_ids: Arc<DashSet<String>>,
+    team_id: String,
+}
+
+impl ActiveTeamProvisioning {
+    fn new(team_ids: Arc<DashSet<String>>, team_id: String) -> Self {
+        team_ids.insert(team_id.clone());
+        Self { team_ids, team_id }
+    }
+}
+
+impl Drop for ActiveTeamProvisioning {
+    fn drop(&mut self) {
+        self.team_ids.remove(&self.team_id);
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MailboxRecoveryReport {
+    pub scanned_team_count: usize,
+    pub started_session_count: usize,
+    pub notified_session_count: usize,
+    pub notified_slot_count: usize,
+    pub failed_team_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OrphanTeamConversationRecoveryReport {
+    pub scanned_count: usize,
+    pub skipped_active_count: usize,
+    pub skipped_fresh_count: usize,
+    pub removed_count: usize,
+    pub failed_count: usize,
 }
 
 pub struct TeamIdleCleanupCoordinator {
@@ -95,8 +164,56 @@ struct MemberRuntimeReconcileWork {
     owner: Option<AttachLease>,
 }
 
-const TEAM_REBUILD_MAX_CONCURRENCY: usize = 3;
-const TEAM_REBUILD_START_STAGGER: std::time::Duration = std::time::Duration::from_secs(3);
+const TEAM_RUNTIME_START_MAX_CONCURRENCY: usize = 3;
+const TEAM_RUNTIME_START_STAGGER_MIN: Duration = Duration::from_millis(500);
+const TEAM_RUNTIME_START_STAGGER_MID: Duration = Duration::from_millis(750);
+const TEAM_RUNTIME_START_STAGGER_MAX: Duration = Duration::from_secs(1);
+
+fn adaptive_team_runtime_start_stagger(parallelism: usize) -> Duration {
+    match parallelism {
+        8.. => TEAM_RUNTIME_START_STAGGER_MIN,
+        4..=7 => TEAM_RUNTIME_START_STAGGER_MID,
+        _ => TEAM_RUNTIME_START_STAGGER_MAX,
+    }
+}
+
+fn host_team_runtime_start_stagger() -> Duration {
+    adaptive_team_runtime_start_stagger(std::thread::available_parallelism().map(usize::from).unwrap_or(1))
+}
+
+struct TeamRuntimeStartGate {
+    semaphore: Arc<Semaphore>,
+    last_started_at: tokio::sync::Mutex<Option<Instant>>,
+    stagger: Duration,
+}
+
+impl TeamRuntimeStartGate {
+    fn new() -> Self {
+        Self {
+            semaphore: Arc::new(Semaphore::new(TEAM_RUNTIME_START_MAX_CONCURRENCY)),
+            last_started_at: tokio::sync::Mutex::new(None),
+            stagger: host_team_runtime_start_stagger(),
+        }
+    }
+
+    async fn acquire(&self) -> Result<OwnedSemaphorePermit, TeamError> {
+        let permit = self
+            .semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| TeamError::InvalidRequest("team runtime start gate closed".to_owned()))?;
+        let mut last_started_at = self.last_started_at.lock().await;
+        if let Some(previous) = *last_started_at {
+            let remaining = self.stagger.saturating_sub(previous.elapsed());
+            if !remaining.is_zero() {
+                tokio::time::sleep(remaining).await;
+            }
+        }
+        *last_started_at = Some(Instant::now());
+        Ok(permit)
+    }
+}
 
 fn format_rebuild_agent_identity(agent: &TeamAgent) -> String {
     format!(
@@ -198,6 +315,24 @@ pub struct TeamSessionService {
     /// Per-team mutex serializing `ensure_session` so concurrent callers cannot
     /// race and start two sessions for the same team.
     ensure_session_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Per-team lifecycle gate. Normal runtime operations hold a read lease;
+    /// deletion holds the write lease while it quiesces the runtime and
+    /// commits the durable aggregate delete.
+    lifecycle_locks: Arc<DashMap<String, Arc<RwLock<()>>>>,
+    /// Team IDs whose conversations are being provisioned before the Team row
+    /// is committed. Orphan recovery must never collect these bindings.
+    active_provisioning_team_ids: Arc<DashSet<String>>,
+    /// Per-team admission control for on-demand member runtime starts. It
+    /// caps concurrent handshakes while spacing process launches just enough
+    /// to avoid CPU and MCP initialization spikes.
+    runtime_start_gates: Arc<DashMap<String, Arc<TeamRuntimeStartGate>>>,
+    /// Service-lifetime receipts for foreground/retry enqueue requests. A
+    /// retry must remain idempotent even when the published TeamSession is
+    /// replaced during runtime recovery.
+    idempotency_receipts: Arc<AsyncMutex<HashMap<String, IdempotencyReceipt>>>,
+    /// Canonical Team work adapter. AppServices installs it once after
+    /// constructing the shared command and query services.
+    team_work_runtime: OnceLock<Arc<TeamWorkRuntimeService>>,
     /// Back-pointer used by [`TeamSession::spawn_agent`] to reach DB-facing
     /// orchestration without threading the service through every session method.
     /// Stored as `Weak` so the session map does not create a strong cycle with
@@ -276,8 +411,30 @@ impl TeamSessionService {
             sessions: Arc::new(DashMap::new()),
             add_agent_locks: Arc::new(DashMap::new()),
             ensure_session_locks: Arc::new(DashMap::new()),
+            lifecycle_locks: Arc::new(DashMap::new()),
+            active_provisioning_team_ids: Arc::new(DashSet::new()),
+            runtime_start_gates: Arc::new(DashMap::new()),
+            idempotency_receipts: Arc::new(AsyncMutex::new(HashMap::new())),
+            team_work_runtime: OnceLock::new(),
             self_ref: weak.clone(),
         })
+    }
+
+    pub(crate) async fn acquire_runtime_start_permit(&self, team_id: &str) -> Result<OwnedSemaphorePermit, TeamError> {
+        let gate = self
+            .runtime_start_gates
+            .entry(team_id.to_owned())
+            .or_insert_with(|| Arc::new(TeamRuntimeStartGate::new()))
+            .clone();
+        let stagger_ms = gate.stagger.as_millis();
+        let permit = gate.acquire().await?;
+        debug!(
+            team_id,
+            stagger_ms,
+            max_concurrency = TEAM_RUNTIME_START_MAX_CONCURRENCY,
+            "team runtime start admitted"
+        );
+        Ok(permit)
     }
 
     pub(crate) fn provisioner(&self) -> TeamAgentProvisioner {
@@ -288,6 +445,40 @@ impl TeamSessionService {
             self.provider_repo.clone(),
             self.conversation_port.clone(),
         )
+    }
+
+    fn lifecycle_lock(&self, team_id: &str) -> Arc<RwLock<()>> {
+        self.lifecycle_locks
+            .entry(team_id.to_owned())
+            .or_insert_with(|| Arc::new(RwLock::new(())))
+            .clone()
+    }
+
+    async fn delete_team_conversation_ids(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        conversation_ids: &[String],
+    ) -> Result<(), TeamError> {
+        let mut failed = Vec::new();
+        for conversation_id in conversation_ids {
+            if let Err(error) = self
+                .conversation_port
+                .delete_team_conversation(user_id, conversation_id)
+                .await
+            {
+                warn!(team_id, conversation_id, error = %error, "Team conversation cleanup will require a retry");
+                failed.push(conversation_id.clone());
+            }
+        }
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(TeamError::InvalidRequest(format!(
+                "Team conversation cleanup is incomplete; retry Team removal ({})",
+                failed.join(", ")
+            )))
+        }
     }
 
     async fn load_owned_team(&self, user_id: &str, team_id: &str) -> Result<Team, TeamError> {
@@ -348,27 +539,6 @@ impl TeamSessionService {
         Ok(())
     }
 
-    /// Restore sessions for all existing teams. Called once at app startup
-    /// so that MCP servers are available before any user sends a message.
-    pub async fn restore_all_sessions(&self) {
-        let teams = match self.repo.list_teams().await {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to list teams for session restore");
-                return;
-            }
-        };
-        for team in &teams {
-            if let Err(e) = self.ensure_session_inner(&team.id).await {
-                tracing::warn!(team_id = %team.id, error = %e, "failed to restore session on startup");
-                continue;
-            }
-        }
-        if !teams.is_empty() {
-            tracing::info!(count = teams.len(), "team sessions restored on startup");
-        }
-    }
-
     pub async fn create_team(&self, user_id: &str, req: CreateTeamRequest) -> Result<TeamResponse, TeamError> {
         if req.agents.is_empty() {
             return Err(TeamError::InvalidRequest("at least one agent is required".into()));
@@ -390,6 +560,8 @@ impl TeamSessionService {
         };
 
         let team_id = generate_id();
+        let _active_provisioning =
+            ActiveTeamProvisioning::new(self.active_provisioning_team_ids.clone(), team_id.clone());
         let now = now_ms();
 
         let provisioned = self
@@ -399,7 +571,19 @@ impl TeamSessionService {
         let agents = provisioned.agents;
         let lead_agent_id = provisioned.lead_agent_id;
         let team_workspace = provisioned.team_workspace;
-        let agents_json = serde_json::to_string(&agents)?;
+        let conversation_ids = agents
+            .iter()
+            .map(|agent| agent.conversation_id.clone())
+            .collect::<Vec<_>>();
+        let agents_json = match serde_json::to_string(&agents) {
+            Ok(agents_json) => agents_json,
+            Err(error) => {
+                let _ = self
+                    .delete_team_conversation_ids(user_id, &team_id, &conversation_ids)
+                    .await;
+                return Err(error.into());
+            }
+        };
 
         let row = TeamRow {
             id: team_id.clone(),
@@ -414,16 +598,43 @@ impl TeamSessionService {
             created_at: now,
             updated_at: now,
         };
-        self.repo.create_team(&row).await?;
+        if let Err(error) = self.repo.create_team(&row).await {
+            let _ = self
+                .delete_team_conversation_ids(user_id, &team_id, &conversation_ids)
+                .await;
+            return Err(error.into());
+        }
 
         let team = Team {
             id: team_id,
+            user_id: user_id.to_owned(),
             name: req.name,
             workspace: team_workspace,
+            workspace_mode: "shared".into(),
             agents,
             lead_agent_id,
+            session_mode: None,
             created_at: now,
             updated_at: now,
+        };
+
+        let response = match self.build_team_response(&team).await {
+            Ok(response) => response,
+            Err(error) => {
+                match self.repo.delete_team(&team.id).await {
+                    Ok(()) => {
+                        let _ = self
+                            .delete_team_conversation_ids(user_id, &team.id, &conversation_ids)
+                            .await;
+                    }
+                    Err(rollback_error) => warn!(
+                        team_id = %team.id,
+                        error = %rollback_error,
+                        "failed to roll back Team after response construction failed"
+                    ),
+                }
+                return Err(error);
+            }
         };
 
         info!(
@@ -438,8 +649,7 @@ impl TeamSessionService {
         );
 
         self.broadcast_team_created(&team.id, &team.name);
-
-        self.build_team_response(&team).await
+        Ok(response)
     }
 
     pub async fn list_teams(&self, user_id: &str) -> Result<Vec<TeamResponse>, TeamError> {
@@ -467,8 +677,35 @@ impl TeamSessionService {
     }
 
     pub async fn remove_team(&self, user_id: &str, team_id: &str) -> Result<(), TeamError> {
-        let team = self.load_owned_team(user_id, team_id).await?;
+        let lifecycle_lock = self.lifecycle_lock(team_id);
+        let _lifecycle_guard = lifecycle_lock.write().await;
+        let membership_lock = self
+            .add_agent_locks
+            .entry(team_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _membership_guard = membership_lock.lock().await;
+        let team = match self.load_owned_team(user_id, team_id).await {
+            Ok(team) => team,
+            Err(TeamError::TeamNotFound(_)) => {
+                let orphaned = self
+                    .conversation_port
+                    .list_team_conversation_ids(user_id, team_id)
+                    .await?;
+                if orphaned.is_empty() {
+                    return Err(TeamError::TeamNotFound(team_id.to_owned()));
+                }
+                self.delete_team_conversation_ids(user_id, team_id, &orphaned).await?;
+                info!(team_id, "replayed orphaned Team conversation cleanup");
+                self.broadcast_team_removed(team_id);
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
 
+        // Stop every in-process writer before committing the durable delete.
+        // The lifecycle write lease waits for already admitted sends/tools and
+        // prevents new session ensures until this operation finishes.
         self.stop_session_unchecked(team_id);
 
         let kill_futures: Vec<_> = team
@@ -486,22 +723,28 @@ impl TeamSessionService {
         )
         .await;
 
-        for agent in &team.agents {
-            let _ = self
-                .conversation_port
-                .delete_team_conversation(user_id, &agent.conversation_id)
-                .await;
-        }
-
-        self.repo.delete_mailbox_by_team(team_id).await?;
-        self.repo.delete_tasks_by_team(team_id).await?;
+        // Team, mailbox, WorkItem, Delivery, event, and integration-attempt
+        // rows are removed by the repository in one transaction. A failure
+        // leaves the durable Team and all conversations intact; the stopped
+        // runtime can be rebuilt on the next ensure.
         self.repo.delete_team(team_id).await?;
 
+        let conversation_ids = team
+            .agents
+            .iter()
+            .map(|agent| agent.conversation_id.clone())
+            .collect::<Vec<_>>();
+        let conversation_cleanup = self
+            .delete_team_conversation_ids(user_id, team_id, &conversation_ids)
+            .await;
+
         self.add_agent_locks.remove(team_id);
+        self.ensure_session_locks.remove(team_id);
+        self.runtime_start_gates.remove(team_id);
 
         info!(team_id = %team_id, "Team removed");
         self.broadcast_team_removed(team_id);
-        Ok(())
+        conversation_cleanup
     }
 
     pub async fn rename_team(&self, user_id: &str, team_id: &str, name: &str) -> Result<(), TeamError> {
@@ -553,7 +796,6 @@ impl TeamSessionService {
                 .self_ref
                 .upgrade()
                 .ok_or_else(|| TeamError::InvalidRequest("add_agent requires a live TeamSessionService".into()))?;
-            self.broadcast_agent_runtime_status(team_id, &agent, TeamAgentRuntimeStatus::Pending, None);
             spawn_attach_agent_process_bg(
                 service,
                 session,
@@ -823,7 +1065,188 @@ impl TeamSessionService {
         self.ensure_session_inner(team_id).await
     }
 
+    /// Reconciles durable mailbox demand into live Team event loops. Cold
+    /// sessions are restored; existing sessions are explicitly re-notified so
+    /// a lost in-memory wake cannot strand an unread row.
+    pub async fn reconcile_unread_mailboxes_once(&self) -> Result<MailboxRecoveryReport, TeamError> {
+        let mut report = MailboxRecoveryReport::default();
+        let mut after_team_id = None;
+
+        loop {
+            let team_ids = self
+                .repo
+                .list_team_ids_with_recoverable_unread_mailbox(after_team_id.as_deref(), MAILBOX_RECOVERY_BATCH_SIZE)
+                .await?;
+            if team_ids.is_empty() {
+                break;
+            }
+            let page_len = team_ids.len();
+            after_team_id = team_ids.last().cloned();
+
+            for team_id in team_ids {
+                report.scanned_team_count += 1;
+                let live_session = self.sessions.get(&team_id).map(|entry| Arc::clone(&entry.session));
+                let result = match live_session {
+                    Some(session) => session
+                        .notify_recoverable_unread_mailbox("mailbox_reconciler")
+                        .await
+                        .map(|slots| {
+                            if !slots.is_empty() {
+                                report.notified_session_count += 1;
+                                report.notified_slot_count += slots.len();
+                            }
+                        }),
+                    None => self.ensure_session_inner(&team_id).await.map(|()| {
+                        report.started_session_count += 1;
+                    }),
+                };
+                if let Err(error) = result {
+                    report.failed_team_count += 1;
+                    warn!(
+                        team_id,
+                        error = %error,
+                        "recoverable unread Team mailbox reconciliation failed; retrying on the next scan"
+                    );
+                }
+            }
+
+            if page_len < MAILBOX_RECOVERY_BATCH_SIZE as usize {
+                break;
+            }
+        }
+
+        if report.scanned_team_count > 0 {
+            info!(
+                scanned_team_count = report.scanned_team_count,
+                started_session_count = report.started_session_count,
+                notified_session_count = report.notified_session_count,
+                notified_slot_count = report.notified_slot_count,
+                failed_team_count = report.failed_team_count,
+                "recoverable unread Team mailbox reconciliation completed"
+            );
+        }
+        Ok(report)
+    }
+
+    /// Removes stale Team-bound conversations whose Team aggregate no longer
+    /// exists. Fresh bindings and in-process provisioning are protected so a
+    /// slow create cannot be mistaken for an orphan.
+    pub async fn reconcile_orphan_team_conversations_once(
+        &self,
+    ) -> Result<OrphanTeamConversationRecoveryReport, TeamError> {
+        let candidates = self
+            .conversation_port
+            .list_team_conversation_cleanup_candidates()
+            .await?;
+        let now = now_ms();
+        let mut team_exists = HashMap::<String, bool>::new();
+        let mut report = OrphanTeamConversationRecoveryReport::default();
+        for candidate in candidates {
+            report.scanned_count += 1;
+            if self.active_provisioning_team_ids.contains(&candidate.team_id) {
+                report.skipped_active_count += 1;
+                continue;
+            }
+            if now.saturating_sub(candidate.created_at) < ORPHAN_TEAM_CONVERSATION_GRACE_MS {
+                report.skipped_fresh_count += 1;
+                continue;
+            }
+            let exists = match team_exists.get(&candidate.team_id) {
+                Some(exists) => *exists,
+                None => {
+                    let exists = self.repo.get_team(&candidate.team_id).await?.is_some();
+                    team_exists.insert(candidate.team_id.clone(), exists);
+                    exists
+                }
+            };
+            if exists {
+                continue;
+            }
+            match self
+                .conversation_port
+                .delete_team_conversation(&candidate.user_id, &candidate.conversation_id)
+                .await
+            {
+                Ok(()) => report.removed_count += 1,
+                Err(error) => {
+                    report.failed_count += 1;
+                    warn!(
+                        team_id = %candidate.team_id,
+                        conversation_id = %candidate.conversation_id,
+                        error = %error,
+                        "orphaned Team conversation cleanup failed; retrying on the next recovery scan"
+                    );
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    /// Starts an immediate-then-periodic recovery scan tied to application
+    /// shutdown. The single loop awaits each scan, so scans never overlap.
+    pub fn start_unread_mailbox_reconciler(
+        self: &Arc<Self>,
+        mut shutdown_rx: watch::Receiver<bool>,
+        scan_interval: Duration,
+    ) -> JoinHandle<()> {
+        let service = Arc::downgrade(self);
+        tokio::spawn(async move {
+            if scan_interval.is_zero() {
+                warn!("unread Team mailbox reconciler disabled because scan interval is zero");
+                return;
+            }
+            if *shutdown_rx.borrow() {
+                return;
+            }
+
+            let mut interval = tokio::time::interval(scan_interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            info!(
+                scan_interval_secs = scan_interval.as_secs(),
+                "unread Team mailbox reconciler started"
+            );
+
+            loop {
+                tokio::select! {
+                    biased;
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                    _ = interval.tick() => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
+                        let Some(service) = service.upgrade() else {
+                            break;
+                        };
+                        if let Err(error) = service.reconcile_orphan_team_conversations_once().await {
+                            warn!(
+                                error = %error,
+                                "orphaned Team conversation recovery scan failed; retrying on the next scan"
+                            );
+                        }
+                        if let Err(error) = service.reconcile_unread_mailboxes_once().await {
+                            warn!(
+                                error = %error,
+                                "unread Team mailbox recovery scan failed; retrying on the next scan"
+                            );
+                        }
+                    }
+                }
+            }
+            info!("unread Team mailbox reconciler stopped");
+        })
+    }
+
     async fn ensure_session_inner(&self, team_id: &str) -> Result<(), TeamError> {
+        let lifecycle_lock = self.lifecycle_lock(team_id);
+        let _lifecycle_guard = lifecycle_lock.read().await;
+        self.ensure_session_inner_unlocked(team_id).await
+    }
+
+    async fn ensure_session_inner_unlocked(&self, team_id: &str) -> Result<(), TeamError> {
         let membership_lock = self
             .add_agent_locks
             .entry(team_id.to_owned())
@@ -859,10 +1282,15 @@ impl TeamSessionService {
         let user_id = row.user_id.clone();
         let team = Team::from_row(&row)?;
         let agents_snapshot: Vec<TeamAgent> = team.agents.clone();
+        let lead_agent = agents_snapshot
+            .iter()
+            .find(|agent| agent.role == TeammateRole::Lead)
+            .cloned()
+            .ok_or_else(|| TeamError::InvalidRequest("team lead not found".to_owned()))?;
 
         if let Some(session) = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session)) {
             let work = self
-                .reserve_member_runtime_reconciliation(&session, &agents_snapshot)
+                .reserve_member_runtime_reconciliation(&session, std::slice::from_ref(&lead_agent))
                 .await?;
             drop(membership_guard);
             return self
@@ -879,7 +1307,7 @@ impl TeamSessionService {
 
         if let Some(session) = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session)) {
             let work = self
-                .reserve_member_runtime_reconciliation(&session, &agents_snapshot)
+                .reserve_member_runtime_reconciliation(&session, std::slice::from_ref(&lead_agent))
                 .await?;
             drop(membership_guard);
             drop(ensure_guard);
@@ -939,7 +1367,7 @@ impl TeamSessionService {
         );
 
         if let Err(e) = self
-            .rebuild_agent_processes(team_id, &session, &user_id, &agents_snapshot)
+            .rebuild_agent_processes(team_id, &session, &user_id, std::slice::from_ref(&lead_agent))
             .await
         {
             self.broadcast_session_status(
@@ -973,19 +1401,21 @@ impl TeamSessionService {
             return Err(error);
         }
 
-        if agents_snapshot
-            .iter()
-            .any(|agent| !session.member_runtimes().seed_ready(agent.slot_id.clone()))
-        {
-            let error = TeamError::InvalidRequest("failed to seed bootstrap member runtime registry".to_owned());
+        if !session.member_runtimes().seed_ready(lead_agent.slot_id.clone()) {
+            let error = TeamError::InvalidRequest("failed to seed Lead runtime registry".to_owned());
             session.stop();
             self.cleanup_bootstrap_runtime_tasks(&agents_snapshot).await;
             return Err(error);
         }
         for agent in &agents_snapshot {
+            let constraint = if agent.slot_id == lead_agent.slot_id {
+                RuntimeConstraint::Ready
+            } else {
+                RuntimeConstraint::Starting { operation_id: 0 }
+            };
             session
                 .work_coordinator()
-                .set_runtime_constraint(&agent.slot_id, RuntimeConstraint::Ready);
+                .set_runtime_constraint(&agent.slot_id, target_role_for(agent.role), constraint);
         }
 
         let slow_monitor_handle = Self::spawn_slow_monitor(session.clone());
@@ -997,7 +1427,12 @@ impl TeamSessionService {
         drop(membership_guard);
 
         for agent in &agents_snapshot {
-            self.broadcast_agent_runtime_status(team_id, agent, TeamAgentRuntimeStatus::Ready, None);
+            let status = if agent.slot_id == lead_agent.slot_id {
+                TeamAgentRuntimeStatus::Ready
+            } else {
+                TeamAgentRuntimeStatus::Pending
+            };
+            self.broadcast_agent_runtime_status(team_id, agent, status, None);
         }
 
         self.broadcast_session_status(
@@ -1016,7 +1451,7 @@ impl TeamSessionService {
         }
 
         self.broadcast_session_status(team_id, TeamSessionStatus::Ready, None, |p| {
-            p.server_count = Some(agents_snapshot.len());
+            p.server_count = Some(1);
         });
 
         Ok(())
@@ -1097,7 +1532,7 @@ impl TeamSessionService {
         session: Arc<TeamSession>,
         work: Vec<MemberRuntimeReconcileWork>,
     ) -> Result<(), TeamError> {
-        if !work.is_empty() {
+        if work.iter().any(|item| item.agent.role == TeammateRole::Lead) {
             self.publish_member_runtime_starting_if_current(&session);
         }
         let mut waiters = Vec::with_capacity(work.len());
@@ -1154,12 +1589,26 @@ impl TeamSessionService {
             match outcome {
                 AttachOutcome::Ready | AttachOutcome::Removed => {}
                 AttachOutcome::Failed(failure) => {
-                    self.broadcast_session_status(
-                        team_id,
-                        TeamSessionStatus::Failed,
-                        Some(TeamSessionPhase::AttachingAgents),
-                        |payload| payload.error = Some(failure.public_reason.clone()),
-                    );
+                    // A Worker rollout is independently recoverable. Keep the
+                    // healthy Lead session usable and expose the failed slot
+                    // through its agent-runtime event; only a failed Lead is
+                    // fatal to the Team lifecycle.
+                    if agent.role == TeammateRole::Lead {
+                        self.broadcast_session_status(
+                            team_id,
+                            TeamSessionStatus::Failed,
+                            Some(TeamSessionPhase::AttachingAgents),
+                            |payload| payload.error = Some(failure.public_reason.clone()),
+                        );
+                    } else {
+                        // refresh_member_runtime_status takes this team's
+                        // membership lock. Release the reconciliation guard
+                        // first: Tokio mutexes are not re-entrant, and keeping
+                        // it here would make a failed Worker hang forever.
+                        drop(current_session);
+                        drop(_membership_guard);
+                        self.refresh_member_runtime_status(&session).await;
+                    }
                     return Err(TeamError::MemberRuntimeFailed {
                         team_id: team_id.to_owned(),
                         slot_id: agent.slot_id,
@@ -1175,8 +1624,17 @@ impl TeamSessionService {
             }
         }
 
+        let ready_count = current_agents
+            .iter()
+            .filter(|agent| {
+                matches!(
+                    session.member_runtimes().snapshot(&agent.slot_id),
+                    MemberRuntimeSnapshot::Ready
+                )
+            })
+            .count();
         self.broadcast_session_status(team_id, TeamSessionStatus::Ready, None, |payload| {
-            payload.server_count = Some(current_agents.len());
+            payload.server_count = Some(ready_count);
         });
         Ok(())
     }
@@ -1330,6 +1788,7 @@ impl TeamSessionService {
         let provisioner = self.provisioner();
         let task_manager = self.task_manager.clone();
         let started_at = Instant::now();
+        let start_stagger = host_team_runtime_start_stagger();
         let mut rebuild_jobs: Vec<TeamAgent> = agents.to_vec();
         rebuild_jobs.sort_by_key(|agent| match agent.role {
             TeammateRole::Lead => 0,
@@ -1339,8 +1798,8 @@ impl TeamSessionService {
         info!(
             team_id,
             agent_count = agents.len(),
-            max_concurrency = TEAM_REBUILD_MAX_CONCURRENCY,
-            start_stagger_ms = TEAM_REBUILD_START_STAGGER.as_millis(),
+            max_concurrency = TEAM_RUNTIME_START_MAX_CONCURRENCY,
+            start_stagger_ms = start_stagger.as_millis(),
             "team agent rebuild started"
         );
 
@@ -1349,7 +1808,7 @@ impl TeamSessionService {
         let mut failed = false;
 
         for (launched_count, agent) in rebuild_jobs.into_iter().enumerate() {
-            while jobs.len() >= TEAM_REBUILD_MAX_CONCURRENCY {
+            while jobs.len() >= TEAM_RUNTIME_START_MAX_CONCURRENCY {
                 if let Some(outcome) = join_next_rebuild_outcome(&mut jobs).await? {
                     failed = outcome.result.is_err();
                     outcomes.push(outcome);
@@ -1363,7 +1822,7 @@ impl TeamSessionService {
             }
 
             if launched_count > 0 {
-                let stagger = tokio::time::sleep(TEAM_REBUILD_START_STAGGER);
+                let stagger = tokio::time::sleep(start_stagger);
                 tokio::pin!(stagger);
                 loop {
                     tokio::select! {
@@ -1415,8 +1874,8 @@ impl TeamSessionService {
             success_count,
             failure_count = failures.len(),
             duration_ms = started_at.elapsed().as_millis(),
-            max_concurrency = TEAM_REBUILD_MAX_CONCURRENCY,
-            start_stagger_ms = TEAM_REBUILD_START_STAGGER.as_millis(),
+            max_concurrency = TEAM_RUNTIME_START_MAX_CONCURRENCY,
+            start_stagger_ms = start_stagger.as_millis(),
             "team agent rebuild completed"
         );
 
@@ -1620,29 +2079,29 @@ impl TeamSessionService {
             return;
         };
 
-        let mut failed_reason = None;
-        let mut pending = false;
-        for agent in &team.agents {
-            match expected.member_runtimes().snapshot(&agent.slot_id) {
-                MemberRuntimeSnapshot::Ready => {}
-                MemberRuntimeSnapshot::Failed { failure, .. } => {
-                    failed_reason.get_or_insert(failure.public_reason);
-                }
-                MemberRuntimeSnapshot::Absent
-                | MemberRuntimeSnapshot::Attaching { .. }
-                | MemberRuntimeSnapshot::Removing { .. } => pending = true,
-                MemberRuntimeSnapshot::SessionStopped => return,
-            }
-        }
-
-        if let Some(reason) = failed_reason {
-            self.publish_member_runtime_failed_if_current(expected, &reason);
-        } else if pending {
+        let lead = team.agents.iter().find(|agent| agent.role == TeammateRole::Lead);
+        let Some(lead) = lead else {
+            return;
+        };
+        let lead_status = expected.member_runtimes().snapshot(&lead.slot_id);
+        if let MemberRuntimeSnapshot::Failed { failure, .. } = lead_status {
+            self.publish_member_runtime_failed_if_current(expected, &failure.public_reason);
+        } else if !matches!(lead_status, MemberRuntimeSnapshot::Ready) {
             self.publish_member_runtime_starting_if_current(expected);
         } else {
+            let ready_count = team
+                .agents
+                .iter()
+                .filter(|agent| {
+                    matches!(
+                        expected.member_runtimes().snapshot(&agent.slot_id),
+                        MemberRuntimeSnapshot::Ready
+                    )
+                })
+                .count();
             let _ = self.with_published_session(expected, |_| {
                 self.broadcast_session_status(expected.team_id(), TeamSessionStatus::Ready, None, |payload| {
-                    payload.server_count = Some(team.agents.len());
+                    payload.server_count = Some(ready_count);
                 });
             });
         }
@@ -1776,6 +2235,8 @@ impl TeamSessionService {
         context: &crate::tool_executor::TeamToolContext,
         call: TeamToolCall,
     ) -> Result<serde_json::Value, TeamToolErrorPayload> {
+        let lifecycle_lock = self.lifecycle_lock(&context.team_id);
+        let _lifecycle_guard = lifecycle_lock.read().await;
         let scheduler = self
             .get_session_scheduler(&context.team_id)
             .ok_or_else(|| error_payload(TeamToolErrorCode::TeamNotFound, "active team session not found"))?;
@@ -1897,6 +2358,98 @@ impl TeamSessionService {
             .collect()
     }
 
+    fn normalize_idempotency_key(value: Option<&str>) -> Result<Option<String>, TeamError> {
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(TeamError::InvalidRequest("idempotency_key cannot be empty".into()));
+        }
+        if value.len() > IDEMPOTENCY_KEY_MAX_LEN || value.chars().any(char::is_control) {
+            return Err(TeamError::InvalidRequest(
+                "idempotency_key must be at most 240 characters and contain no control characters".into(),
+            ));
+        }
+        Ok(Some(value.to_owned()))
+    }
+
+    fn idempotency_receipt_key(team_id: &str, slot_id: &str, key: &str) -> String {
+        format!("{team_id}\0{slot_id}\0{key}")
+    }
+
+    async fn discard_failed_idempotency_receipt(
+        &self,
+        team_id: &str,
+        slot_id: &str,
+        key: &str,
+        result: &Arc<AsyncMutex<Option<TeamRunAckResponse>>>,
+    ) {
+        let cache_key = Self::idempotency_receipt_key(team_id, slot_id, key);
+        let mut receipts = self.idempotency_receipts.lock().await;
+        let should_remove = receipts
+            .get(&cache_key)
+            .is_some_and(|receipt| Arc::ptr_eq(&receipt.result, result));
+        if should_remove {
+            receipts.remove(&cache_key);
+        }
+    }
+
+    async fn idempotency_gate(
+        &self,
+        team_id: &str,
+        slot_id: &str,
+        key: Option<&str>,
+        content: &str,
+        files: Option<&Vec<String>>,
+    ) -> Result<Option<Arc<AsyncMutex<Option<TeamRunAckResponse>>>>, TeamError> {
+        let Some(key) = key else {
+            return Ok(None);
+        };
+        let fingerprint = user_message_fingerprint(content, files.map(Vec::as_slice));
+        let cache_key = Self::idempotency_receipt_key(team_id, slot_id, key);
+        let now = Instant::now();
+        let mut receipts = self.idempotency_receipts.lock().await;
+        receipts.retain(|_, receipt| {
+            now.duration_since(receipt.created_at) <= IDEMPOTENCY_RECEIPT_RETENTION
+                || Arc::strong_count(&receipt.result) > 1
+        });
+        if let Some(receipt) = receipts.get(&cache_key) {
+            if receipt.fingerprint != fingerprint {
+                return Err(TeamError::InvalidRequest(
+                    "idempotency_key was already used for a different Team message".into(),
+                ));
+            }
+            return Ok(Some(receipt.result.clone()));
+        }
+        if receipts.len() >= IDEMPOTENCY_RECEIPT_LIMIT {
+            let oldest = receipts
+                .iter()
+                .filter(|(_, receipt)| Arc::strong_count(&receipt.result) == 1)
+                .min_by_key(|(_, receipt)| receipt.created_at)
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                receipts.remove(&oldest);
+            } else {
+                return Err(TeamError::InvalidRequest(
+                    "too many in-flight idempotent Team messages".into(),
+                ));
+            }
+        }
+        let result = Arc::new(AsyncMutex::new(None));
+        receipts.insert(
+            cache_key,
+            IdempotencyReceipt {
+                created_at: now,
+                fingerprint,
+                result: result.clone(),
+            },
+        );
+        Ok(Some(result))
+    }
+
+    /// Backwards-compatible send path for internal callers that do not carry
+    /// a caller receipt key.
     pub async fn send_message(
         &self,
         user_id: &str,
@@ -1904,16 +2457,73 @@ impl TeamSessionService {
         content: &str,
         files: Option<Vec<String>>,
     ) -> Result<TeamRunAckResponse, TeamError> {
+        self.send_message_with_idempotency(user_id, team_id, content, files, None)
+            .await
+    }
+
+    pub async fn send_message_with_idempotency(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        content: &str,
+        files: Option<Vec<String>>,
+        idempotency_key: Option<String>,
+    ) -> Result<TeamRunAckResponse, TeamError> {
+        let lifecycle_lock = self.lifecycle_lock(team_id);
+        let _lifecycle_guard = lifecycle_lock.read().await;
         self.load_owned_team(user_id, team_id).await?;
-        self.ensure_session_inner(team_id).await?;
-        let session = {
-            let entry = self
-                .sessions
-                .get(team_id)
-                .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
-            Arc::clone(&entry.session)
-        };
-        session.send_message(content, files).await
+        let idempotency_key = Self::normalize_idempotency_key(idempotency_key.as_deref())?;
+        let gate = self
+            .idempotency_gate(team_id, "lead", idempotency_key.as_deref(), content, files.as_ref())
+            .await?;
+        if let Some(gate) = gate {
+            let mut result = gate.lock().await;
+            if let Some(ack) = result.as_ref() {
+                return Ok(ack.clone());
+            }
+            let operation = async {
+                self.ensure_session_inner_unlocked(team_id).await?;
+                let session = {
+                    let entry = self
+                        .sessions
+                        .get(team_id)
+                        .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
+                    Arc::clone(&entry.session)
+                };
+                session
+                    .send_message_with_idempotency(content, files, idempotency_key.as_deref())
+                    .await
+            }
+            .await;
+            match operation {
+                Ok(ack) => {
+                    *result = Some(ack.clone());
+                    Ok(ack)
+                }
+                Err(error) => {
+                    self.discard_failed_idempotency_receipt(
+                        team_id,
+                        "lead",
+                        idempotency_key.as_deref().expect("keyed gate requires a key"),
+                        &gate,
+                    )
+                    .await;
+                    Err(error)
+                }
+            }
+        } else {
+            self.ensure_session_inner_unlocked(team_id).await?;
+            let session = {
+                let entry = self
+                    .sessions
+                    .get(team_id)
+                    .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
+                Arc::clone(&entry.session)
+            };
+            session
+                .send_message_with_idempotency(content, files, idempotency_key.as_deref())
+                .await
+        }
     }
 
     pub async fn send_message_to_agent(
@@ -1923,8 +2533,108 @@ impl TeamSessionService {
         slot_id: &str,
         content: &str,
         files: Option<Vec<String>>,
+        idempotency_key: Option<String>,
     ) -> Result<TeamRunAckResponse, TeamError> {
+        let lifecycle_lock = self.lifecycle_lock(team_id);
+        let _lifecycle_guard = lifecycle_lock.read().await;
         self.load_owned_team(user_id, team_id).await?;
+        let idempotency_key = Self::normalize_idempotency_key(idempotency_key.as_deref())?;
+        let gate = self
+            .idempotency_gate(team_id, slot_id, idempotency_key.as_deref(), content, files.as_ref())
+            .await?;
+        if let Some(gate) = gate {
+            let mut result = gate.lock().await;
+            if let Some(ack) = result.as_ref() {
+                return Ok(ack.clone());
+            }
+            let operation = async {
+                self.ensure_session_inner_unlocked(team_id).await?;
+                let session = {
+                    let entry = self
+                        .sessions
+                        .get(team_id)
+                        .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
+                    Arc::clone(&entry.session)
+                };
+                session
+                    .send_message_to_agent(slot_id, content, files, idempotency_key.as_deref())
+                    .await
+            }
+            .await;
+            match operation {
+                Ok(ack) => {
+                    *result = Some(ack.clone());
+                    Ok(ack)
+                }
+                Err(error) => {
+                    self.discard_failed_idempotency_receipt(
+                        team_id,
+                        slot_id,
+                        idempotency_key.as_deref().expect("keyed gate requires a key"),
+                        &gate,
+                    )
+                    .await;
+                    Err(error)
+                }
+            }
+        } else {
+            self.ensure_session_inner_unlocked(team_id).await?;
+            let session = {
+                let entry = self
+                    .sessions
+                    .get(team_id)
+                    .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
+                Arc::clone(&entry.session)
+            };
+            session
+                .send_message_to_agent(slot_id, content, files, idempotency_key.as_deref())
+                .await
+        }
+    }
+
+    /// Best-effort runtime wake for mailbox rows already committed by the
+    /// canonical WorkItem transaction. Durable unread reconciliation closes
+    /// the process-interruption window after the transaction commits.
+    pub(crate) fn wake_work_notifications(self: &Arc<Self>, user_id: &str, team_id: &str) {
+        let service = Arc::clone(self);
+        let user_id = user_id.to_owned();
+        let team_id = team_id.to_owned();
+        std::mem::drop(tokio::spawn(async move {
+            if let Err(error) = service.ensure_session(&user_id, &team_id).await {
+                warn!(
+                    team_id,
+                    error = %error,
+                    "canonical WorkItem notification remains queued after session wake failed"
+                );
+                return;
+            }
+            let session = service.sessions.get(&team_id).map(|entry| Arc::clone(&entry.session));
+            match session {
+                Some(session) => {
+                    if let Err(error) = session.notify_recoverable_unread_mailbox("team_work_command").await {
+                        warn!(
+                            team_id,
+                            error = %error,
+                            "canonical WorkItem notification remains queued after event-loop wake failed"
+                        );
+                    }
+                }
+                None => warn!(
+                    team_id,
+                    "canonical WorkItem notification remains queued because its Team session is unavailable"
+                ),
+            }
+        }));
+    }
+
+    pub async fn ensure_agent_runtime(&self, user_id: &str, team_id: &str, slot_id: &str) -> Result<(), TeamError> {
+        let team = self.load_owned_team(user_id, team_id).await?;
+        let agent = team
+            .agents
+            .iter()
+            .find(|agent| agent.slot_id == slot_id)
+            .cloned()
+            .ok_or_else(|| TeamError::AgentNotFound(slot_id.to_owned()))?;
         self.ensure_session_inner(team_id).await?;
         let session = {
             let entry = self
@@ -1933,7 +2643,11 @@ impl TeamSessionService {
                 .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
             Arc::clone(&entry.session)
         };
-        session.send_message_to_agent(slot_id, content, files).await
+        let work = self
+            .reserve_member_runtime_reconciliation(&session, std::slice::from_ref(&agent))
+            .await?;
+        self.complete_member_runtime_reconciliation(team_id, user_id, session, work)
+            .await
     }
 
     pub async fn cancel_run(
@@ -2048,7 +2762,25 @@ impl TeamSessionService {
         content: &str,
         files: Option<Vec<String>>,
     ) -> Result<AgentMessageQueueResult, TeamError> {
-        self.require_active_team_run_for_team_work(team_id).await?;
+        self.send_agent_message_from_agent_with_idempotency(team_id, from_slot_id, to_slot_id, content, files, None)
+            .await
+    }
+
+    pub async fn send_agent_message_from_agent_with_idempotency(
+        &self,
+        team_id: &str,
+        from_slot_id: &str,
+        to_slot_id: &str,
+        content: &str,
+        files: Option<Vec<String>>,
+        idempotency_key: Option<String>,
+    ) -> Result<AgentMessageQueueResult, TeamError> {
+        if from_slot_id == to_slot_id {
+            return Err(TeamError::InvalidRequest(
+                "team_send_message cannot target the authenticated caller".into(),
+            ));
+        }
+        let idempotency_key = Self::normalize_idempotency_key(idempotency_key.as_deref())?;
         let session = {
             let entry = self
                 .sessions
@@ -2057,7 +2789,13 @@ impl TeamSessionService {
             Arc::clone(&entry.session)
         };
         session
-            .send_agent_message_from_agent(from_slot_id, to_slot_id, content, files)
+            .send_agent_message_from_agent_with_idempotency(
+                from_slot_id,
+                to_slot_id,
+                content,
+                files,
+                idempotency_key.as_deref(),
+            )
             .await
     }
 
@@ -2076,23 +2814,6 @@ impl TeamSessionService {
             Arc::clone(&entry.session)
         };
         session.shutdown_agent(caller_slot_id, target_slot_id, reason).await
-    }
-
-    /// Friendly pre-check used before invoking run-scoped team tools. This is
-    /// not a concurrency guarantee; any operation
-    /// that writes mailbox, projection, scheduler, spawn, shutdown, or wake state
-    /// must still acquire a TeamRun operation lease in TeamSession/TeamRunManager.
-    pub(crate) async fn require_active_team_run_for_team_work(&self, team_id: &str) -> Result<(), TeamError> {
-        let entry = self
-            .sessions
-            .get(team_id)
-            .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
-        if entry.session.team_run_manager().current_active_run_id().is_some() {
-            return Ok(());
-        }
-        Err(TeamError::InvalidRequest(
-            "no active team run for run-scoped wake".into(),
-        ))
     }
 
     pub(crate) async fn wake_leader_after_recovery_message(
@@ -2141,18 +2862,68 @@ mod tests {
         ActiveLeaseRegistry, AgentError, AgentInstance, AgentSendError, AgentStreamEvent, IAgentTask, IMockAgent,
         IWorkerTaskManager, IdleCleanupCoordinator,
     };
-    use aionui_api_types::{AddAgentRequest, ConfigOptionConfirmation, SetConfigOptionResponse};
+    use aionui_api_types::{AddAgentRequest, ConfigOptionConfirmation, SetConfigOptionResponse, TeamRunTargetRole};
     use aionui_common::{AgentKillReason, AgentType, ConversationStatus, TimestampMs, now_ms};
     use aionui_db::{IConversationRepository, ITeamRepository};
     use tokio::sync::broadcast;
 
-    use super::TeamIdleCleanupCoordinator;
+    use super::{TeamIdleCleanupCoordinator, TeamRuntimeStartGate};
     use crate::test_utils::workspace_harness::{
         setup_with_factory_metadata_team_repo_and_conversation_repo,
         setup_with_factory_metadata_team_repo_conversation_repo_and_broadcaster,
         setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager,
         single_agent_team_request,
     };
+
+    #[test]
+    fn team_runtime_start_stagger_stays_within_adaptive_half_to_one_second_window() {
+        assert_eq!(
+            super::adaptive_team_runtime_start_stagger(16),
+            std::time::Duration::from_millis(500)
+        );
+        assert_eq!(
+            super::adaptive_team_runtime_start_stagger(6),
+            std::time::Duration::from_millis(750)
+        );
+        assert_eq!(
+            super::adaptive_team_runtime_start_stagger(2),
+            std::time::Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn idempotency_key_rejects_empty_oversized_and_control_values() {
+        assert!(super::TeamSessionService::normalize_idempotency_key(Some(" ")).is_err());
+        assert!(super::TeamSessionService::normalize_idempotency_key(Some(&"x".repeat(241))).is_err());
+        assert!(super::TeamSessionService::normalize_idempotency_key(Some("turn\n1")).is_err());
+        assert_eq!(
+            super::TeamSessionService::normalize_idempotency_key(Some(" turn-1 "))
+                .unwrap()
+                .as_deref(),
+            Some("turn-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn team_runtime_start_gate_applies_the_adaptive_interval_without_three_second_delay() {
+        let gate = TeamRuntimeStartGate::new();
+        let first = gate.acquire().await.unwrap();
+        drop(first);
+
+        let started_at = std::time::Instant::now();
+        let second = gate.acquire().await.unwrap();
+        let elapsed = started_at.elapsed();
+        drop(second);
+
+        assert!(
+            elapsed >= gate.stagger.saturating_sub(std::time::Duration::from_millis(40)),
+            "runtime starts must preserve the adaptive admission interval: {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "runtime admission must not regress to the old fixed three-second delay: {elapsed:?}"
+        );
+    }
 
     struct ModeSettingAgent {
         conversation_id: String,
@@ -2492,7 +3263,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ensure_session_repairs_only_missing_member_runtime_in_place() {
+    async fn ensure_session_keeps_worker_dormant_until_first_message() {
         let task_manager = Arc::new(MutableTaskManager::new());
         let (svc, _repo, _task_manager, _conv_repo, broadcaster) =
             setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager(task_manager.clone());
@@ -2509,20 +3280,58 @@ mod tests {
 
         svc.ensure_session("user-test", &created.id).await.unwrap();
         task_manager.insert_mode_agent(&lead.conversation_id);
-        task_manager.insert_mode_agent(&worker.conversation_id);
         task_manager.reset_kills();
         let original_session = Arc::clone(&svc.sessions.get(&created.id).expect("session").session);
         let original_generation = original_session.generation();
-        task_manager.remove(&worker.conversation_id);
 
         svc.ensure_session("user-test", &created.id).await.unwrap();
 
         let current_session = Arc::clone(&svc.sessions.get(&created.id).expect("session").session);
         assert!(Arc::ptr_eq(&original_session, &current_session));
         assert_eq!(current_session.generation(), original_generation);
-        assert_eq!(task_manager.kills(), vec![worker.conversation_id.clone()]);
+        assert!(task_manager.kills().is_empty());
         assert!(current_session.event_loops().has(&lead.slot_id));
         assert!(current_session.event_loops().has(&worker.slot_id));
+        assert_eq!(
+            current_session.member_runtimes().snapshot(&worker.slot_id),
+            crate::member_runtime::MemberRuntimeSnapshot::Absent
+        );
+
+        let task_manager_for_ready = task_manager.clone();
+        let worker_conversation_id = worker.conversation_id.clone();
+        broadcaster.set_observer(Arc::new(move |event| {
+            if event.name == "team.agentRuntimeStatusChanged"
+                && event.data.get("status").and_then(serde_json::Value::as_str) == Some("ready")
+                && event.data.get("conversation_id").and_then(serde_json::Value::as_str)
+                    == Some(worker_conversation_id.as_str())
+            {
+                task_manager_for_ready.insert_mode_agent(&worker_conversation_id);
+            }
+        }));
+
+        let ack = current_session
+            .send_message_to_agent(&worker.slot_id, "start on demand", None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            ack.enqueue_status,
+            aionui_api_types::TeamMessageEnqueueStatus::BlockedRuntimeStarting
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match current_session.member_runtimes().snapshot(&worker.slot_id) {
+                    crate::member_runtime::MemberRuntimeSnapshot::Ready => break,
+                    crate::member_runtime::MemberRuntimeSnapshot::Failed { failure, .. } => {
+                        panic!("worker runtime failed to start on demand: {failure:?}")
+                    }
+                    _ => tokio::task::yield_now().await,
+                }
+            }
+        })
+        .await
+        .expect("worker runtime should start after its first queued message");
+        assert_eq!(task_manager.kills(), vec![worker.conversation_id.clone()]);
 
         let events = broadcaster.events_by_name("team.agentRuntimeStatusChanged");
         let statuses: Vec<&str> = events
@@ -2533,7 +3342,53 @@ mod tests {
             .map(|event| event.data.get("status").and_then(serde_json::Value::as_str).unwrap())
             .collect();
 
-        assert_eq!(statuses, vec!["pending", "ready", "pending", "ready"]);
+        assert_eq!(statuses, vec!["pending", "pending", "ready"]);
+    }
+
+    #[tokio::test]
+    async fn ensure_agent_runtime_starts_a_dormant_worker_without_enqueuing_work() {
+        let task_manager = Arc::new(MutableTaskManager::new());
+        let (svc, _repo, _task_manager, _conv_repo, broadcaster) =
+            setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager(task_manager.clone());
+        let created = svc
+            .create_team("user-test", two_agent_team_request("Explicit Runtime Ensure"))
+            .await
+            .unwrap();
+        let worker = created
+            .assistants
+            .iter()
+            .find(|agent| agent.role == "teammate")
+            .unwrap();
+
+        svc.ensure_session("user-test", &created.id).await.unwrap();
+        let session = Arc::clone(&svc.sessions.get(&created.id).expect("session").session);
+        assert_eq!(
+            session.member_runtimes().snapshot(&worker.slot_id),
+            crate::member_runtime::MemberRuntimeSnapshot::Absent
+        );
+        let task_manager_for_ready = task_manager.clone();
+        let worker_conversation_id = worker.conversation_id.clone();
+        broadcaster.set_observer(Arc::new(move |event| {
+            if event.name == "team.agentRuntimeStatusChanged"
+                && event.data.get("status").and_then(serde_json::Value::as_str) == Some("ready")
+                && event.data.get("conversation_id").and_then(serde_json::Value::as_str)
+                    == Some(worker_conversation_id.as_str())
+            {
+                task_manager_for_ready.insert_mode_agent(&worker_conversation_id);
+            }
+        }));
+
+        svc.ensure_agent_runtime("user-test", &created.id, &worker.slot_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            session.member_runtimes().snapshot(&worker.slot_id),
+            crate::member_runtime::MemberRuntimeSnapshot::Ready
+        );
+        let state = svc.get_run_state("user-test", &created.id).await.unwrap();
+        assert!(state.active_run.is_none());
+        assert!(state.slot_work.iter().all(|slot| slot.team_run_id.is_none()));
     }
 
     #[tokio::test]
@@ -2780,13 +3635,23 @@ mod tests {
 
     #[tokio::test]
     async fn manual_add_agent_in_active_session_emits_runtime_ready_after_background_attach() {
+        let task_manager = Arc::new(MutableTaskManager::new());
         let (svc, _repo, _task_manager, _conv_repo, broadcaster) =
-            setup_with_factory_metadata_team_repo_conversation_repo_and_broadcaster();
+            setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager(task_manager.clone());
         let created = svc
             .create_team("user-test", single_agent_team_request("Manual Runtime Events"))
             .await
             .unwrap();
         svc.ensure_session("user-test", &created.id).await.unwrap();
+        let task_manager_for_ready = task_manager.clone();
+        broadcaster.set_observer(Arc::new(move |event| {
+            if event.name == "team.agentRuntimeStatusChanged"
+                && event.data.get("status").and_then(serde_json::Value::as_str) == Some("ready")
+                && let Some(conversation_id) = event.data.get("conversation_id").and_then(serde_json::Value::as_str)
+            {
+                task_manager_for_ready.insert_mode_agent(conversation_id);
+            }
+        }));
 
         let added = svc
             .add_agent(
@@ -3063,6 +3928,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cold_ensure_and_restart_keep_idle_lead_role() {
+        let (svc, _repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo();
+        let created = svc
+            .create_team("user-test", single_agent_team_request("Idle Lead Role"))
+            .await
+            .unwrap();
+        let lead_slot_id = created.assistants[0].slot_id.clone();
+
+        svc.ensure_session("user-test", &created.id).await.unwrap();
+        let cold_state = svc.get_run_state("user-test", &created.id).await.unwrap();
+        assert!(cold_state.active_run.is_none());
+        assert_eq!(cold_state.slot_work.len(), 1);
+        assert_eq!(cold_state.slot_work[0].slot_id, lead_slot_id);
+        assert_eq!(cold_state.slot_work[0].role, TeamRunTargetRole::Lead);
+
+        svc.stop_session("user-test", &created.id).await.unwrap();
+        svc.ensure_session("user-test", &created.id).await.unwrap();
+        let restarted_state = svc.get_run_state("user-test", &created.id).await.unwrap();
+        assert!(restarted_state.active_run.is_none());
+        assert_eq!(restarted_state.slot_work.len(), 1);
+        assert_eq!(restarted_state.slot_work[0].slot_id, lead_slot_id);
+        assert_eq!(restarted_state.slot_work[0].role, TeamRunTargetRole::Lead);
+    }
+
+    #[tokio::test]
     async fn config_options_returns_snapshot_without_creating_team_session() {
         let (svc, _repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo();
         let created = svc
@@ -3099,9 +3989,55 @@ mod tests {
         assert_eq!(active_run.status, ack.run.status);
         assert_eq!(active_run.target_slot_id, ack.run.target_slot_id);
         assert_eq!(active_run.target_role, ack.run.target_role);
+        assert_eq!(active_run.target_role, TeamRunTargetRole::Lead);
         assert_eq!(active_run.queued_intent_count, 1);
         assert_eq!(active_run.slot_work.len(), 1);
         assert_eq!(active_run.slot_work[0].slot_id, ack.run.slot_work[0].slot_id);
+        assert_eq!(active_run.slot_work[0].role, TeamRunTargetRole::Lead);
+    }
+
+    #[tokio::test]
+    async fn unknown_pause_does_not_pollute_run_state() {
+        let (svc, _repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo();
+        let created = svc
+            .create_team("user-test", single_agent_team_request("Unknown Pause"))
+            .await
+            .unwrap();
+        let ack = svc.send_message("user-test", &created.id, "hello", None).await.unwrap();
+        let before = svc.get_run_state("user-test", &created.id).await.unwrap();
+
+        let error = svc
+            .pause_slot_work(
+                "user-test",
+                &created.id,
+                &ack.run.team_run_id,
+                "missing-slot",
+                Some("not a member".to_owned()),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, crate::error::TeamError::AgentNotFound(ref slot_id) if slot_id == "missing-slot"));
+        let after = svc.get_run_state("user-test", &created.id).await.unwrap();
+        assert_eq!(after.session_generation, before.session_generation);
+        assert_eq!(
+            after.active_run.as_ref().map(|run| run.team_run_id.as_str()),
+            Some(ack.run.team_run_id.as_str())
+        );
+        assert_eq!(after.slot_work.len(), before.slot_work.len());
+        assert!(
+            after
+                .slot_work
+                .iter()
+                .all(|slot| { slot.slot_id != "missing-slot" && slot.role == TeamRunTargetRole::Lead })
+        );
+        assert!(
+            after
+                .active_run
+                .into_iter()
+                .flat_map(|run| run.slot_work)
+                .all(|slot| { slot.slot_id != "missing-slot" && slot.role == TeamRunTargetRole::Lead })
+        );
     }
 
     #[tokio::test]

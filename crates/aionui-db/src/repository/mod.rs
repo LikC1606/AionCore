@@ -28,8 +28,10 @@ mod sqlite_remote_agent;
 mod sqlite_settings;
 mod sqlite_skill;
 mod sqlite_team;
+mod sqlite_team_mode;
 mod sqlite_user;
 pub mod team;
+pub mod team_mode;
 mod user;
 
 pub use acp_session::{CreateAcpSessionParams, IAcpSessionRepository, PersistedSessionState, SaveRuntimeStateParams};
@@ -70,6 +72,13 @@ pub use sqlite_remote_agent::SqliteRemoteAgentRepository;
 pub use sqlite_settings::SqliteSettingsRepository;
 pub use sqlite_skill::SqliteSkillRepository;
 pub use sqlite_team::SqliteTeamRepository;
+pub use sqlite_team_mode::SqliteTeamModeRepository;
 pub use sqlite_user::SqliteUserRepository;
 pub use team::ITeamRepository;
+pub use team_mode::{
+    CommitTeamCommandParams, ITeamModeRepository, NewTeamMailboxNotification, NewTeamWorkEvent,
+    TEAM_WORK_EVENT_NOTIFICATION_SCOPE, TeamCommandCommitResult, TeamCommandReceiptLookupResult,
+    TeamGitDeliveryMutation, TeamGitIntegrationMutation, TeamGitIntegrationResolution, TeamRosterGuard,
+    TeamWorkItemMutation, TeamWorkItemRevisionGuard,
+};
 pub use user::IUserRepository;

@@ -28,7 +28,10 @@ use aionui_extension::{
     HubIndexManager, HubInstaller, HubRouterState, SkillRouterState, resolve_install_target_dir_for_data_dir,
     resolve_scan_paths_for_data_dir, resolve_state_file_path,
 };
-use aionui_file::{BrowseRoots, FileRouterState, FileService, FileWatchService, SnapshotService};
+use aionui_file::{
+    BrowseRoots, DisabledFileWatchService, FileRouterState, FileService, FileWatchService, FileWatchServiceRef,
+    SnapshotService,
+};
 use aionui_mcp::{
     AionrsAdapter, AionuiAdapter, ClaudeAdapter, CodeBuddyAdapter, CodexAdapter, GeminiAdapter, McpAgentAdapter,
     McpConfigService, McpConnectionTestService, McpRouterState, McpSyncService, OpencodeAdapter, QwenAdapter,
@@ -45,11 +48,14 @@ use aionui_system::{
 };
 use aionui_team::{
     AgentTurnCancellationPort, AgentTurnExecutionPort, TeamAssistantCatalogEntry, TeamAssistantCatalogPort,
-    TeamConversationProvisioningPort, TeamProjectionMessageStore, TeamRouterState, TeamSessionService,
+    TeamCommandService, TeamConversationProvisioningPort, TeamDeliveryService, TeamGitDeliveryPort,
+    TeamGitWorkspacePort, TeamProjectionMessageStore, TeamQueryService, TeamRouterState, TeamSessionService,
+    TeamWorkCoordinator,
 };
 
 use crate::config::derive_encryption_key;
 use crate::router::team_conversation_adapters::TeamConversationAdapters;
+use crate::router::team_git_delivery_adapter::LocalTeamGitDeliveryPort;
 use crate::services::AppServices;
 
 #[derive(Debug)]
@@ -439,7 +445,12 @@ pub fn build_file_state(services: &AppServices) -> Result<FileRouterState, Route
     let allowed_roots = default_allowed_roots(Some(services.work_dir.as_path()));
     let browse_roots = BrowseRoots::new();
     let file_service = Arc::new(FileService::new(broadcaster.clone(), allowed_roots.clone()));
-    let watch_service = Arc::new(FileWatchService::new(broadcaster).map_err(file_watch_init_error)?);
+    let watch_service: FileWatchServiceRef =
+        if file_watch_disabled(std::env::var_os("DEEPSCIENTIST_DISABLE_FILE_WATCH").as_deref()) {
+            Arc::new(DisabledFileWatchService)
+        } else {
+            Arc::new(FileWatchService::new(broadcaster).map_err(file_watch_init_error)?)
+        };
     let snapshot_service = Arc::new(SnapshotService::new());
     Ok(FileRouterState {
         file_service,
@@ -448,6 +459,10 @@ pub fn build_file_state(services: &AppServices) -> Result<FileRouterState, Route
         allowed_roots,
         browse_roots,
     })
+}
+
+fn file_watch_disabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
 }
 
 fn file_watch_init_error(error: aionui_file::FileError) -> RouterBuildError {
@@ -597,8 +612,7 @@ pub async fn build_channel_state(
 /// Build the default `TeamRouterState` from application services.
 ///
 /// `backend_binary_path` is resolved once in `build_module_states` via
-/// `std::env::current_exe()` and cloned into each builder that needs it,
-/// per `docs/teams/phase1/interface-contracts.md` §10.
+/// `std::env::current_exe()` and cloned into each builder that needs it.
 pub fn build_team_state(
     services: &AppServices,
     _cron_service: Option<Arc<aionui_cron::service::CronService>>,
@@ -645,6 +659,37 @@ pub fn build_team_state(
 
     let pool = services.database.pool().clone();
     let team_repo: Arc<dyn aionui_db::ITeamRepository> = Arc::new(aionui_db::SqliteTeamRepository::new(pool.clone()));
+    let mode_repo: Arc<dyn aionui_db::ITeamModeRepository> =
+        Arc::new(aionui_db::SqliteTeamModeRepository::new(pool.clone()));
+    let command_service = Arc::new(TeamCommandService::new_with_event_broadcaster(
+        team_repo.clone(),
+        mode_repo.clone(),
+        services.event_bus.clone(),
+    ));
+    let query_service = Arc::new(TeamQueryService::new(team_repo.clone(), mode_repo.clone()));
+    let local_git_adapter = Arc::new(LocalTeamGitDeliveryPort::new(
+        services.data_dir.join("team-worktrees"),
+        vec![
+            services.skill_paths.builtin_skills_dir.clone(),
+            services.skill_paths.user_skills_dir.clone(),
+            services.skill_paths.cron_skills_dir.clone(),
+        ],
+    ));
+    let git_workspace_port: Arc<dyn TeamGitWorkspacePort> = local_git_adapter.clone();
+    let git_delivery_port: Arc<dyn TeamGitDeliveryPort> = local_git_adapter;
+    let work_coordinator = Arc::new(TeamWorkCoordinator::new(
+        team_repo.clone(),
+        mode_repo.clone(),
+        command_service.clone(),
+        git_workspace_port.clone(),
+    ));
+    let delivery_service = Arc::new(TeamDeliveryService::new(
+        team_repo.clone(),
+        mode_repo,
+        command_service.clone(),
+        git_delivery_port,
+        git_workspace_port,
+    ));
     let conv_service = services.conversation_service.clone();
     let conv_repo: Arc<dyn IConversationRepository> = Arc::new(SqliteConversationRepository::new(pool));
     let adapters = Arc::new(TeamConversationAdapters::new(
@@ -674,8 +719,20 @@ pub fn build_team_state(
         backend_binary_path,
         aionui_team::TeamPromptDumpConfig::from_data_dir(&services.data_dir, services.dump_prompts),
     );
+    service
+        .configure_team_work(
+            work_coordinator.clone(),
+            command_service.clone(),
+            delivery_service.clone(),
+            query_service.clone(),
+        )
+        .expect("configure canonical Team work adapter");
     TeamRouterState {
         service,
+        command_service,
+        work_coordinator,
+        delivery_service,
+        query_service,
         active_leases: services.active_lease_registry.clone(),
     }
 }
@@ -887,6 +944,8 @@ mod tests {
 
     use crate::AppConfig;
     use aionui_ai_agent::types::{AIONUI_BASE_URL_ENV, AIONUI_HELPER_BIN_ENV, BuildTaskOptions, SendMessageData};
+
+    type CapturedRuntimeEnv = Arc<Mutex<Vec<Vec<(String, String)>>>>;
     use aionui_ai_agent::{
         AgentError, AgentInstance, AgentSendError, AgentStreamEvent, IAgentTask, IMockAgent, IWorkerTaskManager,
         WorkerTaskManagerImpl,
@@ -961,9 +1020,7 @@ mod tests {
         Arc::new(WorkerTaskManagerImpl::new(factory))
     }
 
-    fn capturing_worker_task_manager(
-        captured_env: Arc<Mutex<Vec<Vec<(String, String)>>>>,
-    ) -> Arc<dyn IWorkerTaskManager> {
+    fn capturing_worker_task_manager(captured_env: CapturedRuntimeEnv) -> Arc<dyn IWorkerTaskManager> {
         let factory = Arc::new(move |opts: BuildTaskOptions| {
             let captured_env = captured_env.clone();
             Box::pin(async move {
@@ -980,7 +1037,7 @@ mod tests {
         Arc::new(WorkerTaskManagerImpl::new(factory))
     }
 
-    async fn wait_for_captured_env(captured_env: &Arc<Mutex<Vec<Vec<(String, String)>>>>) -> Vec<(String, String)> {
+    async fn wait_for_captured_env(captured_env: &CapturedRuntimeEnv) -> Vec<(String, String)> {
         for _ in 0..50 {
             if let Some(env) = captured_env.lock().unwrap().first().cloned() {
                 return env;
@@ -1214,5 +1271,13 @@ mod tests {
         assert_eq!(err.stage(), "router.file_watch");
         assert_eq!(err.message(), "failed to initialize file watch service");
         assert!(!err.to_string().contains("watch backend unavailable"));
+    }
+
+    #[test]
+    fn file_watch_disable_policy_requires_exact_operator_value() {
+        assert!(file_watch_disabled(Some(std::ffi::OsStr::new("1"))));
+        assert!(!file_watch_disabled(None));
+        assert!(!file_watch_disabled(Some(std::ffi::OsStr::new("true"))));
+        assert!(!file_watch_disabled(Some(std::ffi::OsStr::new("0"))));
     }
 }

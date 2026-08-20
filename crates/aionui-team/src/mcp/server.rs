@@ -1,5 +1,6 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, RwLock, Weak};
 
 use aionui_api_types::TeamSendMessageQueuedResponse;
 use aionui_realtime::EventBroadcaster;
@@ -14,26 +15,109 @@ use crate::scheduler::TeammateManager;
 use crate::service::TeamSessionService;
 use crate::session::{AgentMessageQueueResult, SpawnAgentRequest};
 use crate::tool_executor::{TeamToolContext, TeamToolExecutor, team_tool_call_from_name};
-use crate::types::{TaskStatus, TeamAgent, TeamTask, TeammateRole, TeammateStatus};
+use crate::types::{TeamAgent, TeammateRole, TeammateStatus};
 use crate::work_source::WorkSource;
 
 use super::protocol::{
     INVALID_PARAMS, INVALID_REQUEST, JsonRpcResponse, METHOD_NOT_FOUND, PROTOCOL_VERSION, SERVER_NAME, SERVER_VERSION,
     read_request, write_response,
 };
-use super::tools::{
-    RenameAgentInput, SendMessageInput, ShutdownAgentInput, SpawnAgentInput, TaskCreateInput, TaskListInput,
-    TaskListStatusInput, TaskUpdateInput,
-};
+use super::tools::{RenameAgentInput, SendMessageInput, ShutdownAgentInput, SpawnAgentInput};
 
 // ---------------------------------------------------------------------------
 // TeamMcpServer
 // ---------------------------------------------------------------------------
 
+#[derive(Default)]
+struct TeamMcpCredentialState {
+    token_by_slot: HashMap<String, String>,
+    slot_by_token: HashMap<String, String>,
+}
+
+/// Session-local credentials. A token identifies exactly one member slot;
+/// caller-provided slot metadata is never an authorization input.
+struct TeamMcpCredentialRegistry {
+    state: RwLock<TeamMcpCredentialState>,
+}
+
+impl TeamMcpCredentialRegistry {
+    fn new(bootstrap_token: String, agents: &[TeamAgent]) -> Result<Self, TeamError> {
+        if bootstrap_token.trim().is_empty() {
+            return Err(TeamError::InvalidRequest(
+                "Team MCP bootstrap credential must not be empty".to_owned(),
+            ));
+        }
+        let lead = agents
+            .iter()
+            .find(|agent| agent.role == TeammateRole::Lead)
+            .ok_or_else(|| TeamError::InvalidRequest("Team MCP requires a lead member".to_owned()))?;
+        let mut state = TeamMcpCredentialState::default();
+        state
+            .token_by_slot
+            .insert(lead.slot_id.clone(), bootstrap_token.clone());
+        state.slot_by_token.insert(bootstrap_token, lead.slot_id.clone());
+        for agent in agents {
+            Self::ensure_slot_locked(&mut state, &agent.slot_id);
+        }
+        Ok(Self {
+            state: RwLock::new(state),
+        })
+    }
+
+    fn credential_for_slot(&self, slot_id: &str) -> Option<String> {
+        self.read_state().token_by_slot.get(slot_id).cloned()
+    }
+
+    fn ensure_slot(&self, slot_id: &str) -> String {
+        let mut state = self.write_state();
+        Self::ensure_slot_locked(&mut state, slot_id)
+    }
+
+    fn resolve_slot(&self, token: &str) -> Option<String> {
+        self.read_state().slot_by_token.get(token).cloned()
+    }
+
+    fn revoke_slot(&self, slot_id: &str) {
+        let mut state = self.write_state();
+        if let Some(token) = state.token_by_slot.remove(slot_id) {
+            state.slot_by_token.remove(&token);
+        }
+    }
+
+    fn ensure_slot_locked(state: &mut TeamMcpCredentialState, slot_id: &str) -> String {
+        if let Some(token) = state.token_by_slot.get(slot_id) {
+            return token.clone();
+        }
+        let token = loop {
+            let candidate = aionui_common::generate_id();
+            if !state.slot_by_token.contains_key(&candidate) {
+                break candidate;
+            }
+        };
+        state.token_by_slot.insert(slot_id.to_owned(), token.clone());
+        state.slot_by_token.insert(token.clone(), slot_id.to_owned());
+        token
+    }
+
+    fn read_state(&self) -> std::sync::RwLockReadGuard<'_, TeamMcpCredentialState> {
+        self.state.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn write_state(&self) -> std::sync::RwLockWriteGuard<'_, TeamMcpCredentialState> {
+        self.state.write().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+#[derive(Clone)]
+struct TeamMcpTransportContext {
+    credentials: Arc<TeamMcpCredentialRegistry>,
+}
+
 pub struct TeamMcpServer {
     addr: SocketAddr,
     http_addr: SocketAddr,
-    auth_token: String,
+    bootstrap_auth_token: String,
+    credentials: Arc<TeamMcpCredentialRegistry>,
     shutdown_tx: watch::Sender<bool>,
 }
 
@@ -64,6 +148,8 @@ impl TeamMcpServer {
         service: Weak<TeamSessionService>,
         prompt_dump: Option<TeamPromptDumpConfig>,
     ) -> Result<Self, TeamError> {
+        let initial_agents = scheduler.list_agents().await;
+        let credentials = Arc::new(TeamMcpCredentialRegistry::new(auth_token.clone(), &initial_agents)?);
         let listener = match TcpListener::bind("127.0.0.1:0").await {
             Ok(l) => l,
             Err(e) => {
@@ -76,15 +162,17 @@ impl TeamMcpServer {
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        let token = auth_token.clone();
         let sched_for_tcp = scheduler.clone();
         let service_for_tcp = service.clone();
         let team_id_for_tcp = team_id.clone();
         let prompt_dump = prompt_dump.unwrap_or_else(TeamPromptDumpConfig::disabled);
         let prompt_dump_for_tcp = prompt_dump.clone();
+        let transport_context = TeamMcpTransportContext {
+            credentials: Arc::clone(&credentials),
+        };
         tokio::spawn(accept_loop(
             listener,
-            token,
+            transport_context.clone(),
             sched_for_tcp,
             service_for_tcp,
             team_id_for_tcp,
@@ -100,14 +188,13 @@ impl TeamMcpServer {
             .local_addr()
             .map_err(|e| TeamError::InvalidRequest(format!("Failed to get HTTP addr: {e}")))?;
 
-        let http_token = auth_token.clone();
         let http_sched = scheduler.clone();
         let http_service = service.clone();
         let http_team_id = team_id.clone();
         let http_prompt_dump = prompt_dump.clone();
         tokio::spawn(http_mcp_loop(
             http_listener,
-            http_token,
+            transport_context,
             http_sched,
             http_service,
             http_team_id,
@@ -124,7 +211,8 @@ impl TeamMcpServer {
         Ok(Self {
             addr,
             http_addr,
-            auth_token,
+            bootstrap_auth_token: auth_token,
+            credentials,
             shutdown_tx,
         })
     }
@@ -137,8 +225,22 @@ impl TeamMcpServer {
         self.http_addr.port()
     }
 
+    /// Compatibility accessor for callers that bootstrap a standalone server.
+    /// This credential is bound to the lead slot and is not valid for workers.
     pub fn auth_token(&self) -> &str {
-        &self.auth_token
+        &self.bootstrap_auth_token
+    }
+
+    pub fn credential_for_slot(&self, slot_id: &str) -> Option<String> {
+        self.credentials.credential_for_slot(slot_id)
+    }
+
+    pub(crate) fn ensure_slot_credential(&self, slot_id: &str) -> String {
+        self.credentials.ensure_slot(slot_id)
+    }
+
+    pub(crate) fn revoke_slot_credential(&self, slot_id: &str) {
+        self.credentials.revoke_slot(slot_id);
     }
 
     pub fn stop(&self) {
@@ -159,7 +261,7 @@ impl Drop for TeamMcpServer {
 
 async fn accept_loop(
     listener: TcpListener,
-    auth_token: String,
+    transport_context: TeamMcpTransportContext,
     scheduler: Arc<TeammateManager>,
     service: Weak<TeamSessionService>,
     team_id: String,
@@ -172,12 +274,21 @@ async fn accept_loop(
                 match result {
                     Ok((stream, peer)) => {
                         debug!(?peer, "New MCP connection");
-                        let token = auth_token.clone();
+                        let connection_context = transport_context.clone();
                         let sched = Arc::clone(&scheduler);
                         let svc = service.clone();
                         let tid = team_id.clone();
                         let dump = prompt_dump.clone();
-                        tokio::spawn(handle_connection(stream, token, sched, svc, tid, dump));
+                        let connection_shutdown = shutdown_rx.clone();
+                        tokio::spawn(handle_connection(
+                            stream,
+                            connection_context,
+                            sched,
+                            svc,
+                            tid,
+                            dump,
+                            connection_shutdown,
+                        ));
                     }
                     Err(e) => {
                         error!("Accept error: {e}");
@@ -200,11 +311,12 @@ async fn accept_loop(
 
 async fn handle_connection(
     stream: TcpStream,
-    auth_token: String,
+    transport_context: TeamMcpTransportContext,
     scheduler: Arc<TeammateManager>,
     service: Weak<TeamSessionService>,
     team_id: String,
     prompt_dump: TeamPromptDumpConfig,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let (mut reader, mut writer) = tokio::io::split(stream);
 
@@ -212,26 +324,40 @@ async fn handle_connection(
     let mut caller_slot_id: Option<String> = None;
 
     loop {
-        let request = match read_request(&mut reader).await {
-            Ok(req) => req,
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => {
-                warn!("Read error: {e}");
-                break;
-            }
+        let request = tokio::select! {
+            request = read_request(&mut reader) => match request {
+                Ok(req) => req,
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => {
+                    warn!("Read error: {e}");
+                    break;
+                }
+            },
+            _ = shutdown_rx.changed() => break,
         };
+        if *shutdown_rx.borrow() {
+            break;
+        }
 
         if request.id.is_none() {
             continue;
         }
 
         let response = if !authenticated {
-            match handle_initialize(&request, &auth_token) {
+            match handle_initialize(&request, &transport_context.credentials) {
                 InitResult::Authenticated(slot_id, resp) => {
-                    info!(team_id = %team_id, slot_id = %slot_id, "MCP agent authenticated");
-                    authenticated = true;
-                    caller_slot_id = Some(slot_id);
-                    resp
+                    if scheduler.get_agent(&slot_id).await.is_err() {
+                        JsonRpcResponse::error(
+                            request.id,
+                            INVALID_REQUEST,
+                            "Authentication failed: credential is no longer active",
+                        )
+                    } else {
+                        info!(team_id = %team_id, slot_id = %slot_id, "MCP agent authenticated");
+                        authenticated = true;
+                        caller_slot_id = Some(slot_id);
+                        resp
+                    }
                 }
                 InitResult::Response(resp) => {
                     warn!(team_id = %team_id, method = %request.method, "MCP auth rejected");
@@ -266,7 +392,7 @@ enum InitResult {
     Response(JsonRpcResponse),
 }
 
-fn handle_initialize(request: &super::protocol::JsonRpcRequest, auth_token: &str) -> InitResult {
+fn handle_initialize(request: &super::protocol::JsonRpcRequest, credentials: &TeamMcpCredentialRegistry) -> InitResult {
     if request.method != "initialize" {
         return InitResult::Response(JsonRpcResponse::error(
             request.id,
@@ -283,20 +409,13 @@ fn handle_initialize(request: &super::protocol::JsonRpcRequest, auth_token: &str
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    if token != auth_token {
+    let Some(slot_id) = credentials.resolve_slot(token) else {
         return InitResult::Response(JsonRpcResponse::error(
             request.id,
             INVALID_REQUEST,
             "Authentication failed: invalid auth_token",
         ));
-    }
-
-    let slot_id = params
-        .and_then(|p| p.get("slot_id"))
-        .or_else(|| params.and_then(|p| p.get("slotId")))
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown")
-        .to_owned();
+    };
 
     let resp = JsonRpcResponse::success(
         request.id,
@@ -327,6 +446,13 @@ async fn handle_method(
     caller_slot_id: &str,
     prompt_dump: &TeamPromptDumpConfig,
 ) -> JsonRpcResponse {
+    if scheduler.get_agent(caller_slot_id).await.is_err() {
+        return JsonRpcResponse::error(
+            request.id,
+            INVALID_REQUEST,
+            "Authentication failed: credential is no longer active",
+        );
+    }
     match request.method.as_str() {
         "notifications/initialized" => JsonRpcResponse::success(request.id, json!({})),
         "tools/list" => handle_tools_list(request.id, scheduler, team_id, caller_slot_id, prompt_dump).await,
@@ -426,9 +552,9 @@ async fn handle_tools_call(
 
     let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
-    let caller_role = match scheduler.get_agent(caller_slot_id).await {
-        Ok(agent) => agent.role,
-        Err(_) => TeammateRole::Teammate,
+    let (caller_role, caller_conversation_id) = match scheduler.get_agent(caller_slot_id).await {
+        Ok(agent) => (agent.role, Some(agent.conversation_id)),
+        Err(_) => (TeammateRole::Teammate, None),
     };
 
     info!(
@@ -443,11 +569,11 @@ async fn handle_tools_call(
         caller_slot_id: caller_slot_id.to_owned(),
         caller_role,
         user_id: None,
-        conversation_id: None,
+        conversation_id: caller_conversation_id,
         transport: aionui_api_types::TeamToolTransport::Mcp,
     };
     let result = match team_tool_call_from_name(tool_name, arguments) {
-        Ok(call) => TeamToolExecutor::new(scheduler, service).execute(&context, call).await,
+        Ok(call) => execute_mcp_tool(scheduler, service, &context, call).await,
         Err(error) => Err(error),
     };
 
@@ -480,6 +606,21 @@ async fn handle_tools_call(
             JsonRpcResponse::success(request.id, result)
         }
     }
+}
+
+async fn execute_mcp_tool(
+    scheduler: &TeammateManager,
+    service: &Weak<TeamSessionService>,
+    context: &TeamToolContext,
+    call: aionui_api_types::TeamToolCall,
+) -> Result<Value, aionui_api_types::TeamToolErrorPayload> {
+    if let Some(service) = service.upgrade() {
+        return service.execute_team_tool(context, call).await;
+    }
+
+    // Standalone MCP servers have no Team lifecycle owner and therefore no
+    // concurrent remove_team operation to coordinate with.
+    TeamToolExecutor::new(scheduler, service).execute(context, call).await
 }
 
 // ---------------------------------------------------------------------------
@@ -525,9 +666,6 @@ pub(crate) async fn dispatch_tool(
     match tool_name {
         "team_send_message" => exec_send_message(arguments, scheduler, service, team_id, caller_slot_id).await,
         "team_spawn_agent" => exec_spawn_agent(arguments, service, team_id, caller_slot_id, caller_role).await,
-        "team_task_create" => exec_task_create(arguments, scheduler).await,
-        "team_task_update" => exec_task_update(arguments, scheduler).await,
-        "team_task_list" => exec_task_list(arguments, scheduler).await,
         "team_members" => exec_members(scheduler).await,
         "team_rename_agent" => exec_rename_agent(arguments, scheduler, service, team_id).await,
         "team_shutdown_agent" => {
@@ -587,12 +725,33 @@ async fn resolve_agent_target(
     allow_broadcast: bool,
 ) -> Result<String, String> {
     let agents = scheduler.list_agents().await;
+    resolve_agent_target_from_agents(&agents, target, allow_broadcast)
+}
+
+fn resolve_agent_target_from_agents(
+    agents: &[TeamAgent],
+    target: &str,
+    allow_broadcast: bool,
+) -> Result<String, String> {
     if agents.iter().any(|a| a.slot_id == target) {
         return Ok(target.to_owned());
     }
+
+    if target.eq_ignore_ascii_case("leader") || target.eq_ignore_ascii_case("lead") {
+        let leaders = agents
+            .iter()
+            .filter(|agent| agent.role == TeammateRole::Lead)
+            .collect::<Vec<_>>();
+        return match leaders.as_slice() {
+            [leader] => Ok(leader.slot_id.clone()),
+            [] => Err("Cannot resolve recipient 'leader': this team has no leader slot. Call team_members and use an exact slot_id.".to_owned()),
+            _ => Err("Cannot resolve recipient 'leader': this team has multiple leader slots. Call team_members and use an exact slot_id.".to_owned()),
+        };
+    }
+
     if allow_broadcast {
         Err(format!(
-            "Invalid agent target '{target}': expected slot_id or \"*\". Call team_members to get slot_id."
+            "Invalid agent target '{target}': expected slot_id, \"leader\", or \"*\". Do not use team_id as a recipient; call team_members to get slot_id."
         ))
     } else {
         Err(format!(
@@ -689,12 +848,13 @@ async fn exec_send_message(
     let mut target_results = Vec::with_capacity(targets.len());
     for target in &targets {
         let result = service
-            .send_agent_message_from_agent(
+            .send_agent_message_from_agent_with_idempotency(
                 team_id,
                 caller_slot_id,
                 target,
                 &input.message,
                 Some(input.files.clone()),
+                input.idempotency_key.clone(),
             )
             .await
             .map_err(|e| ToolCallError::from_message(e.to_string()))?;
@@ -728,65 +888,6 @@ fn agent_json(agent: &TeamAgent) -> Value {
         "assistant_id": agent.assistant_id,
         "model": agent.model,
     })
-}
-
-fn task_json(task: &TeamTask) -> Value {
-    json!({
-        "task_id": task.id,
-        "subject": task.subject,
-        "status": task.status,
-        "owner": task.owner,
-        "blocked_by": task.blocked_by,
-    })
-}
-
-const MAX_TASK_LIST_LIMIT: usize = 200;
-
-#[derive(Debug)]
-struct TaskListFilters {
-    owner: Option<String>,
-    statuses: Option<Vec<TaskStatus>>,
-    include_deleted: bool,
-    limit: Option<usize>,
-}
-
-fn parse_task_list_filters(args: &Value) -> Result<TaskListFilters, ToolCallError> {
-    let input: TaskListInput = serde_json::from_value(args.clone())
-        .map_err(|e| ToolCallError::from_message(format!("Invalid params: {e}")))?;
-    let statuses = match input.status {
-        Some(TaskListStatusInput::Single(status)) => Some(vec![parse_task_status_arg(&status)?]),
-        Some(TaskListStatusInput::Many(statuses)) => {
-            if statuses.is_empty() {
-                return Err(ToolCallError::from_message("Invalid params: status must not be empty"));
-            }
-            let parsed = statuses
-                .iter()
-                .map(|status| parse_task_status_arg(status))
-                .collect::<Result<Vec<_>, _>>()?;
-            Some(parsed)
-        }
-        None => None,
-    };
-    let limit = match input.limit {
-        Some(value) if value <= 0 => {
-            return Err(ToolCallError::from_message(
-                "Invalid params: limit must be greater than 0",
-            ));
-        }
-        Some(value) => Some((value as usize).min(MAX_TASK_LIST_LIMIT)),
-        None => None,
-    };
-    Ok(TaskListFilters {
-        owner: input.owner,
-        statuses,
-        include_deleted: input.include_deleted.unwrap_or(true),
-        limit,
-    })
-}
-
-fn parse_task_status_arg(status: &str) -> Result<TaskStatus, ToolCallError> {
-    TaskStatus::parse(status)
-        .ok_or_else(|| ToolCallError::from_message(format!("Invalid params: unsupported task status '{status}'")))
 }
 
 fn json_text(value: &Value) -> Result<String, ToolCallError> {
@@ -858,76 +959,6 @@ async fn exec_spawn_agent(
             .map_err(TeamError::Json)
         })
         .map_err(|e| ToolCallError::from_message(e.to_string()))
-}
-
-async fn exec_task_create(args: &Value, scheduler: &TeammateManager) -> Result<String, ToolCallError> {
-    let input: TaskCreateInput = serde_json::from_value(args.clone())
-        .map_err(|e| ToolCallError::from_message(format!("Invalid params: {e}")))?;
-
-    let task = scheduler
-        .create_task(
-            &input.subject,
-            input.description.as_deref(),
-            input.owner.as_deref(),
-            &input.blocked_by.unwrap_or_default(),
-        )
-        .await
-        .map_err(|e| ToolCallError::from_message(e.to_string()))?;
-
-    json_text(&json!({ "status": "ok", "task": task_json(&task) }))
-}
-
-async fn exec_task_update(args: &Value, scheduler: &TeammateManager) -> Result<String, ToolCallError> {
-    let input: TaskUpdateInput = serde_json::from_value(args.clone())
-        .map_err(|e| ToolCallError::from_message(format!("Invalid params: {e}")))?;
-
-    let task = scheduler
-        .update_task(
-            &input.task_id,
-            input.status.as_deref(),
-            input.description,
-            input.owner,
-            input.blocked_by,
-        )
-        .await
-        .map_err(|e| ToolCallError::from_message(e.to_string()))?;
-
-    json_text(&json!({ "status": "ok", "task": task_json(&task) }))
-}
-
-async fn exec_task_list(args: &Value, scheduler: &TeammateManager) -> Result<String, ToolCallError> {
-    let filters = parse_task_list_filters(args)?;
-    let tasks = scheduler
-        .list_tasks()
-        .await
-        .map_err(|e| ToolCallError::from_message(e.to_string()))?;
-    let mut output: Vec<Value> = tasks
-        .iter()
-        .filter(|task| match filters.owner.as_deref() {
-            Some(owner) => task.owner.as_deref() == Some(owner),
-            None => true,
-        })
-        .filter(|task| match filters.statuses.as_ref() {
-            Some(statuses) => statuses.contains(&task.status),
-            None if !filters.include_deleted => task.status != TaskStatus::Deleted,
-            None => true,
-        })
-        .map(|t| {
-            json!({
-                "id": t.id,
-                "subject": t.subject,
-                "description": t.description,
-                "status": t.status,
-                "owner": t.owner,
-                "blocked_by": t.blocked_by,
-                "blocks": t.blocks,
-            })
-        })
-        .collect();
-    if let Some(limit) = filters.limit {
-        output.truncate(limit);
-    }
-    serde_json::to_string_pretty(&output).map_err(|e| ToolCallError::from_message(format!("Serialization error: {e}")))
 }
 
 async fn exec_members(scheduler: &TeammateManager) -> Result<String, ToolCallError> {
@@ -1019,7 +1050,7 @@ async fn exec_shutdown_agent(
 
 async fn http_mcp_loop(
     listener: TcpListener,
-    auth_token: String,
+    transport_context: TeamMcpTransportContext,
     scheduler: Arc<TeammateManager>,
     service: Weak<TeamSessionService>,
     team_id: String,
@@ -1033,17 +1064,24 @@ async fn http_mcp_loop(
             accept = listener.accept() => {
                 let Ok((mut stream, peer)) = accept else { continue };
                 info!(team_id = %team_id, ?peer, "HTTP MCP: new connection accepted");
-                let token = auth_token.clone();
+                let request_context = transport_context.clone();
                 let sched = scheduler.clone();
                 let svc = service.clone();
                 let tid = team_id.clone();
                 let dump = prompt_dump.clone();
+                let mut request_shutdown = shutdown_rx.clone();
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 65536];
-                    let n = match stream.read(&mut buf).await {
-                        Ok(n) if n > 0 => n,
-                        _ => return,
+                    let n = tokio::select! {
+                        result = stream.read(&mut buf) => match result {
+                            Ok(n) if n > 0 => n,
+                            _ => return,
+                        },
+                        _ = request_shutdown.changed() => return,
                     };
+                    if *request_shutdown.borrow() {
+                        return;
+                    }
                     let request = String::from_utf8_lossy(&buf[..n]);
 
                     // Extract JSON body (after \r\n\r\n)
@@ -1057,8 +1095,16 @@ async fn http_mcp_loop(
                     // Handle JSON-RPC request
                     let method = value.get("method").and_then(Value::as_str).unwrap_or("");
                     let id = value.get("id").cloned();
-                    let auth_ok = http_bearer_token(&request).is_some_and(|provided| provided == token);
-                    if !auth_ok {
+                    let caller_slot_id = http_bearer_token(&request)
+                        .and_then(|provided| request_context.credentials.resolve_slot(provided));
+                    let caller = match caller_slot_id
+                        .as_deref()
+                        .map(|slot_id| sched.get_agent(slot_id))
+                    {
+                        Some(agent) => agent.await.ok(),
+                        None => None,
+                    };
+                    let Some(caller) = caller else {
                         let response_body = json!({
                             "jsonrpc": "2.0",
                             "id": id,
@@ -1075,12 +1121,10 @@ async fn http_mcp_loop(
                         let _ = stream.write_all(header.as_bytes()).await;
                         let _ = stream.write_all(&body_bytes).await;
                         return;
-                    }
-                    let caller_slot_id = request.lines()
-                        .find(|l| l.to_lowercase().starts_with("x-slot-id:"))
-                        .and_then(|l| l.split_once(':').map(|(_, v)| v.trim()))
-                        .unwrap_or("");
-                    let caller_role = caller_role_for_tools_list(&sched, caller_slot_id).await;
+                    };
+                    let caller_slot_id = caller.slot_id;
+                    let caller_role = caller.role;
+                    let caller_conversation_id = caller.conversation_id;
 
                     let result = match method {
                         "initialize" => {
@@ -1098,10 +1142,10 @@ async fn http_mcp_loop(
                         "tools/list" => {
                             let context = TeamToolContext {
                                 team_id: tid.clone(),
-                                caller_slot_id: caller_slot_id.to_owned(),
+                                caller_slot_id: caller_slot_id.clone(),
                                 caller_role,
                                 user_id: None,
-                                conversation_id: None,
+                                conversation_id: Some(caller_conversation_id.clone()),
                                 transport: aionui_api_types::TeamToolTransport::Mcp,
                             };
                             let descriptors = TeamToolExecutor::new(&sched, &svc).list_tools(&context);
@@ -1110,7 +1154,7 @@ async fn http_mcp_loop(
                                 &dump,
                                 TeamToolsListDump {
                                     team_id: &tid,
-                                    caller_slot_id,
+                                    caller_slot_id: &caller_slot_id,
                                     caller_role,
                                     tools: &tools,
                                 },
@@ -1130,14 +1174,14 @@ async fn http_mcp_loop(
                             let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
                             let context = TeamToolContext {
                                 team_id: tid.clone(),
-                                caller_slot_id: caller_slot_id.to_owned(),
+                                caller_slot_id: caller_slot_id.clone(),
                                 caller_role,
                                 user_id: None,
-                                conversation_id: None,
+                                conversation_id: Some(caller_conversation_id.clone()),
                                 transport: aionui_api_types::TeamToolTransport::Mcp,
                             };
                             let call_result = match team_tool_call_from_name(tool_name, arguments) {
-                                Ok(call) => TeamToolExecutor::new(&sched, &svc).execute(&context, call).await,
+                                Ok(call) => execute_mcp_tool(&sched, &svc, &context, call).await,
                                 Err(error) => Err(error),
                             };
                             match call_result {
@@ -1229,6 +1273,48 @@ mod tests {
         assert_eq!(payload["target"]["slot_id"], "worker-1");
         assert_eq!(payload["target"]["state"], "queued");
         assert_eq!(payload["target"]["queued_background_count"], 1);
+    }
+
+    fn target_agent(slot_id: &str, role: TeammateRole) -> TeamAgent {
+        TeamAgent {
+            slot_id: slot_id.to_owned(),
+            name: slot_id.to_owned(),
+            role,
+            conversation_id: format!("conversation-{slot_id}"),
+            backend: "codex".to_owned(),
+            model: "test".to_owned(),
+            assistant_id: None,
+            status: Some(TeammateStatus::Idle),
+            conversation_type: None,
+            cli_path: None,
+        }
+    }
+
+    #[test]
+    fn leader_alias_resolves_to_the_actual_leader_slot() {
+        let agents = vec![
+            target_agent("lead-slot", TeammateRole::Lead),
+            target_agent("worker-slot", TeammateRole::Teammate),
+        ];
+
+        assert_eq!(
+            resolve_agent_target_from_agents(&agents, "leader", true),
+            Ok("lead-slot".to_owned())
+        );
+        assert_eq!(
+            resolve_agent_target_from_agents(&agents, "LEAD", true),
+            Ok("lead-slot".to_owned())
+        );
+    }
+
+    #[test]
+    fn invalid_recipient_explains_that_team_id_is_not_a_target() {
+        let agents = vec![target_agent("lead-slot", TeammateRole::Lead)];
+        let error = resolve_agent_target_from_agents(&agents, "team-123", true)
+            .expect_err("team id must not be accepted as an agent recipient");
+
+        assert!(error.contains("Do not use team_id"));
+        assert!(error.contains("team_members"));
     }
 
     /// Non-Lead callers are rejected at the dispatch layer with the

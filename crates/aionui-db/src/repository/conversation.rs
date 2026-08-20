@@ -7,6 +7,30 @@ use crate::models::{
     UpsertConversationAssistantSnapshotParams,
 };
 
+/// Durable identity used when a caller retries one logical conversation turn.
+#[derive(Debug, Clone, Copy)]
+pub struct ConversationMessageIdempotencyParams<'a> {
+    pub key: &'a str,
+    pub request_fingerprint: &'a str,
+    pub turn_id: &'a str,
+}
+
+/// Previously accepted ordinary-conversation turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationMessageReceipt {
+    pub request_fingerprint: String,
+    pub message_id: String,
+    pub turn_id: String,
+}
+
+/// Result of atomically persisting a user message and its retry receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConversationMessageWriteResult {
+    Inserted,
+    Existing(ConversationMessageReceipt),
+    IdempotencyConflict { existing_request_fingerprint: String },
+}
+
 /// Conversation + message data access abstraction.
 ///
 /// Covers conversation CRUD, extended queries (source/chat, cron-job,
@@ -56,6 +80,13 @@ pub trait IConversationRepository: Send + Sync {
     /// The conversation identified by `conversation_id` is excluded.
     async fn list_associated(&self, user_id: &str, conversation_id: &str) -> Result<Vec<ConversationRow>, DbError>;
 
+    /// Lists conversations carrying a persisted Core Team binding. Used by
+    /// startup recovery to remove conversations whose Team creation or
+    /// deletion cleanup was interrupted.
+    async fn list_team_bound(&self) -> Result<Vec<ConversationRow>, DbError> {
+        Ok(Vec::new())
+    }
+
     /// Returns the persisted assistant snapshot for a conversation, if any.
     async fn get_assistant_snapshot(
         &self,
@@ -90,6 +121,27 @@ pub trait IConversationRepository: Send + Sync {
 
     /// Inserts a new message row.
     async fn insert_message(&self, message: &MessageRow) -> Result<(), DbError>;
+
+    /// Reads a durable retry receipt before claiming a runtime turn.
+    async fn get_message_receipt(
+        &self,
+        _conversation_id: &str,
+        _idempotency_key: &str,
+    ) -> Result<Option<ConversationMessageReceipt>, DbError> {
+        Ok(None)
+    }
+
+    /// Atomically inserts the user message and durable retry receipt. The
+    /// default keeps test/in-memory repositories source compatible; SQLite
+    /// overrides it with a transactionally idempotent implementation.
+    async fn insert_message_idempotent(
+        &self,
+        message: &MessageRow,
+        _idempotency: &ConversationMessageIdempotencyParams<'_>,
+    ) -> Result<ConversationMessageWriteResult, DbError> {
+        self.insert_message(message).await?;
+        Ok(ConversationMessageWriteResult::Inserted)
+    }
 
     /// Inserts a message row, or merges mutable fields into the existing row with the same ID.
     async fn upsert_message(&self, message: &MessageRow) -> Result<(), DbError> {

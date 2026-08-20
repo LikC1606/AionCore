@@ -5,7 +5,7 @@ use std::sync::Arc;
 use aionui_api_types::WebSocketMessage;
 use aionui_realtime::EventBroadcaster;
 use aionui_team::{
-    Mailbox, MailboxMessageType, SchedulerAction, TaskBoard, TeamAgent, TeammateManager, TeammateRole, TeammateStatus,
+    Mailbox, MailboxMessageType, SchedulerAction, TeamAgent, TeammateManager, TeammateRole, TeammateStatus,
     WAKE_TIMEOUT_MS,
 };
 use common::MockTeamRepo;
@@ -60,26 +60,17 @@ fn make_agent(slot_id: &str, name: &str, role: TeammateRole) -> TeamAgent {
 struct TestHarness {
     mgr: TeammateManager,
     mailbox: Arc<Mailbox>,
-    task_board: Arc<TaskBoard>,
     broadcaster: Arc<RecordingBroadcaster>,
 }
 
 fn setup_team(agents: &[TeamAgent]) -> TestHarness {
     let repo = Arc::new(MockTeamRepo::new());
     let mailbox = Arc::new(Mailbox::new(repo.clone()));
-    let task_board = Arc::new(TaskBoard::new(repo));
     let broadcaster = Arc::new(RecordingBroadcaster::new());
-    let mgr = TeammateManager::new(
-        "team-1".into(),
-        agents,
-        mailbox.clone(),
-        task_board.clone(),
-        broadcaster.clone(),
-    );
+    let mgr = TeammateManager::new("team-1".into(), agents, mailbox.clone(), broadcaster.clone());
     TestHarness {
         mgr,
         mailbox,
-        task_board,
         broadcaster,
     }
 }
@@ -88,7 +79,7 @@ fn setup_team(agents: &[TeamAgent]) -> TestHarness {
 // Test-plan §7: Agent 调度引擎
 // ===========================================================================
 
-// -- AW-1: Wake idle Agent → status idle→working, payload has tasks+unread --
+// -- AW-1: Wake idle Agent → status idle→working, payload has unread mail ----
 
 #[tokio::test]
 async fn aw1_wake_idle_agent_transitions_to_working_with_payload() {
@@ -97,11 +88,6 @@ async fn aw1_wake_idle_agent_transitions_to_working_with_payload() {
         make_agent("w1", "Worker", TeammateRole::Teammate),
     ];
     let h = setup_team(&agents);
-
-    h.task_board
-        .create_task("team-1", "Task A", None, Some("w1"), &[])
-        .await
-        .unwrap();
 
     h.mailbox
         .write("team-1", "w1", "lead", MailboxMessageType::Message, "Do it", None)
@@ -113,8 +99,6 @@ async fn aw1_wake_idle_agent_transitions_to_working_with_payload() {
 
     let p = payload.unwrap();
     assert_eq!(p.agent.slot_id, "w1");
-    assert_eq!(p.tasks.len(), 1);
-    assert_eq!(p.tasks[0].subject, "Task A");
     assert_eq!(p.unread_messages.len(), 1);
     assert_eq!(p.unread_messages[0].content, "Do it");
 
@@ -135,25 +119,13 @@ async fn aw2_wake_complete_finalize_executes_actions() {
     h.mgr.set_status("w1", TeammateStatus::Working).await.unwrap();
     h.mgr.set_status("w2", TeammateStatus::Working).await.unwrap();
 
-    let actions = vec![
-        SchedulerAction::TaskCreate {
-            subject: "Write tests".into(),
-            description: Some("Unit tests for API".into()),
-            owner: Some("w1".into()),
-            blocked_by: vec![],
-        },
-        SchedulerAction::SendMessage {
-            to: "w2".into(),
-            message: "Please review when done".into(),
-            files: Vec::new(),
-        },
-    ];
+    let actions = vec![SchedulerAction::SendMessage {
+        to: "w2".into(),
+        message: "Please review when done".into(),
+        files: Vec::new(),
+    }];
 
     h.mgr.finalize_turn("w1", &actions).await.unwrap();
-
-    let tasks = h.task_board.list_tasks("team-1").await.unwrap();
-    assert_eq!(tasks.len(), 1);
-    assert_eq!(tasks[0].subject, "Write tests");
 
     let w2_msgs = h.mailbox.read_unread("team-1", "w2").await.unwrap();
     assert_eq!(w2_msgs.len(), 1);
@@ -271,31 +243,6 @@ async fn ae1_send_message_action_writes_mailbox() {
     assert_eq!(msgs.len(), 1);
     assert_eq!(msgs[0].content, "Hello worker");
     assert_eq!(msgs[0].from_agent_id, "lead");
-}
-
-// -- AE-2: task_create action → task created --------------------------------
-
-#[tokio::test]
-async fn ae2_task_create_action() {
-    let agents = vec![make_agent("lead", "Lead", TeammateRole::Lead)];
-    let h = setup_team(&agents);
-
-    h.mgr
-        .execute_action(
-            "lead",
-            &SchedulerAction::TaskCreate {
-                subject: "Build feature".into(),
-                description: Some("With tests".into()),
-                owner: None,
-                blocked_by: vec![],
-            },
-        )
-        .await
-        .unwrap();
-
-    let tasks = h.task_board.list_tasks("team-1").await.unwrap();
-    assert_eq!(tasks.len(), 1);
-    assert_eq!(tasks[0].subject, "Build feature");
 }
 
 // -- AE-3: idle_notification → agent marked idle + check all-idle -----------
@@ -443,12 +390,6 @@ async fn full_workflow_lead_delegate_workers_idle_lead_rewake() {
 
     // 2. Lead delegates work to workers
     let lead_actions = vec![
-        SchedulerAction::TaskCreate {
-            subject: "Implement X".into(),
-            description: None,
-            owner: Some("w1".into()),
-            blocked_by: vec![],
-        },
         SchedulerAction::SendMessage {
             to: "w1".into(),
             message: "Implement X".into(),

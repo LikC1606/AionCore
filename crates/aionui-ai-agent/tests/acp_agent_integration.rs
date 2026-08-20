@@ -75,6 +75,7 @@ async fn make_mock_agent(script: &str, backend: &str) -> (Arc<AcpAgentManager>, 
         mcp_server_ids: None,
         session_mcp_servers: vec![],
         disable_claude_builtin_tools: false,
+        benchmark_container_isolation: false,
         user_id: None,
     };
 

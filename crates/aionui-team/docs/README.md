@@ -1,43 +1,37 @@
 # aionui-team
 
-多 Agent 协作模块：一个团队 = 一个 Lead + N 个 Teammate，共享任务板与邮箱，Lead 派单、Teammate 执行、完成后通知 Lead 汇总。
+`aionui-team` provides a small collaboration kernel for one lead and its team
+members. Canonical `WorkItem` state is the source of truth for work; the
+mailbox carries context, questions, and result summaries.
 
-## 架构
+## Runtime shape
 
-```
-                ┌───────────────────────────────────┐
-                │          HTTP REST (/api/teams)   │
-                └───────────────┬───────────────────┘
-                                │
-                      ┌─────────▼─────────┐
-                      │   TeamSession     │  每 team 一份（内存）
-                      │  (session.rs)     │
-                      └─┬────────┬────────┘
-                        │        │
-              ┌─────────▼──┐  ┌──▼──────────────┐
-              │ Scheduler  │  │  TeamMcpServer  │ 127.0.0.1:随机端口
-              │(scheduler) │  │  (mcp/server)   │ Agent 通过 TCP+JSON-RPC 连接
-              └─┬────────┬─┘  └────┬────────────┘
-                │        │         │
-      ┌─────────▼┐  ┌────▼──────┐  │  调用 8 个 MCP tool
-      │ Mailbox  │  │ TaskBoard │  │  (send_message / task_* / ...)
-      │(SQLite)  │  │ (SQLite)  │  │
-      └──────────┘  └───────────┘  │
-                                   │
-                          持久化：teams / mailbox / team_tasks 三张表
+```text
+TeamSession
+|- member runtime and scheduler
+|- mailbox
+|- TeamMcpServer
+`- canonical TeamCommand / TeamQuery services
+   `- WorkItem + delivery persistence
 ```
 
-## 模块
+The collaboration model is directional:
 
-- **[HTTP API](./api.md)** — REST 端点、请求/响应字段、错误码
-- **[内部调度](./internals.md)** — 状态机、wake→dispatch 时序、已知 bug
-- **[MCP 通信](./mcp.md)** — agent ↔ 后端协作协议、工具清单、后端 GAP 分析
-- **[前端接入指南](./frontend-guide.md)** — 客户端该做什么、不该做什么
+- superior: may delegate bounded work and review it;
+- peer: may exchange context, but cannot control the other's work;
+- subordinate: may execute and submit work assigned by a direct superior.
 
-## 前端必读
+Authorization comes from the member credential bound by the MCP server and
+the conversation principal resolved by the service. Tool payloads never choose
+the actor or team.
 
-1. **Team/Agent 所有增删改，都是普通 REST**，客户端不需要任何专属调度/状态机逻辑。
-2. **用户→agent 发消息 = 单聊**：走 `POST /api/conversations/{conversation_id}/messages`，`conversation_id` 从 `TeamAgentResponse.conversation_id` 取。team 模块不提供消息端点。
-3. **Agent 消息历史也走单聊**：`GET /api/conversations/{conversation_id}/messages`。
-4. **实时状态只走 WebSocket**（`team.agentStatusChanged` / `team.agentSpawned` / ...），HTTP 不提供轮询状态接口。
-5. **MCP 是后端 ↔ agent 进程之间的事，浏览器不直接接触**（见 [mcp.md](./mcp.md)）；但要知道"单聊 → 自动建团"和 lead 的 `team_spawn_agent` 在后端 ⚠️ 都未实现，建团必须显式调 `POST /api/teams`。
+## Interfaces
+
+- [HTTP API](./api.md): team lifecycle and public routes.
+- [MCP](./mcp.md): the native agent collaboration surface.
+- [Internals](./internals.md): state ownership and wake behavior.
+- [Prompts](./team-prompts.md): short role and wake context.
+- [Frontend guide](./frontend-guide.md): client integration boundary.
+
+Historical SQLite migrations may still contain retired tables so old databases
+upgrade safely. They are not runtime work state.

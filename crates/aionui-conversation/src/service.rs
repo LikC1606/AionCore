@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 
 use aionui_ai_agent::session_context::{AgentSessionContext, AgentSessionKind};
 use aionui_ai_agent::types::BuildTaskOptions;
@@ -30,10 +30,11 @@ use aionui_common::{
 };
 use aionui_db::models::{AssistantDefinitionRow, ConversationAssistantSnapshotRow, ConversationRow, MessageRow};
 use aionui_db::{
-    AgentBindingResolution, ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, IAcpSessionRepository,
-    IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
-    IAssistantPreferenceRepository, IConversationRepository, IMcpServerRepository, MessagePageCursor,
-    MessagePageDirection, MessagePageParams, SaveRuntimeStateParams, UpsertConversationAssistantSnapshotParams,
+    AgentBindingResolution, ConversationFilters, ConversationMessageIdempotencyParams, ConversationMessageWriteResult,
+    ConversationRowUpdate, CreateAcpSessionParams, IAcpSessionRepository, IAgentMetadataRepository,
+    IAssistantDefinitionRepository, IAssistantOverlayRepository, IAssistantPreferenceRepository,
+    IConversationRepository, IMcpServerRepository, ITeamRepository, MessagePageCursor, MessagePageDirection,
+    MessagePageParams, SaveRuntimeStateParams, UpsertConversationAssistantSnapshotParams,
     resolve_agent_binding_from_rows,
 };
 use aionui_extension::AssistantRuleDispatcher;
@@ -41,6 +42,7 @@ use aionui_mcp::{AcpMcpCapabilities, parse_acp_mcp_capabilities};
 use aionui_realtime::EventBroadcaster;
 use aionui_runtime::{RuntimeCommandProbe, probe_node_runtime_supported, probe_runtime_command, resolve_command_path};
 use chrono::Datelike;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
@@ -61,6 +63,22 @@ const ACP_CANCEL_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
 const LEGACY_CONVERSATION_ARCHIVED_MESSAGE: &str =
     "This historical conversation can no longer be continued. Please start a new conversation.";
 const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer supported for new conversations.";
+const TEAM_SNAPSHOT_BOOTSTRAP_PENDING_KEY: &str = "_team_snapshot_bootstrap_pending";
+const IMMUTABLE_SNAPSHOT_FIELDS: [&str; 5] = [
+    "skills",
+    "mcp_server_ids",
+    "mcp_servers",
+    "mcp_statuses",
+    "session_mcp_servers",
+];
+const CANONICAL_TEAM_IDENTITY_FIELDS: [&str; 3] = ["teamId", "slot_id", "role"];
+
+#[derive(Debug, serde::Deserialize)]
+struct TeamConversationBinding {
+    slot_id: String,
+    conversation_id: String,
+    role: String,
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 struct AssistantConversationOverrides {
@@ -313,6 +331,7 @@ pub struct ConversationService {
     /// can happen post-construction without breaking the `Clone` impl.
     delete_hooks: Arc<RwLock<Vec<Arc<dyn OnConversationDelete>>>>,
     mcp_server_repo: Arc<RwLock<Option<Arc<dyn IMcpServerRepository>>>>,
+    team_repo: Arc<RwLock<Option<Arc<dyn ITeamRepository>>>>,
     assistant_definition_repo: Arc<RwLock<Option<Arc<dyn IAssistantDefinitionRepository>>>>,
     assistant_state_repo: Arc<RwLock<Option<Arc<dyn IAssistantOverlayRepository>>>>,
     assistant_preference_repo: Arc<RwLock<Option<Arc<dyn IAssistantPreferenceRepository>>>>,
@@ -322,6 +341,14 @@ pub struct ConversationService {
     runtime_helper_bin: Option<String>,
     runtime_base_url: Option<String>,
     runtime_token_service: Option<Arc<RuntimeTokenService>>,
+    /// Short-lived per-request locks close the same-process race between a
+    /// receipt lookup and the atomic message insert. Weak entries disappear
+    /// after callers finish, so long-running apps do not retain every key.
+    send_idempotency_locks: Arc<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>>,
+    /// Serializes PATCH bootstrap and runtime-start consumption for one
+    /// conversation. The durable pending marker still enforces the rule
+    /// across restarts; this lock closes same-process check/write races.
+    update_locks: Arc<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>>,
 
     // Repos for conversation, acp_session and agent_metadata access.
     conversation_repo: Arc<dyn IConversationRepository>,
@@ -339,6 +366,8 @@ pub struct ConversationAgentTurnRequest {
     pub required_runtime_mode: Option<String>,
     pub persist_user_message: bool,
     pub user_message_hidden: bool,
+    /// Called exactly once after the Agent task accepts the first prompt.
+    /// Failures before that boundary must not be treated as delivered work.
     pub on_started: Option<ConversationAgentTurnStartedCallback>,
 }
 
@@ -386,6 +415,7 @@ impl ConversationService {
             task_manager,
             delete_hooks: Arc::new(RwLock::new(Vec::new())),
             mcp_server_repo: Arc::new(RwLock::new(None)),
+            team_repo: Arc::new(RwLock::new(None)),
             assistant_definition_repo: Arc::new(RwLock::new(None)),
             assistant_state_repo: Arc::new(RwLock::new(None)),
             assistant_preference_repo: Arc::new(RwLock::new(None)),
@@ -395,11 +425,46 @@ impl ConversationService {
             runtime_helper_bin: None,
             runtime_base_url: None,
             runtime_token_service: None,
+            send_idempotency_locks: Arc::new(Mutex::new(HashMap::new())),
+            update_locks: Arc::new(Mutex::new(HashMap::new())),
 
             conversation_repo,
             agent_metadata_repo,
             acp_session_repo,
         }
+    }
+
+    fn send_idempotency_lock(
+        &self,
+        conversation_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Arc<tokio::sync::Mutex<()>>, ConversationError> {
+        let identity = format!("{conversation_id}\0{idempotency_key}");
+        let mut locks = self
+            .send_idempotency_locks
+            .lock()
+            .map_err(|_| ConversationError::internal("conversation idempotency lock poisoned"))?;
+        locks.retain(|_, weak| weak.strong_count() > 0);
+        if let Some(lock) = locks.get(&identity).and_then(Weak::upgrade) {
+            return Ok(lock);
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(identity, Arc::downgrade(&lock));
+        Ok(lock)
+    }
+
+    fn update_lock(&self, conversation_id: &str) -> Result<Arc<tokio::sync::Mutex<()>>, ConversationError> {
+        let mut locks = self
+            .update_locks
+            .lock()
+            .map_err(|_| ConversationError::internal("conversation update lock poisoned"))?;
+        locks.retain(|_, weak| weak.strong_count() > 0);
+        if let Some(lock) = locks.get(conversation_id).and_then(Weak::upgrade) {
+            return Ok(lock);
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(conversation_id.to_owned(), Arc::downgrade(&lock));
+        Ok(lock)
     }
 
     pub fn with_runtime_state(mut self, runtime_state: Arc<ConversationRuntimeStateService>) -> Self {
@@ -427,6 +492,12 @@ impl ConversationService {
 
     pub fn with_mcp_server_repo(&self, repo: Arc<dyn IMcpServerRepository>) {
         if let Ok(mut guard) = self.mcp_server_repo.write() {
+            *guard = Some(repo);
+        }
+    }
+
+    pub fn with_team_repo(&self, repo: Arc<dyn ITeamRepository>) {
+        if let Ok(mut guard) = self.team_repo.write() {
             *guard = Some(repo);
         }
     }
@@ -519,6 +590,10 @@ impl ConversationService {
             .read()
             .ok()
             .and_then(|guard| guard.as_ref().cloned())
+    }
+
+    fn team_repo(&self) -> Option<Arc<dyn ITeamRepository>> {
+        self.team_repo.read().ok().and_then(|guard| guard.as_ref().cloned())
     }
 
     fn assistant_state_repo(&self) -> Option<Arc<dyn IAssistantOverlayRepository>> {
@@ -1820,6 +1895,92 @@ impl ConversationService {
         })
     }
 
+    async fn allows_team_snapshot_bootstrap(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        existing: &ConversationRow,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+    ) -> Result<bool, ConversationError> {
+        if existing.status.as_deref() != Some("pending") || task_manager.get_task(conversation_id).is_some() {
+            return Ok(false);
+        }
+
+        let extra: serde_json::Value = serde_json::from_str(&existing.extra)
+            .map_err(|e| ConversationError::internal(format!("Invalid extra JSON: {e}")))?;
+        if extra
+            .get(TEAM_SNAPSHOT_BOOTSTRAP_PENDING_KEY)
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        {
+            return Ok(false);
+        }
+        let Some(team_id) = extra.get("teamId").and_then(serde_json::Value::as_str) else {
+            return Ok(false);
+        };
+        let Some(slot_id) = extra.get("slot_id").and_then(serde_json::Value::as_str) else {
+            return Ok(false);
+        };
+        let Some(role) = extra.get("role").and_then(serde_json::Value::as_str) else {
+            return Ok(false);
+        };
+        let Some(team_repo) = self.team_repo() else {
+            return Ok(false);
+        };
+        let Some(team) = team_repo.get_team(team_id).await? else {
+            return Ok(false);
+        };
+        if team.user_id != user_id {
+            return Ok(false);
+        }
+        let bindings: Vec<TeamConversationBinding> = serde_json::from_str(&team.agents)
+            .map_err(|e| ConversationError::internal(format!("Invalid Team agents JSON: {e}")))?;
+        if !bindings.iter().any(|binding| {
+            binding.conversation_id == conversation_id && binding.slot_id == slot_id && binding.role == role
+        }) {
+            return Ok(false);
+        }
+
+        let page = self
+            .conversation_repo
+            .list_messages_page(
+                conversation_id,
+                &MessagePageParams {
+                    limit: 1,
+                    direction: MessagePageDirection::InitialLatest,
+                },
+            )
+            .await?;
+        Ok(page.items.is_empty())
+    }
+
+    async fn consume_team_snapshot_bootstrap_pending(
+        &self,
+        existing: &ConversationRow,
+    ) -> Result<(), ConversationError> {
+        let mut extra: serde_json::Value = serde_json::from_str(&existing.extra)
+            .map_err(|e| ConversationError::internal(format!("Invalid extra JSON: {e}")))?;
+        let Some(obj) = extra.as_object_mut() else {
+            return Ok(());
+        };
+        if obj.remove(TEAM_SNAPSHOT_BOOTSTRAP_PENDING_KEY).is_none() {
+            return Ok(());
+        }
+        self.conversation_repo
+            .update(
+                &existing.id,
+                &ConversationRowUpdate {
+                    extra: Some(serde_json::to_string(&extra).map_err(|e| {
+                        ConversationError::internal(format!("Failed to serialize Team bootstrap state: {e}"))
+                    })?),
+                    updated_at: Some(now_ms()),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Update a conversation (partial update with extra-merge semantics).
     ///
     /// If `extra` is provided, it is merged into the existing extra JSON
@@ -1833,6 +1994,7 @@ impl ConversationService {
         req: UpdateConversationRequest,
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<ConversationResponse, ConversationError> {
+        let _update_guard = self.update_lock(id)?.lock_owned().await;
         let existing = self
             .conversation_repo
             .get(id)
@@ -1842,20 +2004,41 @@ impl ConversationService {
 
         let existing_type: AgentType = string_to_enum(&existing.r#type)?;
 
-        // Snapshot invariant: once written at create time, `extra.skills`
-        // must not be re-shaped by PATCH. The frontend must clone the
-        // conversation to produce a new snapshot.
         if let Some(incoming) = &req.extra
-            && (incoming.get("skills").is_some()
-                || incoming.get("mcp_server_ids").is_some()
-                || incoming.get("mcp_servers").is_some()
-                || incoming.get("mcp_statuses").is_some()
-                || incoming.get("session_mcp_servers").is_some())
+            && (incoming.get("teamId").is_some()
+                || incoming.get(TEAM_SNAPSHOT_BOOTSTRAP_PENDING_KEY).is_some()
+                || (team_id_from_extra(&existing.extra).is_some()
+                    && CANONICAL_TEAM_IDENTITY_FIELDS
+                        .iter()
+                        .any(|field| incoming.get(*field).is_some())))
         {
             return Err(ConversationError::BadRequest {
-                reason: "extra.skills and MCP snapshots are immutable post-creation".into(),
+                reason: "Core Team conversation identity is immutable".into(),
             });
         }
+
+        // Snapshot invariant: once written at create time, `extra.skills`
+        // must not be re-shaped by PATCH. The sole exception is the complete,
+        // one-shot role snapshot applied to a newly Core-provisioned Team
+        // conversation before any runtime or message exists.
+        let snapshot_bootstrap = if let Some(incoming) = &req.extra
+            && IMMUTABLE_SNAPSHOT_FIELDS
+                .iter()
+                .any(|field| incoming.get(*field).is_some())
+        {
+            if !self
+                .allows_team_snapshot_bootstrap(user_id, id, &existing, task_manager)
+                .await?
+            {
+                return Err(ConversationError::BadRequest {
+                    reason: "extra.skills and MCP snapshots are immutable post-creation".into(),
+                });
+            }
+            validate_team_snapshot_bootstrap_payload(incoming)?;
+            true
+        } else {
+            false
+        };
 
         if existing_type == AgentType::Acp
             && let Some(incoming) = &req.extra
@@ -1899,6 +2082,9 @@ impl ConversationService {
             }
             if new_extra.get("workspace").is_some() {
                 normalize_workspace_extra(&mut existing_extra)?;
+            }
+            if snapshot_bootstrap && let Some(obj) = existing_extra.as_object_mut() {
+                obj.remove(TEAM_SNAPSHOT_BOOTSTRAP_PENDING_KEY);
             }
             Some(
                 serde_json::to_string(&existing_extra)
@@ -1990,6 +2176,7 @@ impl ConversationService {
     /// on a spurious model comparison.
     #[tracing::instrument(skip_all, fields(conversation_id = %conversation_id))]
     pub async fn update_extra(&self, conversation_id: &str, patch: serde_json::Value) -> Result<(), ConversationError> {
+        let _update_guard = self.update_lock(conversation_id)?.lock_owned().await;
         let existing =
             self.conversation_repo
                 .get(conversation_id)
@@ -2574,6 +2761,33 @@ impl ConversationService {
 
 // ── Message Flow (send / stop / warmup) ─────────────────────────────
 
+const MAX_CONVERSATION_IDEMPOTENCY_KEY_LEN: usize = 200;
+
+fn normalize_conversation_idempotency_key(value: Option<&str>) -> Result<Option<String>, ConversationError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() || value.len() > MAX_CONVERSATION_IDEMPOTENCY_KEY_LEN || value.chars().any(char::is_control) {
+        return Err(ConversationError::BadRequest {
+            reason: "idempotency_key must contain 1-200 non-control characters".into(),
+        });
+    }
+    Ok(Some(value.to_owned()))
+}
+
+fn conversation_send_fingerprint(req: &SendMessageRequest) -> String {
+    let payload = serde_json::json!({
+        "version": 1,
+        "content": req.content,
+        "files": req.files,
+        "inject_skills": req.inject_skills,
+        "hidden": req.hidden,
+    });
+    let bytes = serde_json::to_vec(&payload).expect("conversation send fingerprint payload is serializable");
+    format!("{:x}", Sha256::digest(bytes))
+}
+
 impl ConversationService {
     /// Send a user message to the conversation.
     ///
@@ -2596,6 +2810,8 @@ impl ConversationService {
             });
         }
         let send_started_at = now_ms();
+        let idempotency_key = normalize_conversation_idempotency_key(req.idempotency_key.as_deref())?;
+        let request_fingerprint = idempotency_key.as_ref().map(|_| conversation_send_fingerprint(&req));
 
         // Verify conversation exists and belongs to user
         let row = self
@@ -2621,6 +2837,26 @@ impl ConversationService {
         }
 
         reject_deprecated_runtime_row(&row)?;
+
+        // Serialize only retries sharing the same logical request identity.
+        // This closes the lookup/insert race without delaying unrelated sends.
+        let _idempotency_guard = if let Some(key) = idempotency_key.as_deref() {
+            Some(self.send_idempotency_lock(conversation_id, key)?.lock_owned().await)
+        } else {
+            None
+        };
+        if let (Some(key), Some(fingerprint)) = (idempotency_key.as_deref(), request_fingerprint.as_deref())
+            && let Some(receipt) = self.conversation_repo.get_message_receipt(conversation_id, key).await?
+        {
+            if receipt.request_fingerprint != fingerprint {
+                return Err(ConversationError::Busy {
+                    reason: "idempotency_key was already used with a different message payload".into(),
+                });
+            }
+            return Ok(self
+                .send_message_response(conversation_id, receipt.message_id, receipt.turn_id)
+                .await);
+        }
 
         let turn_id = Self::mint_turn_id();
         let turn_claim = self.runtime_state.try_claim_turn(conversation_id, &turn_id)?;
@@ -2651,9 +2887,46 @@ impl ConversationService {
                 .await;
             return Ok(self.send_message_response(conversation_id, user_msg_id, turn_id).await);
         }
-        if let Err(e) = self.conversation_repo.insert_message(&user_msg).await {
-            warn!(msg_id = %user_msg_id, error = %ErrorChain(&e), "Failed to insert user message");
-            return Err(e.into());
+        let write_result = match (idempotency_key.as_deref(), request_fingerprint.as_deref()) {
+            (Some(key), Some(fingerprint)) => {
+                self.conversation_repo
+                    .insert_message_idempotent(
+                        &user_msg,
+                        &ConversationMessageIdempotencyParams {
+                            key,
+                            request_fingerprint: fingerprint,
+                            turn_id: &turn_id,
+                        },
+                    )
+                    .await
+            }
+            _ => self
+                .conversation_repo
+                .insert_message(&user_msg)
+                .await
+                .map(|()| ConversationMessageWriteResult::Inserted),
+        };
+        let write_result = match write_result {
+            Ok(result) => result,
+            Err(error) => {
+                warn!(msg_id = %user_msg_id, error = %ErrorChain(&error), "Failed to insert user message");
+                return Err(error.into());
+            }
+        };
+        match write_result {
+            ConversationMessageWriteResult::Inserted => {}
+            ConversationMessageWriteResult::Existing(receipt) => {
+                drop(turn_claim);
+                return Ok(self
+                    .send_message_response(conversation_id, receipt.message_id, receipt.turn_id)
+                    .await);
+            }
+            ConversationMessageWriteResult::IdempotencyConflict { .. } => {
+                drop(turn_claim);
+                return Err(ConversationError::Busy {
+                    reason: "idempotency_key was already used with a different message payload".into(),
+                });
+            }
         }
 
         info!(msg_id = %user_msg_id, "User message persisted");
@@ -2710,6 +2983,7 @@ impl ConversationService {
             stored_workspace,
             turn_id: turn_id.clone(),
             turn_claim,
+            on_started: None,
         });
 
         info!(
@@ -2781,14 +3055,6 @@ impl ConversationService {
                 return Err(e.into());
             }
         }
-        if let Some(on_started) = request.on_started.as_ref() {
-            on_started(ConversationAgentTurnStarted {
-                conversation_id: request.conversation_id.clone(),
-                turn_id: turn_id.clone(),
-            })
-            .await;
-        }
-
         let mut build_opts = match self.build_task_options(&row).await {
             Ok(opts) => opts,
             Err(err) => {
@@ -2828,12 +3094,14 @@ impl ConversationService {
                     files: request.files,
                     inject_skills: request.inject_skills,
                     hidden: request.user_message_hidden,
+                    idempotency_key: None,
                 },
                 required_runtime_mode: request.required_runtime_mode,
                 build_options: build_opts,
                 stored_workspace,
                 turn_id: turn_id.clone(),
                 turn_claim,
+                on_started: request.on_started,
             })
             .await;
 
@@ -3113,6 +3381,7 @@ impl ConversationService {
         task_manager: &Arc<dyn IWorkerTaskManager>,
         phase: &'static str,
     ) -> Result<(AgentInstance, bool), ConversationError> {
+        let runtime_start_guard = self.update_lock(conversation_id)?.lock_owned().await;
         let row = self
             .conversation_repo
             .get(conversation_id)
@@ -3123,6 +3392,9 @@ impl ConversationService {
             })?;
 
         reject_deprecated_runtime_row(&row)?;
+
+        self.consume_team_snapshot_bootstrap_pending(&row).await?;
+        drop(runtime_start_guard);
 
         if let Some(agent) = task_manager.get_task(conversation_id) {
             debug!(conversation_id, phase, "Conversation runtime already active");
@@ -4025,6 +4297,27 @@ fn legacy_cron_trigger_to_artifact(row: MessageRow) -> Result<ConversationArtifa
         created_at: row.created_at,
         updated_at: row.created_at,
     })
+}
+
+fn validate_team_snapshot_bootstrap_payload(incoming: &serde_json::Value) -> Result<(), ConversationError> {
+    let invalid = |reason: &str| ConversationError::BadRequest {
+        reason: format!("Invalid Team role snapshot bootstrap: {reason}"),
+    };
+    for field in IMMUTABLE_SNAPSHOT_FIELDS {
+        if incoming.get(field).is_none() {
+            return Err(invalid(&format!("missing {field}")));
+        }
+    }
+
+    for field in ["skills", "mcp_server_ids", "mcp_servers"] {
+        serde_json::from_value::<Vec<String>>(incoming[field].clone())
+            .map_err(|_| invalid(&format!("{field} must be a string array")))?;
+    }
+    serde_json::from_value::<Vec<ConversationMcpStatus>>(incoming["mcp_statuses"].clone())
+        .map_err(|_| invalid("mcp_statuses has an invalid shape"))?;
+    serde_json::from_value::<Vec<SessionMcpServer>>(incoming["session_mcp_servers"].clone())
+        .map_err(|_| invalid("session_mcp_servers has an invalid shape"))?;
+    Ok(())
 }
 
 /// Merge `patch` into `base` (top-level key overwrite).

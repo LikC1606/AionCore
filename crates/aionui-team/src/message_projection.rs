@@ -43,16 +43,20 @@ impl TeamProjectionRequest {
         conversation_id: impl Into<String>,
         content: impl Into<String>,
         files: Vec<String>,
+        mailbox_message_id: impl Into<String>,
     ) -> Self {
+        let team_id = team_id.into();
+        let conversation_id = conversation_id.into();
+        let mailbox_message_id = mailbox_message_id.into();
         Self {
-            team_id: team_id.into(),
+            dedupe_key: Some(teammate_dedupe_key(&team_id, &mailbox_message_id, &conversation_id)),
+            team_id,
             slot_id: slot_id.into(),
-            conversation_id: conversation_id.into(),
+            conversation_id,
             source: TeamProjectionSource::User,
             content: content.into(),
             files,
             visibility: TeamVisibilityPolicy::user_message(),
-            dedupe_key: None,
         }
     }
 
@@ -305,5 +309,21 @@ where
             hidden: request.visibility.allow_hidden_conversation_message,
             created_at,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_projection_uses_mailbox_identity_for_deduplication() {
+        let request =
+            TeamProjectionRequest::user_visible("team-1", "lead-1", "conversation-1", "hello", Vec::new(), "mailbox-1");
+
+        assert_eq!(
+            request.dedupe_key.as_deref(),
+            Some("team:team-1:mailbox:mailbox-1:conversation:conversation-1")
+        );
     }
 }

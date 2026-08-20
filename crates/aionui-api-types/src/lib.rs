@@ -29,6 +29,7 @@ mod system;
 mod team;
 mod team_mcp;
 mod team_tools;
+mod team_work_command;
 mod websocket;
 
 pub use acp::{
@@ -103,6 +104,12 @@ pub use file::{
     BrowseDirectoryQuery, BrowseDirectoryResponse, BrowseEntry, CancelZipRequest, CopyFilesRequest, CopyFilesResponse,
     CreateTempFileRequest, DirOrFileResponse, FetchRemoteImageRequest, FileChangeInfoResponse, FileMetadataResponse,
     FileWatchRequest, GetFileMetadataRequest, GetFilesByDirRequest, GetImageBase64Request, ListWorkspaceFilesRequest,
+    ProjectGitBlobRequest, ProjectGitBlobResponse, ProjectGitChangedFileResponse, ProjectGitCommitDetailResponse,
+    ProjectGitCommitRequest, ProjectGitCommitResponse, ProjectGitCommitSummaryResponse, ProjectGitDiffRequest,
+    ProjectGitDiffResponse, ProjectGitDiscoverRequest, ProjectGitDiscoverResponse, ProjectGitFrontierResponse,
+    ProjectGitGraphRequest, ProjectGitGraphResponse, ProjectGitPreflightRequest, ProjectGitPreflightResponse,
+    ProjectGitRepositoryResponse, ProjectGitResearchBranchResponse, ProjectGitTreeEntryResponse, ProjectGitTreeRequest,
+    ProjectGitTreeResponse, ProjectGitWorkingDiffRequest, ProjectGitWorkingDiffResponse, ProjectGitWorkingTreeResponse,
     ReadFileBufferRequest, ReadFileRequest, RemoveEntryRequest, RenameRequest, RenameResponse, SnapshotBaselineRequest,
     SnapshotCompareResponse, SnapshotDiscardRequest, SnapshotInfoResponse, SnapshotMode, SnapshotStageRequest,
     SnapshotWorkspaceRequest, WorkspaceFlatFileResponse, WorkspaceOfficeWatchRequest, WriteFileRequest, ZipFileEntry,
@@ -162,10 +169,12 @@ pub use team::{
     RenameAgentRequest, RenameTeamRequest, SendAgentMessageRequest, SendTeamMessageRequest, TeamAgentInput,
     TeamAgentRemovedPayload, TeamAgentRenamedPayload, TeamAgentResponse, TeamAgentRuntimeStatus,
     TeamAgentRuntimeStatusPayload, TeamAgentSpawnedPayload, TeamAgentStatusPayload, TeamChildTurnPayload,
-    TeamListResponse, TeamMcpRuntimeConfig, TeamMessageEnqueueStatus, TeamResponse, TeamRunAckResponse, TeamRunPayload,
-    TeamRunSource, TeamRunStateResponse, TeamRunStatus, TeamRunTargetRole, TeamRuntimeSeed,
-    TeamSendMessageQueuedResponse, TeamSessionBinding, TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload,
-    TeamSlotBlockedReason, TeamSlotWorkPayload, TeamSlotWorkState, TeammateMessagePayload,
+    TeamGitDeliveryResponse, TeamGitWorkAssignmentResponse, TeamListResponse, TeamMcpRuntimeConfig,
+    TeamMessageEnqueueStatus, TeamResponse, TeamRunAckResponse, TeamRunPayload, TeamRunSource, TeamRunStateResponse,
+    TeamRunStatus, TeamRunTargetRole, TeamRuntimeSeed, TeamSendMessageQueuedResponse, TeamSessionBinding,
+    TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload, TeamSlotBlockedReason, TeamSlotWorkPayload,
+    TeamSlotWorkState, TeamWorkEventResponse, TeamWorkItemResponse, TeamWorkItemSnapshotResponse,
+    TeamWorkSubmissionResponse, TeammateMessagePayload,
 };
 pub use team_mcp::{TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig};
 pub use team_tools::{
@@ -174,6 +183,11 @@ pub use team_tools::{
     TeamToolDescriptor, TeamToolErrorCode, TeamToolErrorPayload, TeamToolName, TeamToolPermission, TeamToolRole,
     TeamToolRuntimeCallRequest, TeamToolRuntimeCallResponse, TeamToolTransport, cli_command_for_tool,
     team_tool_descriptor, team_tool_descriptors, team_tool_descriptors_for_role, tool_name_for_cli_path,
+};
+pub use team_work_command::{
+    CancelTeamWorkRequest, DelegateTeamWorkRequest, IntegrateTeamWorkRequest, IntegrateTeamWorkResponse,
+    ReviewTeamWorkRequest, TeamWorkChangedPayload, TeamWorkCommandDeliveryResponse, TeamWorkCommandResponse,
+    TeamWorkDeliveryRequirement, TeamWorkReviewDecision,
 };
 pub use websocket::WebSocketMessage;
 

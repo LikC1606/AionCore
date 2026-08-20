@@ -1,14 +1,13 @@
-use aionui_common::now_ms;
-use aionui_db::models::{MailboxMessageRow, TeamRow, TeamTaskRow};
-use aionui_db::{DbError, ITeamRepository, UpdateTaskParams, UpdateTeamParams};
+use aionui_db::models::{MailboxMessageRow, TeamRow};
+use aionui_db::{DbError, ITeamRepository, MailboxIdempotencyParams, MailboxWriteResult, UpdateTeamParams};
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 #[derive(Default)]
 pub struct MockState {
     pub messages: Vec<MailboxMessageRow>,
-    pub tasks: Vec<TeamTaskRow>,
+    pub idempotency_receipts: HashMap<(String, String, String), (String, String)>,
     pub fail_message_writes: bool,
-    pub fail_task_lists: bool,
 }
 
 pub struct MockTeamRepo {
@@ -57,6 +56,41 @@ impl ITeamRepository for MockTeamRepo {
         Ok(())
     }
 
+    async fn write_message_idempotent(
+        &self,
+        row: &MailboxMessageRow,
+        idempotency: &MailboxIdempotencyParams<'_>,
+    ) -> Result<MailboxWriteResult, DbError> {
+        let mut state = self.state.lock().unwrap();
+        if state.fail_message_writes {
+            return Err(DbError::Init("forced mailbox write failure".into()));
+        }
+        let key = (
+            row.team_id.clone(),
+            idempotency.scope.to_owned(),
+            idempotency.key.to_owned(),
+        );
+        if let Some((existing_fingerprint, existing_id)) = state.idempotency_receipts.get(&key).cloned() {
+            if existing_fingerprint != idempotency.request_fingerprint {
+                return Ok(MailboxWriteResult::IdempotencyConflict {
+                    existing_request_fingerprint: existing_fingerprint,
+                });
+            }
+            let existing = state
+                .messages
+                .iter()
+                .find(|message| message.id == existing_id)
+                .cloned()
+                .ok_or_else(|| DbError::Init("mock mailbox receipt points to a missing message".into()))?;
+            return Ok(MailboxWriteResult::Existing(existing));
+        }
+        state.messages.push(row.clone());
+        state
+            .idempotency_receipts
+            .insert(key, (idempotency.request_fingerprint.to_owned(), row.id.clone()));
+        Ok(MailboxWriteResult::Inserted)
+    }
+
     async fn read_unread_and_mark(&self, team_id: &str, to_agent_id: &str) -> Result<Vec<MailboxMessageRow>, DbError> {
         let mut state = self.state.lock().unwrap();
         let mut result = vec![];
@@ -78,6 +112,25 @@ impl ITeamRepository for MockTeamRepo {
             .cloned()
             .collect();
         Ok(result)
+    }
+
+    async fn list_team_ids_with_recoverable_unread_mailbox(
+        &self,
+        after_team_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<String>, DbError> {
+        let state = self.state.lock().unwrap();
+        let mut team_ids = state
+            .messages
+            .iter()
+            .filter(|message| !message.read && message.from_agent_id != message.to_agent_id)
+            .map(|message| message.team_id.clone())
+            .filter(|team_id| after_team_id.is_none_or(|after| team_id.as_str() > after))
+            .collect::<Vec<_>>();
+        team_ids.sort();
+        team_ids.dedup();
+        team_ids.truncate(limit as usize);
+        Ok(team_ids)
     }
 
     async fn mark_read_batch(&self, ids: &[String]) -> Result<(), DbError> {
@@ -112,89 +165,6 @@ impl ITeamRepository for MockTeamRepo {
         self.state.lock().unwrap().messages.retain(|m| m.team_id != team_id);
         Ok(())
     }
-
-    // ── TaskBoard ───────────────────────────────────────────────────
-
-    async fn create_task(&self, row: &TeamTaskRow) -> Result<(), DbError> {
-        self.state.lock().unwrap().tasks.push(row.clone());
-        Ok(())
-    }
-
-    async fn find_task_by_id(&self, team_id: &str, task_id: &str) -> Result<Option<TeamTaskRow>, DbError> {
-        let state = self.state.lock().unwrap();
-        let found = state
-            .tasks
-            .iter()
-            .find(|t| t.team_id == team_id && t.id == task_id)
-            .cloned();
-        Ok(found)
-    }
-
-    async fn update_task(&self, task_id: &str, params: &UpdateTaskParams) -> Result<(), DbError> {
-        let mut state = self.state.lock().unwrap();
-        let task = state
-            .tasks
-            .iter_mut()
-            .find(|t| t.id == task_id)
-            .ok_or_else(|| DbError::NotFound(task_id.to_owned()))?;
-        if let Some(ref s) = params.status {
-            task.status = s.clone();
-        }
-        if let Some(ref d) = params.description {
-            task.description = Some(d.clone());
-        }
-        if let Some(ref o) = params.owner {
-            task.owner = Some(o.clone());
-        }
-        if let Some(ref b) = params.blocked_by {
-            task.blocked_by = b.clone();
-        }
-        if let Some(ref m) = params.metadata {
-            task.metadata = Some(m.clone());
-        }
-        task.updated_at = now_ms();
-        Ok(())
-    }
-
-    async fn list_tasks(&self, team_id: &str) -> Result<Vec<TeamTaskRow>, DbError> {
-        let state = self.state.lock().unwrap();
-        if state.fail_task_lists {
-            return Err(DbError::Init("forced task list failure".into()));
-        }
-        let tasks = state.tasks.iter().filter(|t| t.team_id == team_id).cloned().collect();
-        Ok(tasks)
-    }
-
-    async fn append_to_blocks(&self, task_id: &str, blocked_task_id: &str) -> Result<(), DbError> {
-        let mut state = self.state.lock().unwrap();
-        let task = state
-            .tasks
-            .iter_mut()
-            .find(|t| t.id == task_id)
-            .ok_or_else(|| DbError::NotFound(task_id.to_owned()))?;
-        let mut blocks: Vec<String> = serde_json::from_str(&task.blocks).unwrap_or_default();
-        blocks.push(blocked_task_id.to_owned());
-        task.blocks = serde_json::to_string(&blocks).unwrap();
-        Ok(())
-    }
-
-    async fn remove_from_blocked_by(&self, task_id: &str, unblocked_task_id: &str) -> Result<(), DbError> {
-        let mut state = self.state.lock().unwrap();
-        let task = state
-            .tasks
-            .iter_mut()
-            .find(|t| t.id == task_id)
-            .ok_or_else(|| DbError::NotFound(task_id.to_owned()))?;
-        let mut blocked_by: Vec<String> = serde_json::from_str(&task.blocked_by).unwrap_or_default();
-        blocked_by.retain(|id| id != unblocked_task_id);
-        task.blocked_by = serde_json::to_string(&blocked_by).unwrap();
-        Ok(())
-    }
-
-    async fn delete_tasks_by_team(&self, team_id: &str) -> Result<(), DbError> {
-        self.state.lock().unwrap().tasks.retain(|t| t.team_id != team_id);
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -208,13 +178,14 @@ pub(crate) mod workspace_harness {
     use aionui_common::{AgentKillReason, AgentType, PaginatedResult, now_ms};
     use aionui_db::models::{
         AgentMetadataRow, AssistantDefinitionRow, AssistantOverlayRow, ConversationRow, MessageRow, TeamRow,
-        TeamTaskRow, UpdateAgentHandshakeParams, UpsertAgentMetadataParams, UpsertAssistantDefinitionParams,
+        UpdateAgentHandshakeParams, UpsertAgentMetadataParams, UpsertAssistantDefinitionParams,
         UpsertAssistantOverlayParams,
     };
     use aionui_db::{
         ConversationFilters, ConversationRowUpdate, DbError, IAgentMetadataRepository, IAssistantDefinitionRepository,
-        IAssistantOverlayRepository, IConversationRepository, IProviderRepository, ITeamRepository, MessagePageParams,
-        MessagePageResult, MessageRowUpdate, MessageSearchRow, UpdateTeamParams,
+        IAssistantOverlayRepository, IConversationRepository, IProviderRepository, ITeamRepository,
+        MailboxIdempotencyParams, MailboxWriteResult, MessagePageParams, MessagePageResult, MessageRowUpdate,
+        MessageSearchRow, UpdateTeamParams,
     };
     use aionui_realtime::EventBroadcaster;
     use async_trait::async_trait;
@@ -456,6 +427,14 @@ pub(crate) mod workspace_harness {
             Ok(())
         }
 
+        async fn write_message_idempotent(
+            &self,
+            _row: &aionui_db::models::MailboxMessageRow,
+            _idempotency: &MailboxIdempotencyParams<'_>,
+        ) -> Result<MailboxWriteResult, DbError> {
+            Ok(MailboxWriteResult::Inserted)
+        }
+
         async fn read_unread_and_mark(
             &self,
             _team_id: &str,
@@ -469,6 +448,14 @@ pub(crate) mod workspace_harness {
             _team_id: &str,
             _to_agent_id: &str,
         ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
+            Ok(vec![])
+        }
+
+        async fn list_team_ids_with_recoverable_unread_mailbox(
+            &self,
+            _after_team_id: Option<&str>,
+            _limit: u32,
+        ) -> Result<Vec<String>, DbError> {
             Ok(vec![])
         }
 
@@ -486,34 +473,6 @@ pub(crate) mod workspace_harness {
         }
 
         async fn delete_mailbox_by_team(&self, _team_id: &str) -> Result<(), DbError> {
-            Ok(())
-        }
-
-        async fn create_task(&self, _row: &TeamTaskRow) -> Result<(), DbError> {
-            Ok(())
-        }
-
-        async fn find_task_by_id(&self, _team_id: &str, _task_id: &str) -> Result<Option<TeamTaskRow>, DbError> {
-            Ok(None)
-        }
-
-        async fn update_task(&self, _task_id: &str, _params: &aionui_db::UpdateTaskParams) -> Result<(), DbError> {
-            Ok(())
-        }
-
-        async fn list_tasks(&self, _team_id: &str) -> Result<Vec<TeamTaskRow>, DbError> {
-            Ok(vec![])
-        }
-
-        async fn append_to_blocks(&self, _task_id: &str, _blocked_task_id: &str) -> Result<(), DbError> {
-            Ok(())
-        }
-
-        async fn remove_from_blocked_by(&self, _task_id: &str, _unblocked_task_id: &str) -> Result<(), DbError> {
-            Ok(())
-        }
-
-        async fn delete_tasks_by_team(&self, _team_id: &str) -> Result<(), DbError> {
             Ok(())
         }
     }

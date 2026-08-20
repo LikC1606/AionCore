@@ -33,9 +33,32 @@ fn build_agent_process_env(
 ) -> Vec<(OsString, OsString)> {
     let current_path = get_env_value(&current_env, "PATH").cloned();
     let shell_path = get_env_value(&shell_env, "PATH").cloned();
+    let has_run_scoped_claude_provider = current_env.iter().any(|(name, _)| {
+        ["ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]
+            .iter()
+            .any(|key| env_key_eq(name.as_os_str(), key))
+    });
 
-    let mut merged: BTreeMap<OsString, OsString> = current_env.into_iter().collect();
-    merged.extend(shell_env);
+    // The backend process is the authoritative source for explicit run-scoped
+    // configuration (notably provider credentials and endpoint/model pins).
+    // A login shell may contribute variables that are absent from the backend,
+    // but must never replace values supplied to this process: shell startup
+    // files are commonly stale and previously caused an agent to authenticate
+    // with an older key than the one used to launch Core.
+    let mut merged: BTreeMap<OsString, OsString> = shell_env.into_iter().collect();
+    if has_run_scoped_claude_provider {
+        // Treat the Claude provider environment as one atomic profile. In
+        // particular, Claude Code prefers ANTHROPIC_API_KEY over
+        // ANTHROPIC_AUTH_TOKEN. Keeping a stale shell API key alongside a
+        // run-scoped auth token silently authenticates with the wrong secret.
+        // Removing the whole shell profile also prevents stale model aliases
+        // or custom headers from changing a supposedly frozen experiment.
+        merged.retain(|name, _| {
+            !env_key_starts_with(name.as_os_str(), "ANTHROPIC_")
+                && !env_key_eq(name.as_os_str(), "CLAUDE_CODE_SUBAGENT_MODEL")
+        });
+    }
+    merged.extend(current_env);
 
     remove_env_key(&mut merged, "PATH");
     if let Some(path) = merge_path_values(current_path.as_deref(), shell_path.as_deref()) {
@@ -256,7 +279,7 @@ printf '%s\n' \
 
         assert_eq!(value("AIONUI_CURRENT_ONLY").as_deref(), Some("from-current"));
         assert_eq!(value("AIONUI_SHELL_ONLY").as_deref(), Some("from-shell"));
-        assert_eq!(value("AIONUI_OVERLAY").as_deref(), Some("from-shell"));
+        assert_eq!(value("AIONUI_OVERLAY").as_deref(), Some("from-current"));
         assert_eq!(value("NODE_OPTIONS"), None);
         assert_eq!(value("CLAUDECODE"), None);
         assert_eq!(value("npm_config_cache"), None);
@@ -279,5 +302,54 @@ printf '%s\n' \
 
         std::fs::write(path, contents).unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn run_scoped_claude_provider_shadows_the_entire_shell_profile() {
+        let current = vec![
+            (
+                OsString::from("ANTHROPIC_BASE_URL"),
+                OsString::from("https://current.invalid"),
+            ),
+            (OsString::from("ANTHROPIC_AUTH_TOKEN"), OsString::from("current-token")),
+            (OsString::from("ANTHROPIC_MODEL"), OsString::from("current-model")),
+        ];
+        let shell = vec![
+            (
+                OsString::from("ANTHROPIC_BASE_URL"),
+                OsString::from("https://shell.invalid"),
+            ),
+            (OsString::from("ANTHROPIC_API_KEY"), OsString::from("stale-shell-key")),
+            (
+                OsString::from("ANTHROPIC_AUTH_TOKEN"),
+                OsString::from("stale-shell-token"),
+            ),
+            (OsString::from("ANTHROPIC_MODEL"), OsString::from("stale-shell-model")),
+            (
+                OsString::from("ANTHROPIC_CUSTOM_HEADERS"),
+                OsString::from("stale-header"),
+            ),
+            (
+                OsString::from("CLAUDE_CODE_SUBAGENT_MODEL"),
+                OsString::from("stale-subagent"),
+            ),
+            (OsString::from("UNRELATED"), OsString::from("preserved")),
+        ];
+
+        let merged = build_agent_process_env(current, shell);
+        let value = |key: &str| {
+            merged
+                .iter()
+                .find(|(name, _)| name == OsStr::new(key))
+                .map(|(_, value)| value.to_string_lossy().into_owned())
+        };
+
+        assert_eq!(value("ANTHROPIC_BASE_URL").as_deref(), Some("https://current.invalid"));
+        assert_eq!(value("ANTHROPIC_AUTH_TOKEN").as_deref(), Some("current-token"));
+        assert_eq!(value("ANTHROPIC_MODEL").as_deref(), Some("current-model"));
+        assert_eq!(value("ANTHROPIC_API_KEY"), None);
+        assert_eq!(value("ANTHROPIC_CUSTOM_HEADERS"), None);
+        assert_eq!(value("CLAUDE_CODE_SUBAGENT_MODEL"), None);
+        assert_eq!(value("UNRELATED").as_deref(), Some("preserved"));
     }
 }

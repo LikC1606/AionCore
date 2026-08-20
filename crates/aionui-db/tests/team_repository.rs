@@ -6,15 +6,14 @@
 //! Covers test-plan items from Phase 11 test-plan:
 //! - Section 1 (Team CRUD): TC-1..TC-7, TL-1..TL-3, TG-1..TG-2, TD-1..TD-6, TR-1..TR-4
 //! - Section 4 (Mailbox): MW-1..MW-3, MR-1..MR-4, MH-1..MH-3, MD-1..MD-2
-//! - Section 5 (Task Board): TK-1..TK-3, TU-1..TU-5, CU-1..CU-4, TT-1..TT-3, TKD-1..TKD-2
-//! - Section 10 (Data Consistency): DC-1, DC-4
 
 use std::sync::Arc;
 
 use aionui_common::now_ms;
-use aionui_db::models::{MailboxMessageRow, TeamRow, TeamTaskRow};
+use aionui_db::models::{MailboxMessageRow, TeamRow};
 use aionui_db::{
-    DbError, ITeamRepository, SqliteTeamRepository, UpdateTaskParams, UpdateTeamParams, init_database_memory,
+    DbError, ITeamRepository, MailboxIdempotencyParams, MailboxWriteResult, SqliteTeamRepository, UpdateTeamParams,
+    init_database, init_database_memory,
 };
 
 async fn repo() -> (Arc<dyn ITeamRepository>, aionui_db::Database) {
@@ -58,23 +57,6 @@ fn make_mailbox_msg(id: &str, team_id: &str, to: &str, from: &str, msg_type: &st
         files: None,
         read: false,
         created_at: now_ms(),
-    }
-}
-
-fn make_task(id: &str, team_id: &str, subject: &str) -> TeamTaskRow {
-    let now = now_ms();
-    TeamTaskRow {
-        id: id.into(),
-        team_id: team_id.into(),
-        subject: subject.into(),
-        description: None,
-        status: "pending".into(),
-        owner: None,
-        blocked_by: "[]".into(),
-        blocks: "[]".into(),
-        metadata: None,
-        created_at: now,
-        updated_at: now,
     }
 }
 
@@ -249,6 +231,148 @@ async fn delete_nonexistent_team_returns_not_found() {
     assert!(matches!(result, Err(DbError::NotFound(_))));
 }
 
+async fn seed_team_mode_aggregate(repo: &Arc<dyn ITeamRepository>, db: &aionui_db::Database, team_id: &str) {
+    repo.create_team(&make_team(team_id, "Git Team")).await.unwrap();
+    repo.write_message(&make_mailbox_msg("mail-1", team_id, "a1", "worker", "message"))
+        .await
+        .unwrap();
+    let now = now_ms();
+    sqlx::query(
+        "INSERT INTO team_tasks \
+            (id, team_id, subject, status, blocked_by, blocks, created_at, updated_at) \
+         VALUES ('legacy-task-1', ?, 'legacy', 'pending', '[]', '[]', ?, ?)",
+    )
+    .bind(team_id)
+    .bind(now)
+    .bind(now)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO team_work_items (\
+            id, team_id, subject, controller_member_id, assignee_member_id, reviewer_member_id, \
+            integrator_member_id, delivery_requirement, state, revision, created_at, updated_at, \
+            git_repository_id, git_base_commit, git_branch_ref\
+         ) VALUES ('work-1', ?, 'Integrate', 'a1', 'worker', 'a1', 'a1', 'git', \
+                   'accepted', 5, ?, ?, 'repo-1', 'base-1', 'refs/heads/work')",
+    )
+    .bind(team_id)
+    .bind(now)
+    .bind(now)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO team_git_deliveries (\
+            id, team_id, work_item_id, producer_member_id, repository_id, content_revision, \
+            base_commit, branch_ref, head_commit, state, revision, created_at, updated_at\
+         ) VALUES ('delivery-1', ?, 'work-1', 'worker', 'repo-1', 1, 'base-1', \
+                   'refs/heads/work', 'source-1', 'integrating', 2, ?, ?)",
+    )
+    .bind(team_id)
+    .bind(now)
+    .bind(now)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO team_work_events (\
+            event_id, team_id, work_item_id, delivery_id, actor_member_id, command_name, \
+            idempotency_key, request_fingerprint, result_json, expected_work_item_revision, \
+            expected_delivery_revision, work_item_revision, delivery_revision, created_at\
+         ) VALUES ('event-1', ?, 'work-1', 'delivery-1', 'a1', 'begin_integration', \
+                   'begin-1', 'fingerprint-1', '{}', 5, 1, 5, 2, ?)",
+    )
+    .bind(team_id)
+    .bind(now)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO team_git_integration_attempts (\
+            attempt_id, team_id, work_item_id, delivery_id, repository_id, base_commit, \
+            source_ref, source_head, target_ref, target_head, state, created_at, updated_at\
+         ) VALUES ('attempt-1', ?, 'work-1', 'delivery-1', 'repo-1', 'base-1', \
+                   'refs/heads/work', 'source-1', 'refs/heads/main', 'target-1', 'pending', ?, ?)",
+    )
+    .bind(team_id)
+    .bind(now)
+    .bind(now)
+    .execute(db.pool())
+    .await
+    .unwrap();
+}
+
+async fn team_domain_row_count(db: &aionui_db::Database, table: &str, team_id: &str) -> i64 {
+    let query = format!("SELECT COUNT(*) FROM {table} WHERE team_id = ?");
+    sqlx::query_scalar(&query)
+        .bind(team_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn delete_team_atomically_removes_git_integration_aggregate_and_mailbox() {
+    let (repo, db) = repo().await;
+    seed_team_mode_aggregate(&repo, &db, "t1").await;
+
+    repo.delete_team("t1").await.unwrap();
+
+    assert!(repo.get_team("t1").await.unwrap().is_none());
+    for table in [
+        "mailbox",
+        "team_tasks",
+        "team_work_items",
+        "team_git_deliveries",
+        "team_work_events",
+        "team_git_integration_attempts",
+    ] {
+        assert_eq!(
+            team_domain_row_count(&db, table, "t1").await,
+            0,
+            "{table} was not deleted"
+        );
+    }
+    let attempt_delete_actions: Vec<String> =
+        sqlx::query_scalar("SELECT on_delete FROM pragma_foreign_key_list('team_git_integration_attempts')")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    assert!(attempt_delete_actions.iter().any(|action| action == "CASCADE"));
+}
+
+#[tokio::test]
+async fn delete_team_failure_rolls_back_mailbox_and_complete_work_aggregate() {
+    let (repo, db) = repo().await;
+    seed_team_mode_aggregate(&repo, &db, "t1").await;
+    sqlx::query(
+        "CREATE TRIGGER fail_team_delete BEFORE DELETE ON teams \
+         WHEN OLD.id = 't1' BEGIN SELECT RAISE(ABORT, 'forced Team delete failure'); END",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    assert!(repo.delete_team("t1").await.is_err());
+
+    assert!(repo.get_team("t1").await.unwrap().is_some());
+    for table in [
+        "mailbox",
+        "team_tasks",
+        "team_work_items",
+        "team_git_deliveries",
+        "team_work_events",
+        "team_git_integration_attempts",
+    ] {
+        assert_eq!(
+            team_domain_row_count(&db, table, "t1").await,
+            1,
+            "{table} was partially deleted"
+        );
+    }
+}
+
 // ── Mailbox Tests ────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -388,328 +512,199 @@ async fn delete_mailbox_by_team() {
     assert_eq!(h2.len(), 1);
 }
 
-// ── Task Board Tests ─────────────────────────────────────────────────
-
 #[tokio::test]
-async fn create_and_list_tasks() {
+async fn recoverable_unread_mailbox_team_ids_are_filtered_deduplicated_and_paginated() {
     let (repo, _db) = repo().await;
-    repo.create_team(&make_team("t1", "Team")).await.unwrap();
+    for team_id in ["team-a", "team-b", "team-c", "team-read", "team-self"] {
+        repo.create_team(&make_team(team_id, team_id)).await.unwrap();
+    }
 
-    let task = make_task("tk1", "t1", "Implement feature");
-    repo.create_task(&task).await.unwrap();
+    for message in [
+        make_mailbox_msg("a-1", "team-a", "a1", "a2", "message"),
+        make_mailbox_msg("a-2", "team-a", "a1", "a3", "message"),
+        make_mailbox_msg("b-1", "team-b", "a1", "a2", "message"),
+        make_mailbox_msg("c-1", "team-c", "a1", "a2", "message"),
+        make_mailbox_msg("self-1", "team-self", "a1", "a1", "message"),
+        make_mailbox_msg("read-1", "team-read", "a1", "a2", "message"),
+        make_mailbox_msg("orphan-1", "team-deleted", "a1", "a2", "message"),
+    ] {
+        repo.write_message(&message).await.unwrap();
+    }
+    repo.read_unread_and_mark("team-read", "a1").await.unwrap();
 
-    let tasks = repo.list_tasks("t1").await.unwrap();
-    assert_eq!(tasks.len(), 1);
-    assert_eq!(tasks[0].subject, "Implement feature");
-    assert_eq!(tasks[0].status, "pending");
+    let first_page = repo
+        .list_team_ids_with_recoverable_unread_mailbox(None, 2)
+        .await
+        .unwrap();
+    assert_eq!(first_page, ["team-a", "team-b"]);
+
+    let second_page = repo
+        .list_team_ids_with_recoverable_unread_mailbox(Some("team-b"), 2)
+        .await
+        .unwrap();
+    assert_eq!(second_page, ["team-c"]);
+    assert!(
+        repo.list_team_ids_with_recoverable_unread_mailbox(Some("team-c"), 2)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        repo.list_team_ids_with_recoverable_unread_mailbox(None, 0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
-async fn list_tasks_empty() {
-    let (repo, _db) = repo().await;
-    repo.create_team(&make_team("t1", "Team")).await.unwrap();
-
-    let tasks = repo.list_tasks("t1").await.unwrap();
-    assert!(tasks.is_empty());
-}
-
-#[tokio::test]
-async fn find_task_by_id() {
-    let (repo, _db) = repo().await;
-    repo.create_team(&make_team("t1", "Team")).await.unwrap();
-
-    let task = make_task("tk1", "t1", "Task");
-    repo.create_task(&task).await.unwrap();
-
-    let found = repo.find_task_by_id("t1", "tk1").await.unwrap();
-    assert!(found.is_some());
-    assert_eq!(found.unwrap().id, "tk1");
-}
-
-#[tokio::test]
-async fn find_task_by_id_not_found() {
-    let (repo, _db) = repo().await;
-    repo.create_team(&make_team("t1", "Team")).await.unwrap();
-
-    let found = repo.find_task_by_id("t1", "nonexistent").await.unwrap();
-    assert!(found.is_none());
-}
-
-#[tokio::test]
-async fn update_task_status() {
-    let (repo, _db) = repo().await;
-    repo.create_team(&make_team("t1", "Team")).await.unwrap();
-
-    let task = make_task("tk1", "t1", "Task");
-    repo.create_task(&task).await.unwrap();
-
-    repo.update_task(
-        "tk1",
-        &UpdateTaskParams {
-            status: Some("in_progress".into()),
-            ..Default::default()
-        },
+async fn recoverable_unread_mailbox_index_is_partial() {
+    let (_repo, db) = repo().await;
+    let index: (i64, i64) = sqlx::query_as(
+        "SELECT [unique], partial FROM pragma_index_list('mailbox') \
+         WHERE name = 'idx_mailbox_recoverable_unread_team'",
     )
+    .fetch_one(db.pool())
     .await
     .unwrap();
-
-    let updated = repo.find_task_by_id("t1", "tk1").await.unwrap().unwrap();
-    assert_eq!(updated.status, "in_progress");
+    assert_eq!(index, (0, 1));
 }
 
 #[tokio::test]
-async fn update_task_description_and_owner() {
-    let (repo, _db) = repo().await;
-    repo.create_team(&make_team("t1", "Team")).await.unwrap();
+async fn mailbox_schema_has_partial_idempotency_identity() {
+    let (_repo, db) = repo().await;
+    let columns: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('mailbox')")
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+    assert!(columns.contains(&"idempotency_scope".to_owned()));
+    assert!(columns.contains(&"idempotency_key".to_owned()));
+    assert!(columns.contains(&"request_fingerprint".to_owned()));
 
-    let task = make_task("tk1", "t1", "Task");
-    repo.create_task(&task).await.unwrap();
-
-    repo.update_task(
-        "tk1",
-        &UpdateTaskParams {
-            description: Some("New description".into()),
-            owner: Some("agent-2".into()),
-            ..Default::default()
-        },
+    let index: (i64, i64) = sqlx::query_as(
+        "SELECT [unique], partial FROM pragma_index_list('mailbox') WHERE name = 'idx_mailbox_idempotency'",
     )
+    .fetch_one(db.pool())
     .await
     .unwrap();
-
-    let updated = repo.find_task_by_id("t1", "tk1").await.unwrap().unwrap();
-    assert_eq!(updated.description.as_deref(), Some("New description"));
-    assert_eq!(updated.owner.as_deref(), Some("agent-2"));
+    assert_eq!(index, (1, 1));
 }
 
 #[tokio::test]
-async fn update_nonexistent_task_returns_not_found() {
+async fn idempotent_mailbox_write_returns_existing_row_and_rejects_changed_payload() {
     let (repo, _db) = repo().await;
-    let result = repo
-        .update_task(
-            "nonexistent",
-            &UpdateTaskParams {
-                status: Some("completed".into()),
-                ..Default::default()
+    repo.create_team(&make_team("t1", "Team")).await.unwrap();
+    let first = make_mailbox_msg("m-first", "t1", "a1", "user", "message");
+    let repeated = make_mailbox_msg("m-repeated", "t1", "a1", "user", "message");
+    let identity = MailboxIdempotencyParams {
+        scope: "lead",
+        key: "turn-1",
+        request_fingerprint: "fingerprint-1",
+    };
+
+    assert!(matches!(
+        repo.write_message_idempotent(&first, &identity).await.unwrap(),
+        MailboxWriteResult::Inserted
+    ));
+    let replay = repo.write_message_idempotent(&repeated, &identity).await.unwrap();
+    let MailboxWriteResult::Existing(existing) = replay else {
+        panic!("expected existing mailbox row");
+    };
+    assert_eq!(existing.id, first.id);
+
+    let conflict = repo
+        .write_message_idempotent(
+            &repeated,
+            &MailboxIdempotencyParams {
+                request_fingerprint: "different-fingerprint",
+                ..identity
             },
         )
-        .await;
-    assert!(matches!(result, Err(DbError::NotFound(_))));
+        .await
+        .unwrap();
+    assert!(matches!(
+        conflict,
+        MailboxWriteResult::IdempotencyConflict {
+            existing_request_fingerprint
+        } if existing_request_fingerprint == "fingerprint-1"
+    ));
+    assert_eq!(repo.get_history("t1", "a1", None).await.unwrap().len(), 1);
 }
 
-#[tokio::test]
-async fn append_to_blocks_and_remove_from_blocked_by() {
-    let (repo, _db) = repo().await;
-    repo.create_team(&make_team("t1", "Team")).await.unwrap();
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_idempotent_mailbox_writes_across_pools_insert_once() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("mailbox-concurrent.db");
+    let first_db = init_database(&path).await.unwrap();
+    let first_repo = SqliteTeamRepository::new(first_db.pool().clone());
+    first_repo.create_team(&make_team("t1", "Team")).await.unwrap();
+    let second_db = init_database(&path).await.unwrap();
+    let second_repo = SqliteTeamRepository::new(second_db.pool().clone());
+    let first_row = make_mailbox_msg("m-first", "t1", "a1", "user", "message");
+    let second_row = make_mailbox_msg("m-second", "t1", "a1", "user", "message");
+    let identity = MailboxIdempotencyParams {
+        scope: "a1",
+        key: "turn-concurrent",
+        request_fingerprint: "fingerprint-concurrent",
+    };
 
-    // Create taskA and taskB
-    let task_a = make_task("tkA", "t1", "Task A");
-    let mut task_b = make_task("tkB", "t1", "Task B");
-    task_b.blocked_by = r#"["tkA"]"#.into();
-    repo.create_task(&task_a).await.unwrap();
-    repo.create_task(&task_b).await.unwrap();
-
-    // Append tkB to taskA's blocks
-    repo.append_to_blocks("tkA", "tkB").await.unwrap();
-
-    let a = repo.find_task_by_id("t1", "tkA").await.unwrap().unwrap();
-    let blocks: Vec<String> = serde_json::from_str(&a.blocks).unwrap();
-    assert!(blocks.contains(&"tkB".to_string()));
-
-    // Now complete taskA: remove tkA from taskB's blocked_by
-    repo.remove_from_blocked_by("tkB", "tkA").await.unwrap();
-
-    let b = repo.find_task_by_id("t1", "tkB").await.unwrap().unwrap();
-    let blocked_by: Vec<String> = serde_json::from_str(&b.blocked_by).unwrap();
-    assert!(!blocked_by.contains(&"tkA".to_string()));
-}
-
-#[tokio::test]
-async fn append_to_blocks_idempotent() {
-    let (repo, _db) = repo().await;
-    repo.create_team(&make_team("t1", "Team")).await.unwrap();
-
-    let task = make_task("tkA", "t1", "Task A");
-    repo.create_task(&task).await.unwrap();
-
-    repo.append_to_blocks("tkA", "tkB").await.unwrap();
-    repo.append_to_blocks("tkA", "tkB").await.unwrap();
-
-    let a = repo.find_task_by_id("t1", "tkA").await.unwrap().unwrap();
-    let blocks: Vec<String> = serde_json::from_str(&a.blocks).unwrap();
-    assert_eq!(blocks.len(), 1); // no duplicates
-}
-
-#[tokio::test]
-async fn multi_dependency_unblock() {
-    let (repo, _db) = repo().await;
-    repo.create_team(&make_team("t1", "Team")).await.unwrap();
-
-    // taskA blocks taskB and taskC
-    let task_a = make_task("tkA", "t1", "A");
-    let mut task_b = make_task("tkB", "t1", "B");
-    task_b.blocked_by = r#"["tkA"]"#.into();
-    let mut task_c = make_task("tkC", "t1", "C");
-    task_c.blocked_by = r#"["tkA"]"#.into();
-
-    repo.create_task(&task_a).await.unwrap();
-    repo.create_task(&task_b).await.unwrap();
-    repo.create_task(&task_c).await.unwrap();
-
-    repo.append_to_blocks("tkA", "tkB").await.unwrap();
-    repo.append_to_blocks("tkA", "tkC").await.unwrap();
-
-    // Complete A: unblock both B and C
-    repo.remove_from_blocked_by("tkB", "tkA").await.unwrap();
-    repo.remove_from_blocked_by("tkC", "tkA").await.unwrap();
-
-    let b = repo.find_task_by_id("t1", "tkB").await.unwrap().unwrap();
-    let c = repo.find_task_by_id("t1", "tkC").await.unwrap().unwrap();
-    let b_blocked: Vec<String> = serde_json::from_str(&b.blocked_by).unwrap();
-    let c_blocked: Vec<String> = serde_json::from_str(&c.blocked_by).unwrap();
-    assert!(b_blocked.is_empty());
-    assert!(c_blocked.is_empty());
-}
-
-#[tokio::test]
-async fn partial_unblock_preserves_other_blockers() {
-    let (repo, _db) = repo().await;
-    repo.create_team(&make_team("t1", "Team")).await.unwrap();
-
-    // taskB is blocked by both tkA and tkX
-    let task_a = make_task("tkA", "t1", "A");
-    let mut task_b = make_task("tkB", "t1", "B");
-    task_b.blocked_by = r#"["tkA","tkX"]"#.into();
-
-    repo.create_task(&task_a).await.unwrap();
-    repo.create_task(&task_b).await.unwrap();
-
-    // Complete A only
-    repo.remove_from_blocked_by("tkB", "tkA").await.unwrap();
-
-    let b = repo.find_task_by_id("t1", "tkB").await.unwrap().unwrap();
-    let blocked_by: Vec<String> = serde_json::from_str(&b.blocked_by).unwrap();
-    assert_eq!(blocked_by, vec!["tkX"]);
-}
-
-#[tokio::test]
-async fn no_blocks_task_completes_cleanly() {
-    let (repo, _db) = repo().await;
-    repo.create_team(&make_team("t1", "Team")).await.unwrap();
-
-    let task = make_task("tkA", "t1", "A");
-    repo.create_task(&task).await.unwrap();
-
-    // Complete without any blocks to unblock
-    repo.update_task(
-        "tkA",
-        &UpdateTaskParams {
-            status: Some("completed".into()),
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-
-    let a = repo.find_task_by_id("t1", "tkA").await.unwrap().unwrap();
-    assert_eq!(a.status, "completed");
-    let blocks: Vec<String> = serde_json::from_str(&a.blocks).unwrap();
-    assert!(blocks.is_empty());
-}
-
-#[tokio::test]
-async fn delete_tasks_by_team() {
-    let (repo, _db) = repo().await;
-    repo.create_team(&make_team("t1", "Team1")).await.unwrap();
-    repo.create_team(&make_team("t2", "Team2")).await.unwrap();
-
-    repo.create_task(&make_task("tk1", "t1", "T1 Task")).await.unwrap();
-    repo.create_task(&make_task("tk2", "t2", "T2 Task")).await.unwrap();
-
-    repo.delete_tasks_by_team("t1").await.unwrap();
-
-    let t1_tasks = repo.list_tasks("t1").await.unwrap();
-    assert!(t1_tasks.is_empty());
-
-    let t2_tasks = repo.list_tasks("t2").await.unwrap();
-    assert_eq!(t2_tasks.len(), 1);
-}
-
-#[tokio::test]
-async fn tasks_contain_dependency_info() {
-    let (repo, _db) = repo().await;
-    repo.create_team(&make_team("t1", "Team")).await.unwrap();
-
-    let task_a = make_task("tkA", "t1", "A");
-    let mut task_b = make_task("tkB", "t1", "B");
-    task_b.blocked_by = r#"["tkA"]"#.into();
-
-    repo.create_task(&task_a).await.unwrap();
-    repo.create_task(&task_b).await.unwrap();
-    repo.append_to_blocks("tkA", "tkB").await.unwrap();
-
-    let tasks = repo.list_tasks("t1").await.unwrap();
-    assert_eq!(tasks.len(), 2);
-
-    let a = tasks.iter().find(|t| t.id == "tkA").unwrap();
-    let b = tasks.iter().find(|t| t.id == "tkB").unwrap();
-
-    let a_blocks: Vec<String> = serde_json::from_str(&a.blocks).unwrap();
-    assert!(a_blocks.contains(&"tkB".to_string()));
-
-    let b_blocked_by: Vec<String> = serde_json::from_str(&b.blocked_by).unwrap();
-    assert!(b_blocked_by.contains(&"tkA".to_string()));
-}
-
-// ── Data Consistency Tests ───────────────────────────────────────────
-
-#[tokio::test]
-async fn delete_team_cascades_mailbox_and_tasks() {
-    let (repo, _db) = repo().await;
-    repo.create_team(&make_team("t1", "Team")).await.unwrap();
-
-    // Add mailbox messages and tasks
-    let msg = make_mailbox_msg("m1", "t1", "a1", "a2", "message");
-    repo.write_message(&msg).await.unwrap();
-    let task = make_task("tk1", "t1", "Task");
-    repo.create_task(&task).await.unwrap();
-
-    // Delete team, then manually clean up related data (as service layer would)
-    repo.delete_mailbox_by_team("t1").await.unwrap();
-    repo.delete_tasks_by_team("t1").await.unwrap();
-    repo.delete_team("t1").await.unwrap();
-
-    // Verify all cleaned up
-    let team = repo.get_team("t1").await.unwrap();
-    assert!(team.is_none());
-    let mail = repo.get_history("t1", "a1", None).await.unwrap();
-    assert!(mail.is_empty());
-    let tasks = repo.list_tasks("t1").await.unwrap();
-    assert!(tasks.is_empty());
-}
-
-#[tokio::test]
-async fn task_blocked_by_blocks_bidirectional_consistency() {
-    let (repo, _db) = repo().await;
-    repo.create_team(&make_team("t1", "Team")).await.unwrap();
-
-    let task_a = make_task("tkA", "t1", "A");
-    let mut task_b = make_task("tkB", "t1", "B");
-    task_b.blocked_by = r#"["tkA"]"#.into();
-
-    repo.create_task(&task_a).await.unwrap();
-    repo.create_task(&task_b).await.unwrap();
-    repo.append_to_blocks("tkA", "tkB").await.unwrap();
-
-    // Verify bidirectional link
-    let a = repo.find_task_by_id("t1", "tkA").await.unwrap().unwrap();
-    let b = repo.find_task_by_id("t1", "tkB").await.unwrap().unwrap();
-
-    let a_blocks: Vec<String> = serde_json::from_str(&a.blocks).unwrap();
-    let b_blocked_by: Vec<String> = serde_json::from_str(&b.blocked_by).unwrap();
-
-    assert!(a_blocks.contains(&"tkB".to_string()), "A.blocks should contain B");
-    assert!(
-        b_blocked_by.contains(&"tkA".to_string()),
-        "B.blockedBy should contain A"
+    let (first, second) = tokio::join!(
+        first_repo.write_message_idempotent(&first_row, &identity),
+        second_repo.write_message_idempotent(&second_row, &identity)
     );
+    let outcomes = [first.unwrap(), second.unwrap()];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, MailboxWriteResult::Inserted))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, MailboxWriteResult::Existing(_)))
+            .count(),
+        1
+    );
+    assert_eq!(first_repo.get_history("t1", "a1", None).await.unwrap().len(), 1);
+
+    drop(first_repo);
+    drop(second_repo);
+    first_db.close().await;
+    second_db.close().await;
+}
+
+#[tokio::test]
+async fn idempotent_mailbox_write_replays_after_dropped_result_and_database_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("mailbox-restart.db");
+    let identity = MailboxIdempotencyParams {
+        scope: "lead",
+        key: "turn-after-restart",
+        request_fingerprint: "fingerprint-restart",
+    };
+
+    {
+        let db = init_database(&path).await.unwrap();
+        let repo = SqliteTeamRepository::new(db.pool().clone());
+        repo.create_team(&make_team("t1", "Team")).await.unwrap();
+        let first = make_mailbox_msg("m-before-restart", "t1", "a1", "user", "message");
+        let _dropped_result = repo.write_message_idempotent(&first, &identity).await.unwrap();
+        drop(repo);
+        db.close().await;
+    }
+
+    let db = init_database(&path).await.unwrap();
+    let repo = SqliteTeamRepository::new(db.pool().clone());
+    let retry = make_mailbox_msg("m-after-restart", "t1", "a1", "user", "message");
+    let result = repo.write_message_idempotent(&retry, &identity).await.unwrap();
+    let MailboxWriteResult::Existing(existing) = result else {
+        panic!("expected persisted mailbox replay");
+    };
+    assert_eq!(existing.id, "m-before-restart");
+    assert_eq!(repo.get_history("t1", "a1", None).await.unwrap().len(), 1);
+
+    drop(repo);
+    db.close().await;
 }

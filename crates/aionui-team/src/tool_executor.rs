@@ -40,18 +40,31 @@ impl<'a> TeamToolExecutor<'a> {
     pub async fn execute(&self, context: &TeamToolContext, call: TeamToolCall) -> Result<Value, TeamToolErrorPayload> {
         let started = Instant::now();
         let tool = call.tool.as_str();
-        let result = crate::mcp::server::dispatch_tool(
-            tool,
-            &call.arguments,
-            self.scheduler,
-            self.service,
-            &context.team_id,
-            &context.caller_slot_id,
-            context.caller_role,
-        )
-        .await
-        .map(|text| serde_json::from_str(&text).unwrap_or(Value::String(text)))
-        .map_err(map_tool_error);
+        let result = if is_canonical_work_tool(call.tool) {
+            let service = self.service.upgrade().ok_or_else(|| {
+                TeamToolErrorPayload::new(
+                    TeamToolErrorCode::TransportUnavailable,
+                    "canonical Team work adapter is unavailable",
+                )
+            });
+            match service {
+                Ok(service) => service.execute_canonical_work_tool(context, call).await,
+                Err(error) => Err(error),
+            }
+        } else {
+            crate::mcp::server::dispatch_tool(
+                tool,
+                &call.arguments,
+                self.scheduler,
+                self.service,
+                &context.team_id,
+                &context.caller_slot_id,
+                context.caller_role,
+            )
+            .await
+            .map(|text| serde_json::from_str(&text).unwrap_or(Value::String(text)))
+            .map_err(map_tool_error)
+        };
 
         let duration_ms = started.elapsed().as_millis();
         match &result {
@@ -81,6 +94,19 @@ impl<'a> TeamToolExecutor<'a> {
     }
 }
 
+fn is_canonical_work_tool(tool: TeamToolName) -> bool {
+    matches!(
+        tool,
+        TeamToolName::TeamInspect
+            | TeamToolName::TeamDelegate
+            | TeamToolName::TeamProgress
+            | TeamToolName::TeamSubmit
+            | TeamToolName::TeamReview
+            | TeamToolName::TeamIntegrate
+            | TeamToolName::TeamCancel
+    )
+}
+
 pub fn team_tool_call_from_name(tool_name: &str, arguments: Value) -> Result<TeamToolCall, TeamToolErrorPayload> {
     let tool = TeamToolName::parse(tool_name).ok_or_else(|| {
         TeamToolErrorPayload::new(TeamToolErrorCode::UnknownTool, format!("Unknown tool: {tool_name}"))
@@ -104,6 +130,7 @@ fn map_tool_error(error: ToolCallError) -> TeamToolErrorPayload {
         || error.message.starts_with("Missing required field")
         || error.message.contains("does not accept arguments")
         || error.message.contains("is no longer accepted")
+        || error.message.contains("cannot target the authenticated caller")
     {
         TeamToolErrorCode::SchemaValidationFailed
     } else if error.message.contains("Invalid agent target") {

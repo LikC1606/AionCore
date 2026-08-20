@@ -30,6 +30,21 @@ pub(super) enum PromptOutcome {
     WarningTip { session_id: String, tips: TipsEventData },
 }
 
+#[derive(Debug)]
+pub(super) enum PromptAttemptFailure {
+    SessionNotFoundWithoutOutput(AcpError),
+    Fatal(AcpSendFailure),
+}
+
+impl PromptAttemptFailure {
+    pub(super) fn into_send_failure(self) -> AcpSendFailure {
+        match self {
+            Self::SessionNotFoundWithoutOutput(error) => error.into(),
+            Self::Fatal(error) => error,
+        }
+    }
+}
+
 impl AcpAgentManager {
     /// Establish a fresh ACP session (session/new) and apply desired
     /// mode/model/config via reconcile. Does NOT send a prompt and
@@ -87,13 +102,17 @@ impl AcpAgentManager {
     /// Used as the rescue path when resume helpers see `SessionNotFound`.
     /// Emits a `warn!` so ops can still see the original failure that
     /// triggered the rebuild.
-    async fn rebuild_after_session_not_found(&self, stale_sid: &str, err: &AcpError) -> Result<String, AgentError> {
+    pub(super) async fn rebuild_after_session_not_found(
+        &self,
+        stale_sid: &str,
+        err: &AcpError,
+    ) -> Result<String, AgentError> {
         warn!(
             conversation_id = %self.params.conversation_id,
             stale_session_id = %stale_sid,
             recovery_action = "clear_persisted_session_id_and_session_new",
             error = %err,
-            "open_session_resume: stale session id rejected by CLI; clearing persisted session id and rebuilding via session/new"
+            "ACP stale session id rejected by CLI; clearing persisted session id and rebuilding via session/new"
         );
         {
             let mut session = self.session.write().await;
@@ -249,10 +268,11 @@ impl AcpAgentManager {
         data: &SendMessageData,
         session_id: Option<&str>,
         matched_command: Option<&SlashCommandItem>,
-    ) -> Result<PromptOutcome, AcpSendFailure> {
+    ) -> Result<PromptOutcome, PromptAttemptFailure> {
         let sid = session_id
             .ok_or_else(|| AgentError::internal("Cannot prompt: no session ID available"))
-            .map_err(AcpSendFailure::from)?;
+            .map_err(AcpSendFailure::from)
+            .map_err(PromptAttemptFailure::Fatal)?;
 
         let content = data.content.clone();
 
@@ -271,14 +291,19 @@ impl AcpAgentManager {
         // earlier turn cannot override a later benign empty turn.
         self.process.clear_stderr().await;
 
-        let prompt_response = self
+        let prompt_response = match self
             .protocol
             .prompt(PromptRequest::new(
                 SessionId::new(sid),
                 vec![ContentBlock::from(content)],
             ))
             .await
-            .map_err(AcpSendFailure::from)?;
+        {
+            Ok(response) => response,
+            Err(error) => {
+                return Err(classify_prompt_attempt_failure(error, &mut probe_rx));
+            }
+        };
 
         let empty_turn = is_empty_turn(&mut probe_rx);
         if empty_turn && let Some(error) = self.empty_turn_terminal_error().await {
@@ -370,6 +395,17 @@ impl AcpAgentManager {
         let tail = self.process.peek_stderr_tail(STDERR_PEEK_LINES).await;
         let detail = super::stderr_error_extractor::extract_error_message(&tail)?;
         Some(classify_empty_turn_stderr_error(&detail))
+    }
+}
+
+fn classify_prompt_attempt_failure(
+    error: AcpError,
+    probe_rx: &mut tokio::sync::broadcast::Receiver<AgentStreamEvent>,
+) -> PromptAttemptFailure {
+    if is_acp_session_not_found(&error) && is_empty_turn(probe_rx) {
+        PromptAttemptFailure::SessionNotFoundWithoutOutput(error)
+    } else {
+        PromptAttemptFailure::Fatal(error.into())
     }
 }
 
@@ -796,6 +832,53 @@ mod tests {
         .unwrap();
 
         assert!(!super::is_empty_turn(&mut rx));
+    }
+
+    #[test]
+    fn prompt_session_not_found_without_output_is_recoverable() {
+        let (tx, _) = broadcast::channel::<AgentStreamEvent>(8);
+        let mut rx = tx.subscribe();
+        tx.send(AgentStreamEvent::Start(StartEventData::default())).unwrap();
+
+        let failure = super::classify_prompt_attempt_failure(
+            AcpError::SessionNotFound {
+                session_id: "stale-session".into(),
+            },
+            &mut rx,
+        );
+
+        assert!(matches!(
+            failure,
+            super::PromptAttemptFailure::SessionNotFoundWithoutOutput(_)
+        ));
+    }
+
+    #[test]
+    fn prompt_session_not_found_after_visible_output_is_not_replayed() {
+        let (tx, _) = broadcast::channel::<AgentStreamEvent>(8);
+        let mut rx = tx.subscribe();
+        tx.send(AgentStreamEvent::Text(TextEventData {
+            content: "already visible".into(),
+        }))
+        .unwrap();
+
+        let failure = super::classify_prompt_attempt_failure(
+            AcpError::SessionNotFound {
+                session_id: "stale-session".into(),
+            },
+            &mut rx,
+        );
+
+        assert!(matches!(failure, super::PromptAttemptFailure::Fatal(_)));
+    }
+
+    #[test]
+    fn non_session_prompt_error_without_output_is_not_replayed() {
+        let (_tx, mut rx) = broadcast::channel::<AgentStreamEvent>(8);
+
+        let failure = super::classify_prompt_attempt_failure(AcpError::AuthRequired, &mut rx);
+
+        assert!(matches!(failure, super::PromptAttemptFailure::Fatal(_)));
     }
 
     /// Each empty-finish stop reason maps to a stable tip code so the UI can

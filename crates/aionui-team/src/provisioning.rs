@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use aionui_ai_agent::IWorkerTaskManager;
 use aionui_api_types::{AddAgentRequest, GetConfigOptionsResponse, TeamAgentInput, TeamToolTransport};
-use aionui_common::{AgentKillReason, AgentType, ProviderWithModel, generate_id};
+use aionui_common::{AgentKillReason, AgentType, ProviderWithModel, TimestampMs, generate_id};
 use aionui_db::models::{AgentMetadataRow, TeamRow};
 use aionui_db::{IAgentMetadataRepository, IProviderRepository, ITeamRepository, UpdateTeamParams};
 use async_trait::async_trait;
@@ -76,6 +76,14 @@ pub struct TeamConversationCreateResult {
     pub workspace: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeamConversationCleanupCandidate {
+    pub conversation_id: String,
+    pub user_id: String,
+    pub team_id: String,
+    pub created_at: TimestampMs,
+}
+
 #[async_trait]
 pub trait TeamConversationProvisioningPort: Send + Sync {
     async fn create_team_conversation(
@@ -103,6 +111,19 @@ pub trait TeamConversationProvisioningPort: Send + Sync {
     ) -> Result<(), TeamError>;
 
     async fn delete_team_conversation(&self, user_id: &str, conversation_id: &str) -> Result<(), TeamError>;
+
+    /// Lists durable conversations still carrying this Team binding. This is
+    /// the replay cursor for conversation cleanup after the Team aggregate has
+    /// already been removed.
+    async fn list_team_conversation_ids(&self, _user_id: &str, _team_id: &str) -> Result<Vec<String>, TeamError> {
+        Ok(Vec::new())
+    }
+
+    async fn list_team_conversation_cleanup_candidates(
+        &self,
+    ) -> Result<Vec<TeamConversationCleanupCandidate>, TeamError> {
+        Ok(Vec::new())
+    }
 
     async fn lookup_team_binding_by_conversation(
         &self,
@@ -173,108 +194,132 @@ impl TeamAgentProvisioner {
             ));
         };
 
-        let leader_input = &inputs[*leader_idx];
-        let leader_slot_id = generate_id();
-        let leader_role = TeammateRole::Lead;
-        let leader_assistant_id = Self::effective_assistant_id(leader_input.assistant_id.as_deref());
-        let leader_backend = self
-            .resolve_requested_backend(leader_input.backend.as_deref(), leader_assistant_id.as_deref())
-            .await?;
-        let leader_conversation = self
-            .create_team_conversation_for_agent(
-                user_id,
-                team_id,
-                &leader_slot_id,
-                leader_role,
-                &leader_input.name,
-                &leader_backend,
-                &leader_input.model,
-                leader_assistant_id.as_deref(),
-                shared_workspace,
-                None,
-            )
-            .await?;
-
-        let team_workspace = match shared_workspace {
-            Some(workspace) => workspace.to_owned(),
-            None => {
-                self.resolve_initial_leader_workspace(
-                    team_id,
-                    &leader_conversation.conversation_id,
-                    leader_conversation.workspace,
-                )
-                .await?
-            }
-        };
-
-        let mut agents = Vec::with_capacity(inputs.len());
-        agents.push(TeamAgent {
-            slot_id: leader_slot_id.clone(),
-            name: leader_input.name.clone(),
-            role: leader_role,
-            conversation_id: leader_conversation.conversation_id,
-            backend: leader_backend,
-            model: leader_input.model.clone(),
-            assistant_id: leader_assistant_id,
-            status: None,
-            conversation_type: None,
-            cli_path: None,
-        });
-
-        for (input, role) in inputs
-            .iter()
-            .zip(roles.iter())
-            .filter(|(_, role)| **role == TeammateRole::Teammate)
-        {
-            let slot_id = generate_id();
-            let assistant_id = Self::effective_assistant_id(input.assistant_id.as_deref());
-            let backend = self
-                .resolve_requested_backend(input.backend.as_deref(), assistant_id.as_deref())
+        let mut created_conversation_ids = Vec::with_capacity(inputs.len());
+        let result = async {
+            let leader_input = &inputs[*leader_idx];
+            let leader_slot_id = generate_id();
+            let leader_role = TeammateRole::Lead;
+            let leader_assistant_id = Self::effective_assistant_id(leader_input.assistant_id.as_deref());
+            let leader_backend = self
+                .resolve_requested_backend(leader_input.backend.as_deref(), leader_assistant_id.as_deref())
                 .await?;
-            let conversation = self
+            let leader_conversation = self
                 .create_team_conversation_for_agent(
                     user_id,
                     team_id,
-                    &slot_id,
-                    *role,
-                    &input.name,
-                    &backend,
-                    &input.model,
-                    assistant_id.as_deref(),
-                    Some(&team_workspace),
+                    &leader_slot_id,
+                    leader_role,
+                    &leader_input.name,
+                    &leader_backend,
+                    &leader_input.model,
+                    leader_assistant_id.as_deref(),
+                    shared_workspace,
                     None,
                 )
                 .await?;
+            created_conversation_ids.push(leader_conversation.conversation_id.clone());
+
+            let team_workspace = match shared_workspace {
+                Some(workspace) => workspace.to_owned(),
+                None => {
+                    self.resolve_initial_leader_workspace(
+                        team_id,
+                        &leader_conversation.conversation_id,
+                        leader_conversation.workspace,
+                    )
+                    .await?
+                }
+            };
+
+            let mut agents = Vec::with_capacity(inputs.len());
             agents.push(TeamAgent {
-                slot_id,
-                name: input.name.clone(),
-                role: *role,
-                conversation_id: conversation.conversation_id,
-                backend,
-                model: input.model.clone(),
-                assistant_id,
+                slot_id: leader_slot_id.clone(),
+                name: leader_input.name.clone(),
+                role: leader_role,
+                conversation_id: leader_conversation.conversation_id,
+                backend: leader_backend,
+                model: leader_input.model.clone(),
+                assistant_id: leader_assistant_id,
                 status: None,
                 conversation_type: None,
                 cli_path: None,
             });
-        }
 
-        let lead_agent_id = Some(leader_slot_id);
-        info!(
-            team_id,
-            count = agents.len(),
-            workspace_source = if shared_workspace.is_some() {
-                "user_supplied"
-            } else {
-                "auto_from_leader"
-            },
-            "Team agents provisioned"
-        );
-        Ok(InitialProvisioningResult {
-            agents,
-            lead_agent_id,
-            team_workspace,
-        })
+            for (input, role) in inputs
+                .iter()
+                .zip(roles.iter())
+                .filter(|(_, role)| **role == TeammateRole::Teammate)
+            {
+                let slot_id = generate_id();
+                let assistant_id = Self::effective_assistant_id(input.assistant_id.as_deref());
+                let backend = self
+                    .resolve_requested_backend(input.backend.as_deref(), assistant_id.as_deref())
+                    .await?;
+                let conversation = self
+                    .create_team_conversation_for_agent(
+                        user_id,
+                        team_id,
+                        &slot_id,
+                        *role,
+                        &input.name,
+                        &backend,
+                        &input.model,
+                        assistant_id.as_deref(),
+                        Some(&team_workspace),
+                        None,
+                    )
+                    .await?;
+                created_conversation_ids.push(conversation.conversation_id.clone());
+                agents.push(TeamAgent {
+                    slot_id,
+                    name: input.name.clone(),
+                    role: *role,
+                    conversation_id: conversation.conversation_id,
+                    backend,
+                    model: input.model.clone(),
+                    assistant_id,
+                    status: None,
+                    conversation_type: None,
+                    cli_path: None,
+                });
+            }
+
+            let lead_agent_id = Some(leader_slot_id);
+            info!(
+                team_id,
+                count = agents.len(),
+                workspace_source = if shared_workspace.is_some() {
+                    "user_supplied"
+                } else {
+                    "auto_from_leader"
+                },
+                "Team agents provisioned"
+            );
+            Ok(InitialProvisioningResult {
+                agents,
+                lead_agent_id,
+                team_workspace,
+            })
+        }
+        .await;
+
+        if result.is_err() {
+            for conversation_id in created_conversation_ids.into_iter().rev() {
+                if let Err(cleanup_error) = self
+                    .conversation_port
+                    .delete_team_conversation(user_id, &conversation_id)
+                    .await
+                {
+                    warn!(
+                        team_id,
+                        conversation_id,
+                        error = %cleanup_error,
+                        "failed to roll back a partially provisioned Team conversation"
+                    );
+                }
+            }
+        }
+        result
     }
 
     pub(crate) async fn add_agent(
@@ -668,6 +713,7 @@ impl TeamAgentProvisioner {
             "teamId": team_id,
             "slot_id": slot_id,
             "role": role.to_string(),
+            "_team_snapshot_bootstrap_pending": true,
             "backend": backend,
             "session_mode": session_mode,
         });

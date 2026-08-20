@@ -18,9 +18,10 @@ pub const TEAM_MCP_SERVER_NAME: &str = "aionui-team";
 
 /// Stdio connection config for the team session MCP server.
 ///
-/// `team_id` is persisted for diagnostics; the wire-level MCP server name is
-/// the fixed [`TEAM_MCP_SERVER_NAME`] (team routing happens via per-team TCP
-/// port + auth token, not via the server name — see ELECTRON-1JY).
+/// `team_id` and `slot_id` are persisted for diagnostics; the wire-level MCP
+/// server name is the fixed [`TEAM_MCP_SERVER_NAME`]. `token` is an opaque,
+/// per-member credential whose server-side binding is authoritative. The
+/// client-provided `slot_id` must never be used to establish caller identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TeamMcpStdioConfig {
     pub team_id: String,
@@ -35,7 +36,8 @@ impl TeamMcpStdioConfig {
     pub const ENV_PORT: &'static str = "TEAM_MCP_PORT";
     /// env key the stdio bridge reads to learn the auth token.
     pub const ENV_TOKEN: &'static str = "TEAM_MCP_TOKEN";
-    /// env key the stdio bridge reads to learn which agent slot it represents.
+    /// Compatibility metadata describing which agent slot launched the bridge.
+    /// Authorization is derived from [`Self::ENV_TOKEN`], not this value.
     pub const ENV_SLOT_ID: &'static str = "TEAM_AGENT_SLOT_ID";
 }
 

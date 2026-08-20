@@ -11,19 +11,6 @@ pub enum SchedulerAction {
         message: String,
         files: Vec<String>,
     },
-    TaskCreate {
-        subject: String,
-        description: Option<String>,
-        owner: Option<String>,
-        blocked_by: Vec<String>,
-    },
-    TaskUpdate {
-        task_id: String,
-        status: Option<String>,
-        description: Option<String>,
-        owner: Option<String>,
-        blocked_by: Option<Vec<String>>,
-    },
     SpawnAgent {
         name: String,
         role: String,
@@ -43,39 +30,6 @@ pub enum SchedulerAction {
 }
 
 impl TeammateManager {
-    pub async fn create_task(
-        &self,
-        subject: &str,
-        description: Option<&str>,
-        owner: Option<&str>,
-        blocked_by: &[String],
-    ) -> Result<crate::types::TeamTask, TeamError> {
-        self.task_board
-            .create_task(&self.team_id, subject, description, owner, blocked_by)
-            .await
-    }
-
-    pub async fn update_task(
-        &self,
-        task_id: &str,
-        status: Option<&str>,
-        description: Option<String>,
-        owner: Option<String>,
-        blocked_by: Option<Vec<String>>,
-    ) -> Result<crate::types::TeamTask, TeamError> {
-        use crate::task_board::TaskUpdate;
-        use crate::types::TaskStatus;
-
-        let update = TaskUpdate {
-            status: status.and_then(TaskStatus::parse),
-            description,
-            owner,
-            blocked_by,
-            ..Default::default()
-        };
-        self.task_board.update_task(&self.team_id, task_id, &update).await
-    }
-
     pub async fn execute_action(
         &self,
         from_slot_id: &str,
@@ -84,33 +38,6 @@ impl TeammateManager {
         match action {
             SchedulerAction::SendMessage { to, message, files } => {
                 self.handle_send_message(from_slot_id, to, message, files).await?;
-                Ok(None)
-            }
-            SchedulerAction::TaskCreate {
-                subject,
-                description,
-                owner,
-                blocked_by,
-            } => {
-                self.create_task(subject, description.as_deref(), owner.as_deref(), blocked_by)
-                    .await?;
-                Ok(None)
-            }
-            SchedulerAction::TaskUpdate {
-                task_id,
-                status,
-                description,
-                owner,
-                blocked_by,
-            } => {
-                self.update_task(
-                    task_id,
-                    status.as_deref(),
-                    description.clone(),
-                    owner.clone(),
-                    blocked_by.clone(),
-                )
-                .await?;
                 Ok(None)
             }
             SchedulerAction::IdleNotification { summary } => {

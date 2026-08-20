@@ -8,7 +8,7 @@ use aionui_api_types::{
 };
 use serde_json::{Value, json};
 
-use crate::cli::{TeamArgs, TeamCommand, TeamTaskCommand};
+use crate::cli::{TeamArgs, TeamCommand};
 use crate::commands::team_capabilities;
 
 const ENV_BASE_URL: &str = "AIONUI_BASE_URL";
@@ -46,12 +46,13 @@ async fn run_team_inner(args: TeamArgs) -> Result<(), ExitCode> {
         }
         TeamCommand::Members => call_tool(vec!["members"]).await,
         TeamCommand::SendMessage => call_tool(vec!["send-message"]).await,
-        TeamCommand::Task(task) => match task.command {
-            TeamTaskCommand::Create => call_tool(vec!["task", "create"]).await,
-            TeamTaskCommand::Update => call_tool(vec!["task", "update"]).await,
-            TeamTaskCommand::List => call_tool(vec!["task", "list"]).await,
-            TeamTaskCommand::Unknown(path) => Err(unknown_command("team task", path, "unknown team task command")),
-        },
+        TeamCommand::Inspect => call_tool(vec!["inspect"]).await,
+        TeamCommand::Delegate => call_tool(vec!["delegate"]).await,
+        TeamCommand::Progress => call_tool(vec!["progress"]).await,
+        TeamCommand::Submit => call_tool(vec!["submit"]).await,
+        TeamCommand::Review => call_tool(vec!["review"]).await,
+        TeamCommand::Integrate => call_tool(vec!["integrate"]).await,
+        TeamCommand::Cancel => call_tool(vec!["cancel"]).await,
         TeamCommand::ListAssistants => call_tool(vec!["list-assistants"]).await,
         TeamCommand::DescribeAssistant => call_tool(vec!["describe-assistant"]).await,
         TeamCommand::SpawnAgent => call_tool(vec!["spawn-agent"]).await,

@@ -629,16 +629,6 @@ impl SqliteFeedbackDiagnosticsRepository {
             ));
         };
 
-        let task_rows = sqlx::query(
-            "SELECT status, COUNT(*) AS count, MAX(updated_at) AS last_updated_at \
-             FROM team_tasks \
-             WHERE team_id = ? \
-             GROUP BY status",
-        )
-        .bind(&team_id)
-        .fetch_all(&self.pool)
-        .await?;
-
         let mailbox_rows = sqlx::query(
             "SELECT type, read, COUNT(*) AS count, MAX(created_at) AS last_created_at \
              FROM mailbox \
@@ -664,7 +654,6 @@ impl SqliteFeedbackDiagnosticsRepository {
                     "created_at": team.try_get::<i64, _>("created_at")?,
                     "updated_at": team.try_get::<i64, _>("updated_at")?,
                 },
-                "tasks": rows_to_group_counts(task_rows, "status")?,
                 "mailbox": mailbox_rows_to_counts(mailbox_rows)?,
             }),
         ))
@@ -1796,21 +1785,6 @@ fn unhealthy_model_count(raw: Option<&str>) -> usize {
                 .count()
         })
         .unwrap_or_default()
-}
-
-fn rows_to_group_counts(rows: Vec<sqlx::sqlite::SqliteRow>, key_column: &str) -> Result<Value, sqlx::Error> {
-    let mut result = BTreeMap::new();
-    for row in rows {
-        let key = row.try_get::<String, _>(key_column)?;
-        result.insert(
-            key,
-            json!({
-                "count": row.try_get::<i64, _>("count")?,
-                "last_updated_at": row.try_get::<Option<i64>, _>("last_updated_at")?,
-            }),
-        );
-    }
-    Ok(json!(result))
 }
 
 fn mailbox_rows_to_counts(rows: Vec<sqlx::sqlite::SqliteRow>) -> Result<Value, sqlx::Error> {

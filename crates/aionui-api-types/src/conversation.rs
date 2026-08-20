@@ -99,6 +99,10 @@ pub struct SendMessageRequest {
     pub inject_skills: Vec<String>,
     #[serde(default)]
     pub hidden: bool,
+    /// Stable caller identity for retrying one logical turn. Reusing a key
+    /// with a different payload is rejected.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 }
 
 /// Response for `POST /api/conversations/:id/messages`.

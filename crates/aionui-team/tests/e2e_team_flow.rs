@@ -10,7 +10,7 @@
 //! Infrastructure used:
 //! - Real in-memory mock repo (same pattern as existing tests)
 //! - Real TCP MCP server (TeamMcpServer)
-//! - Real TeamSession with real Mailbox + TaskBoard
+//! - Real TeamSession with mailbox and canonical WorkItem tools
 //! - RecordingAgent: captures send_message calls (mock `IAgentTask` / `IMockAgent`)
 //! - StubTaskManager: pre-populated with RecordingAgent instances
 //!
@@ -526,6 +526,10 @@ fn session_token(session: &TeamSession) -> String {
     session.mcp_stdio_config("lead-1").token
 }
 
+fn session_token_for(session: &TeamSession, slot_id: &str) -> String {
+    session.mcp_stdio_config(slot_id).token
+}
+
 // ---------------------------------------------------------------------------
 // MCP protocol helpers (same pattern as e2e_smoke.rs and mcp_server_integration.rs)
 // ---------------------------------------------------------------------------
@@ -681,10 +685,13 @@ async fn setup_session_with_turn_recorder_inner(
 
     let team = aionui_team::types::Team {
         id: "e2e-team".into(),
+        user_id: "user-e2e".into(),
         name: "E2E Team".into(),
         workspace: "/tmp/e2e-team".into(),
+        workspace_mode: "shared".into(),
         agents: two_agents(),
         lead_agent_id: Some("lead-1".into()),
+        session_mode: None,
         created_at: 1000,
         updated_at: 1000,
     };
@@ -739,10 +746,13 @@ async fn setup_session_with_runtime_ports(
     let task_manager_dyn: Arc<dyn aionui_ai_agent::IWorkerTaskManager> = task_manager;
     let team = aionui_team::types::Team {
         id: "e2e-team".into(),
+        user_id: "user-e2e".into(),
         name: "E2E Team".into(),
         workspace: "/tmp/e2e-team".into(),
+        workspace_mode: "shared".into(),
         agents: two_agents(),
         lead_agent_id: Some("lead-1".into()),
+        session_mode: None,
         created_at: 1000,
         updated_at: 1000,
     };
@@ -848,12 +858,18 @@ async fn s1a_mcp_server_starts_and_tools_available() {
     let resp = tcp_recv(&mut stream).await;
 
     let tools = resp["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 10, "expected exactly 10 MCP tools, got {}", tools.len());
+    assert_eq!(tools.len(), 14, "expected exactly 14 MCP tools, got {}", tools.len());
 
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert!(names.contains(&"team_send_message"), "missing team_send_message");
     assert!(names.contains(&"team_members"), "missing team_members");
-    assert!(names.contains(&"team_task_create"), "missing team_task_create");
+    assert!(names.contains(&"team_inspect"), "missing team_inspect");
+    assert!(names.contains(&"team_delegate"), "missing team_delegate");
+    assert!(names.contains(&"team_progress"), "missing team_progress");
+    assert!(names.contains(&"team_submit"), "missing team_submit");
+    assert!(names.contains(&"team_review"), "missing team_review");
+    assert!(names.contains(&"team_integrate"), "missing team_integrate");
+    assert!(names.contains(&"team_cancel"), "missing team_cancel");
     assert!(names.contains(&"team_list_assistants"), "missing team_list_assistants");
     assert!(
         !names.contains(&"team_list_models"),
@@ -881,7 +897,10 @@ async fn s1b_mcp_stdio_config_per_agent() {
     assert_eq!(cfg_worker.team_id, "e2e-team");
     assert_eq!(cfg_worker.slot_id, "worker-1");
     assert_eq!(cfg_worker.port, cfg_lead.port, "same server port");
-    assert_eq!(cfg_worker.token, cfg_lead.token, "same auth token for same session");
+    assert_ne!(
+        cfg_worker.token, cfg_lead.token,
+        "each member must receive a distinct credential"
+    );
     assert_ne!(cfg_worker.slot_id, cfg_lead.slot_id);
 
     session.stop();
@@ -1113,7 +1132,7 @@ async fn s3c_finish_triggers_lead_wake_with_idle_notification() {
     // Trigger lead wake via the public send_message_to_agent API:
     // this writes to mailbox + wakes the agent, which causes send_message to fire.
     session
-        .send_message_to_agent("lead-1", "wake", None)
+        .send_message_to_agent("lead-1", "wake", None, None)
         .await
         .expect("send_message_to_agent must succeed");
 
@@ -1201,7 +1220,7 @@ async fn s4_dynamic_agent_added_then_finish_propagates() {
     // Wake the helper via public send_message_to_agent API
     // (this writes to mailbox AND wakes the agent, consuming the prior mailbox messages)
     session
-        .send_message_to_agent("helper-1", "start your task", None)
+        .send_message_to_agent("helper-1", "start your task", None, None)
         .await
         .expect("send_message_to_agent to helper must succeed");
 
@@ -1350,51 +1369,6 @@ async fn s5b_dedup_window_blocks_rapid_duplicate_finish() {
 }
 
 // ===========================================================================
-// Scenario 6: task board operations via MCP
-// ===========================================================================
-
-/// Scenario 6: team_task_create via MCP → task board persisted → task visible
-/// in team_task_list.
-#[tokio::test]
-async fn s6_mcp_task_create_and_list() {
-    let (session, _tm, repo, _sent) = setup_session().await;
-    let port = session_port(&session);
-    let token = session_token(&session);
-
-    let mut stream = mcp_connect(port, &token, "lead-1").await;
-
-    // Create a task
-    let create_resp = mcp_call_tool(
-        &mut stream,
-        20,
-        "team_task_create",
-        json!({ "subject": "E2E Task Alpha" }),
-    )
-    .await;
-    assert!(!is_mcp_error(&create_resp), "team_task_create failed: {create_resp}");
-
-    // List tasks — must contain the created task
-    let list_resp = mcp_call_tool(&mut stream, 21, "team_task_list", json!({})).await;
-    assert!(!is_mcp_error(&list_resp), "team_task_list failed: {list_resp}");
-    let text = mcp_text(&list_resp);
-    let tasks: Vec<Value> = serde_json::from_str(text).expect("task list must be JSON");
-    assert!(
-        tasks.iter().any(|t| t["subject"] == "E2E Task Alpha"),
-        "created task must appear in task list; got {tasks:?}"
-    );
-
-    // Repo-level cross-check: task row reached storage
-    let state = repo.state.lock().unwrap();
-    assert!(
-        state.tasks.iter().any(|t| t.subject == "E2E Task Alpha"),
-        "task must be persisted in repo; got {:?}",
-        state.tasks
-    );
-
-    session.stop();
-}
-
-// ===========================================================================
 // Scenario 7: team_members reflects dynamic roster
 // ===========================================================================
 
@@ -1485,7 +1459,7 @@ async fn s8a_wrong_auth_token_rejected() {
 async fn s8b_worker_cannot_call_spawn_agent() {
     let (session, _tm, _repo, _sent) = setup_session().await;
     let port = session_port(&session);
-    let token = session_token(&session);
+    let token = session_token_for(&session, "worker-1");
 
     let mut stream = mcp_connect(port, &token, "worker-1").await;
     let resp = mcp_call_tool(
@@ -1528,7 +1502,7 @@ async fn turn_completion_reconciles_without_another_notify() {
         .await
         .unwrap();
     let user_ack = session
-        .send_message_to_agent("lead-1", "user priority", None)
+        .send_message_to_agent("lead-1", "user priority", None, None)
         .await
         .unwrap();
 
@@ -1849,7 +1823,7 @@ async fn s10_error_finish_sets_agent_status_to_error() {
 async fn s11_shutdown_approved_interception() {
     let (session, _tm, repo, _sent) = setup_session().await;
     let port = session_port(&session);
-    let token = session_token(&session);
+    let token = session_token_for(&session, "worker-1");
 
     let mut stream = mcp_connect(port, &token, "worker-1").await;
     let resp = mcp_call_tool(

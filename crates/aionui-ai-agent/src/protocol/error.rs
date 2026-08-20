@@ -295,7 +295,9 @@ impl AcpError {
         // the thread id nested in `data.details` (rather than using ACP's
         // SessionNotFound code). Treat it as the same recoverable stale
         // session condition before mapping the numeric error code.
-        if let Some(sid) = extract_session_not_found(err.data.as_ref()) {
+        if let Some(sid) =
+            extract_session_not_found(err.data.as_ref()).or_else(|| extract_session_not_found_message(&err.message))
+        {
             return AcpError::SessionNotFound { session_id: sid };
         }
         match err.code {
@@ -380,14 +382,24 @@ fn extract_session_not_found(data: Option<&serde_json::Value>) -> Option<String>
         let Some(msg) = obj.get(key).and_then(|value| value.as_str()) else {
             continue;
         };
-        let sid = msg
-            .strip_prefix("Session not found: ")
-            .or_else(|| msg.strip_prefix("no rollout found for thread id "))
-            .map(str::trim)
-            .filter(|sid| !sid.is_empty());
-        if let Some(sid) = sid {
-            return Some(sid.to_owned());
+        if let Some(sid) = extract_session_not_found_message(msg) {
+            return Some(sid);
         }
+    }
+    None
+}
+
+fn extract_session_not_found_message(message: &str) -> Option<String> {
+    for marker in ["Session not found: ", "no rollout found for thread id "] {
+        let Some(start) = message.find(marker) else {
+            continue;
+        };
+        let candidate = message[start + marker.len()..]
+            .split(|ch: char| ch.is_whitespace() || matches!(ch, ',' | ';' | ')' | ']' | '}'))
+            .next()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?;
+        return Some(candidate.to_owned());
     }
     None
 }
@@ -695,6 +707,16 @@ mod tests {
         }));
         match AcpError::from_sdk(sdk_err, "session/load") {
             AcpError::SessionNotFound { session_id } => assert_eq!(session_id, "thread-stale"),
+            other => panic!("expected SessionNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_sdk_internal_with_codex_missing_rollout_message() {
+        let mut sdk_err = SdkError::internal_error();
+        sdk_err.message = "session/load failed: no rollout found for thread id thread-message-only".into();
+        match AcpError::from_sdk(sdk_err, "session/load") {
+            AcpError::SessionNotFound { session_id } => assert_eq!(session_id, "thread-message-only"),
             other => panic!("expected SessionNotFound, got {other:?}"),
         }
     }

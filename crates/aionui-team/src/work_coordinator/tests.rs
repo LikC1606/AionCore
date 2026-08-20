@@ -20,6 +20,14 @@ impl RunCausalityPort for RecordingRunCausality {
         }
     }
 
+    fn bind_system_enqueue(&self, _request: &EnqueueRequest) -> RunBinding {
+        RunBinding {
+            team_run_id: Some("system-run-1".to_owned()),
+            created_new_run: true,
+            user_intervention: false,
+        }
+    }
+
     fn abort_binding(&self, _binding: &RunBinding) {}
 
     fn apply_work_summary(&self, summary: RunWorkSummary) {
@@ -50,7 +58,7 @@ fn enqueue(coordinator: &SlotWorkCoordinator, source: WorkSource, message_id: &s
 #[test]
 fn foreground_precedes_background_and_fifo_is_stable() {
     let coordinator = coordinator();
-    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    coordinator.set_runtime_constraint("lead-1", TeamRunTargetRole::Lead, RuntimeConstraint::Ready);
     enqueue(&coordinator, WorkSource::McpSendMessage, "background-1");
     enqueue(&coordinator, WorkSource::UserMessage, "foreground-1");
     enqueue(&coordinator, WorkSource::UserIntervention, "foreground-2");
@@ -79,7 +87,7 @@ fn foreground_precedes_background_and_fifo_is_stable() {
 #[test]
 fn five_enqueues_require_one_reconcile_not_five_signals() {
     let coordinator = coordinator();
-    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    coordinator.set_runtime_constraint("lead-1", TeamRunTargetRole::Lead, RuntimeConstraint::Ready);
     for index in 1..=5 {
         enqueue(&coordinator, WorkSource::UserMessage, &format!("message-{index}"));
     }
@@ -104,7 +112,7 @@ fn five_enqueues_require_one_reconcile_not_five_signals() {
 #[test]
 fn messages_consumed_by_one_turn_are_claimed_in_one_batch() {
     let coordinator = coordinator();
-    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    coordinator.set_runtime_constraint("lead-1", TeamRunTargetRole::Lead, RuntimeConstraint::Ready);
     for message_id in ["m1", "m2", "m3"] {
         enqueue(&coordinator, WorkSource::UserMessage, message_id);
     }
@@ -125,7 +133,7 @@ fn messages_consumed_by_one_turn_are_claimed_in_one_batch() {
 #[test]
 fn enqueue_during_running_batch_waits_for_next_batch() {
     let coordinator = coordinator();
-    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    coordinator.set_runtime_constraint("lead-1", TeamRunTargetRole::Lead, RuntimeConstraint::Ready);
     enqueue(&coordinator, WorkSource::UserMessage, "m1");
     let ReconcileDecision::Claim(first) = coordinator.next("lead-1") else {
         panic!("first message must be claimable");
@@ -146,7 +154,7 @@ fn enqueue_during_running_batch_waits_for_next_batch() {
 #[test]
 fn retryable_start_returns_the_same_intents_to_the_queue() {
     let coordinator = coordinator();
-    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    coordinator.set_runtime_constraint("lead-1", TeamRunTargetRole::Lead, RuntimeConstraint::Ready);
     enqueue(&coordinator, WorkSource::UserMessage, "m1");
     let ReconcileDecision::Claim(first) = coordinator.next("lead-1") else {
         panic!("message must be claimable");
@@ -170,9 +178,9 @@ fn retryable_start_returns_the_same_intents_to_the_queue() {
 #[test]
 fn foreground_message_resumes_paused_slot() {
     let coordinator = coordinator();
-    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    coordinator.set_runtime_constraint("lead-1", TeamRunTargetRole::Lead, RuntimeConstraint::Ready);
     enqueue(&coordinator, WorkSource::McpSendMessage, "background");
-    coordinator.pause_slot("lead-1");
+    coordinator.pause_slot("lead-1").unwrap();
     enqueue(&coordinator, WorkSource::UserIntervention, "intervention");
 
     let ReconcileDecision::Claim(first) = coordinator.next("lead-1") else {
@@ -190,7 +198,7 @@ fn foreground_message_resumes_paused_slot() {
 #[test]
 fn cancelled_batch_rejects_a_late_start_by_cancelling_it_immediately() {
     let coordinator = coordinator();
-    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    coordinator.set_runtime_constraint("lead-1", TeamRunTargetRole::Lead, RuntimeConstraint::Ready);
     enqueue(&coordinator, WorkSource::UserMessage, "m1");
     let ReconcileDecision::Claim(batch) = coordinator.next("lead-1") else {
         panic!("message must be claimable");
@@ -209,14 +217,18 @@ fn cancelled_batch_rejects_a_late_start_by_cancelling_it_immediately() {
 #[test]
 fn runtime_starting_blocks_and_runtime_ready_releases_work() {
     let coordinator = coordinator();
-    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Starting { operation_id: 7 });
+    coordinator.set_runtime_constraint(
+        "lead-1",
+        TeamRunTargetRole::Lead,
+        RuntimeConstraint::Starting { operation_id: 7 },
+    );
     enqueue(&coordinator, WorkSource::UserMessage, "m1");
 
     assert_eq!(
         coordinator.next("lead-1"),
         ReconcileDecision::Blocked(RuntimeConstraint::Starting { operation_id: 7 })
     );
-    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    coordinator.set_runtime_constraint("lead-1", TeamRunTargetRole::Lead, RuntimeConstraint::Ready);
     let ReconcileDecision::Claim(batch) = coordinator.next("lead-1") else {
         panic!("ready runtime must release the queued intent");
     };
@@ -226,7 +238,7 @@ fn runtime_starting_blocks_and_runtime_ready_releases_work() {
 #[test]
 fn remove_cancels_queued_and_running_work_and_rejects_new_enqueue() {
     let coordinator = coordinator();
-    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    coordinator.set_runtime_constraint("lead-1", TeamRunTargetRole::Lead, RuntimeConstraint::Ready);
     enqueue(&coordinator, WorkSource::UserMessage, "m1");
     let ReconcileDecision::Claim(first) = coordinator.next("lead-1") else {
         panic!("first message must be claimable");
@@ -256,7 +268,7 @@ fn remove_cancels_queued_and_running_work_and_rejects_new_enqueue() {
 #[test]
 fn stale_generation_and_operation_cannot_commit() {
     let coordinator = coordinator();
-    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    coordinator.set_runtime_constraint("lead-1", TeamRunTargetRole::Lead, RuntimeConstraint::Ready);
     enqueue(&coordinator, WorkSource::UserMessage, "m1");
     let ReconcileDecision::Claim(batch) = coordinator.next("lead-1") else {
         panic!("message must be claimable");
@@ -280,7 +292,7 @@ fn stale_generation_and_operation_cannot_commit() {
 #[test]
 fn unread_without_projection_creates_one_recovery_intent() {
     let coordinator = coordinator();
-    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    coordinator.set_runtime_constraint("lead-1", TeamRunTargetRole::Lead, RuntimeConstraint::Ready);
     coordinator.reconcile_mailbox("lead-1", &["m1".into()], TeamRunTargetRole::Lead);
     coordinator.reconcile_mailbox("lead-1", &["m1".into()], TeamRunTargetRole::Lead);
 
@@ -293,7 +305,7 @@ fn unread_without_projection_creates_one_recovery_intent() {
 #[test]
 fn active_batch_prevents_unread_projection_from_being_rebuilt() {
     let coordinator = coordinator();
-    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    coordinator.set_runtime_constraint("lead-1", TeamRunTargetRole::Lead, RuntimeConstraint::Ready);
     coordinator.reconcile_mailbox("lead-1", &["m1".into()], TeamRunTargetRole::Lead);
     let ReconcileDecision::Claim(batch) = coordinator.next("lead-1") else {
         panic!("recovery message must be claimable");
@@ -307,7 +319,7 @@ fn active_batch_prevents_unread_projection_from_being_rebuilt() {
 #[test]
 fn pause_cancels_running_batch_and_retains_queued_work() {
     let coordinator = coordinator();
-    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    coordinator.set_runtime_constraint("lead-1", TeamRunTargetRole::Lead, RuntimeConstraint::Ready);
     enqueue(&coordinator, WorkSource::UserMessage, "running");
     let ReconcileDecision::Claim(running) = coordinator.next("lead-1") else {
         panic!("first message must be claimable");
@@ -318,7 +330,7 @@ fn pause_cancels_running_batch_and_retains_queued_work() {
     );
     enqueue(&coordinator, WorkSource::McpSendMessage, "retained");
 
-    let paused = coordinator.pause_slot("lead-1");
+    let paused = coordinator.pause_slot("lead-1").unwrap();
     assert_eq!(paused.cancel_target.unwrap().batch, running);
     assert_eq!(
         coordinator.cancel_batch(&running, "slot_paused"),
@@ -329,9 +341,21 @@ fn pause_cancels_running_batch_and_retains_queued_work() {
 }
 
 #[test]
+fn pause_unknown_slot_fails_without_registering_it() {
+    let coordinator = coordinator();
+    let before = coordinator.snapshot();
+
+    let error = coordinator.pause_slot("missing-slot").unwrap_err();
+
+    assert!(matches!(error, TeamError::AgentNotFound(ref slot_id) if slot_id == "missing-slot"));
+    assert_eq!(coordinator.snapshot(), before);
+    assert!(coordinator.slot_snapshot("missing-slot").is_none());
+}
+
+#[test]
 fn cancel_run_terminalizes_every_associated_intent_and_lease() {
     let coordinator = coordinator();
-    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    coordinator.set_runtime_constraint("lead-1", TeamRunTargetRole::Lead, RuntimeConstraint::Ready);
     let first = coordinator
         .acquire_enqueue(EnqueueRequest {
             slot_id: "lead-1".into(),
@@ -376,7 +400,7 @@ fn cancel_run_terminalizes_every_associated_intent_and_lease() {
 #[test]
 fn background_work_continues_after_unrelated_run_completion() {
     let coordinator = coordinator();
-    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    coordinator.set_runtime_constraint("lead-1", TeamRunTargetRole::Lead, RuntimeConstraint::Ready);
     let user = coordinator
         .acquire_enqueue(EnqueueRequest {
             slot_id: "lead-1".into(),
@@ -402,7 +426,7 @@ fn background_work_continues_after_unrelated_run_completion() {
 #[test]
 fn late_terminal_after_cancel_is_rejected() {
     let coordinator = coordinator();
-    coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
+    coordinator.set_runtime_constraint("lead-1", TeamRunTargetRole::Lead, RuntimeConstraint::Ready);
     let user = coordinator
         .acquire_enqueue(EnqueueRequest {
             slot_id: "lead-1".into(),

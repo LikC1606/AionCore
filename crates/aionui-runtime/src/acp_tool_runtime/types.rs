@@ -21,7 +21,11 @@ impl ManagedAcpToolId {
     pub fn version(self) -> &'static str {
         match self {
             Self::CodexAcp => "1.1.2",
-            Self::ClaudeAgentAcp => "0.58.1",
+            // Compatibility directory selected by the bundled-resources
+            // manifest. The artifact in this slot is Claude Agent ACP 0.60.0;
+            // keeping the selector aligned with the manifest prevents Core
+            // from silently activating the retained 0.58.1 fallback slot.
+            Self::ClaudeAgentAcp => "0.39.0",
         }
     }
 
@@ -225,7 +229,7 @@ mod tests {
     #[test]
     fn managed_acp_tool_versions_match_current_pins() {
         assert_eq!(ManagedAcpToolId::CodexAcp.version(), "1.1.2");
-        assert_eq!(ManagedAcpToolId::ClaudeAgentAcp.version(), "0.58.1");
+        assert_eq!(ManagedAcpToolId::ClaudeAgentAcp.version(), "0.39.0");
     }
 }
 

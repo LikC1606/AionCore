@@ -153,27 +153,18 @@ pub(crate) enum TeamCommand {
     Context,
     Members,
     SendMessage,
-    Task(TeamTaskArgs),
+    Inspect,
+    Delegate,
+    Progress,
+    Submit,
+    Review,
+    Integrate,
+    Cancel,
     ListAssistants,
     DescribeAssistant,
     SpawnAgent,
     RenameAgent,
     ShutdownAgent,
-    #[command(external_subcommand)]
-    Unknown(Vec<OsString>),
-}
-
-#[derive(Args, Debug, Clone)]
-pub(crate) struct TeamTaskArgs {
-    #[command(subcommand)]
-    pub command: TeamTaskCommand,
-}
-
-#[derive(Subcommand, Debug, Clone)]
-pub(crate) enum TeamTaskCommand {
-    Create,
-    Update,
-    List,
     #[command(external_subcommand)]
     Unknown(Vec<OsString>),
 }
@@ -811,9 +802,6 @@ mod tests {
             &["aioncore", "team", "context"],
             &["aioncore", "team", "members"],
             &["aioncore", "team", "send-message"],
-            &["aioncore", "team", "task", "create"],
-            &["aioncore", "team", "task", "update"],
-            &["aioncore", "team", "task", "list"],
             &["aioncore", "team", "list-assistants"],
             &["aioncore", "team", "describe-assistant"],
             &["aioncore", "team", "spawn-agent"],

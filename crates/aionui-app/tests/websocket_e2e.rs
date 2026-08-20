@@ -9,7 +9,9 @@ use std::time::Duration;
 
 use aionui_api_types::WebSocketMessage;
 use aionui_app::{AppConfig, AppServices, create_router};
-use aionui_realtime::WebSocketManager;
+use aionui_db::models::TeamRow;
+use aionui_db::{ITeamRepository, SqliteTeamRepository};
+use aionui_realtime::{EventBroadcaster, WebSocketManager};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -396,6 +398,60 @@ async fn t4_3_broadcast_after_disconnect_no_error() {
 
     let msg = read_text(&mut rx2).await;
     assert_eq!(msg["name"], "after-disconnect");
+}
+
+#[tokio::test]
+async fn t4_4_team_events_reach_only_the_team_owner() {
+    let app = start_app().await;
+    SqliteTeamRepository::new(app.services.database.pool().clone())
+        .create_team(&TeamRow {
+            id: "private-team".into(),
+            user_id: "owner-user".into(),
+            name: "Private Team".into(),
+            workspace: String::new(),
+            workspace_mode: "shared".into(),
+            agents: "[]".into(),
+            lead_agent_id: None,
+            session_mode: None,
+            agents_version: "1.0.1".into(),
+            created_at: 1,
+            updated_at: 1,
+        })
+        .await
+        .unwrap();
+
+    let owner_token = sign_token(&app, "owner-user");
+    let other_token = sign_token(&app, "other-user");
+    let (_, mut owner_rx) = connect_bearer(app.addr, &owner_token).await;
+    let (_, mut other_rx) = connect_bearer(app.addr, &other_token).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    app.services.event_bus.broadcast(WebSocketMessage::new(
+        "team.agentStatusChanged",
+        json!({ "team_id": "private-team", "slot_id": "worker" }),
+    ));
+
+    let owner_event = read_text(&mut owner_rx).await;
+    assert_eq!(owner_event["name"], "team.agentStatusChanged");
+    let leaked = tokio::time::timeout(Duration::from_millis(250), async {
+        loop {
+            match other_rx.next().await {
+                Some(Ok(tungstenite::Message::Text(text))) => {
+                    let value: Value = serde_json::from_str(&text).unwrap();
+                    if value["name"] == "team.agentStatusChanged" {
+                        return;
+                    }
+                }
+                Some(Ok(_)) => {}
+                Some(Err(_)) | None => return,
+            }
+        }
+    })
+    .await;
+    assert!(
+        leaked.is_err(),
+        "another authenticated user received a private Team event"
+    );
 }
 
 // ===========================================================================

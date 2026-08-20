@@ -81,6 +81,39 @@ pub struct FileWatchService {
     debounce: Arc<DashMap<String, Instant>>,
 }
 
+/// Explicit headless-mode watch service.
+///
+/// Large benchmark campaigns run one isolated Core per agent. Those runtimes
+/// never use the desktop file-watch routes, and allocating an inotify instance
+/// per Core exhausts the host-wide per-user instance limit before the agents
+/// can start. The application selects this implementation only when the
+/// operator-owned headless policy is enabled.
+#[derive(Default)]
+pub struct DisabledFileWatchService;
+
+#[async_trait::async_trait]
+impl crate::traits::IFileWatchService for DisabledFileWatchService {
+    async fn start_watch(&self, _file_path: &str) -> Result<(), FileError> {
+        Ok(())
+    }
+
+    async fn stop_watch(&self, _file_path: &str) -> Result<(), FileError> {
+        Ok(())
+    }
+
+    async fn stop_all_watches(&self) -> Result<(), FileError> {
+        Ok(())
+    }
+
+    async fn start_office_watch(&self, _workspace: &str) -> Result<(), FileError> {
+        Ok(())
+    }
+
+    async fn stop_office_watch(&self, _workspace: &str) -> Result<(), FileError> {
+        Ok(())
+    }
+}
+
 impl FileWatchService {
     /// Create a new watch service backed by the platform's recommended watcher.
     pub fn new(broadcaster: Arc<dyn EventBroadcaster>) -> Result<Self, FileError> {

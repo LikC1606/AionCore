@@ -1,5 +1,7 @@
 #![allow(clippy::disallowed_types)]
 
+mod team_work_commands;
+
 use std::sync::Arc;
 
 use axum::Router;
@@ -13,18 +15,24 @@ use aionui_api_types::{
     AddAgentRequest, ApiResponse, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest,
     GetConfigOptionsResponse, PauseTeamSlotRequest, RenameAgentRequest, RenameTeamRequest, SendAgentMessageRequest,
     SendTeamMessageRequest, SetModeRequest, TeamAgentResponse, TeamListResponse, TeamResponse, TeamRunAckResponse,
-    TeamRunStateResponse,
+    TeamRunStateResponse, TeamWorkEventResponse, TeamWorkItemResponse, TeamWorkItemSnapshotResponse,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
 use aionui_db::DbError;
 
 use crate::error::{TeamError, classify_public_error};
-use crate::service::TeamSessionService;
+use crate::service::{
+    TeamCommandService, TeamDeliveryService, TeamQueryError, TeamQueryService, TeamSessionService, TeamWorkCoordinator,
+};
 
 #[derive(Clone)]
 pub struct TeamRouterState {
     pub service: Arc<TeamSessionService>,
+    pub command_service: Arc<TeamCommandService>,
+    pub work_coordinator: Arc<TeamWorkCoordinator>,
+    pub delivery_service: Arc<TeamDeliveryService>,
+    pub query_service: Arc<TeamQueryService>,
     pub active_leases: Arc<ActiveLeaseRegistry>,
 }
 
@@ -43,7 +51,6 @@ impl From<TeamError> for ApiError {
         match err {
             TeamError::TeamNotFound(msg) => ApiError::NotFound(msg),
             TeamError::AgentNotFound(msg) => ApiError::NotFound(msg),
-            TeamError::TaskNotFound(msg) => ApiError::NotFound(msg),
             TeamError::InvalidRequest(msg) => {
                 if let Some(public) = classify_public_error(&msg) {
                     ApiError::coded(StatusCode::BAD_REQUEST, public.code, msg, public.details)
@@ -54,7 +61,6 @@ impl From<TeamError> for ApiError {
             TeamError::LeaderOnly(msg) => ApiError::Forbidden(msg),
             TeamError::Forbidden(msg) => ApiError::Forbidden(msg),
             TeamError::SessionNotFound(msg) => ApiError::NotFound(msg),
-            TeamError::BlockedTaskNotFound(msg) => ApiError::BadRequest(msg),
             TeamError::BackendNotAllowed(msg) => ApiError::BadRequest(msg),
             TeamError::DuplicateAgentName(msg) => ApiError::BadRequest(format!("Agent name already taken: {msg}")),
             TeamError::RuntimeNotReady { conversation_id } => ApiError::coded(
@@ -87,14 +93,54 @@ impl From<TeamError> for ApiError {
     }
 }
 
+impl From<TeamQueryError> for ApiError {
+    fn from(err: TeamQueryError) -> Self {
+        match err {
+            TeamQueryError::TeamNotFound(team_id) => ApiError::NotFound(format!("Team not found: {team_id}")),
+            TeamQueryError::ForbiddenTeam => ApiError::Forbidden("Team is not owned by current user".into()),
+            TeamQueryError::WorkItemNotFound(work_item_id) => {
+                ApiError::NotFound(format!("WorkItem not found: {work_item_id}"))
+            }
+            TeamQueryError::ConcurrentSnapshotChange => {
+                ApiError::Conflict("Team Mode state changed while it was being read; retry the request".into())
+            }
+            TeamQueryError::CorruptStoredState { .. } => ApiError::Internal("Stored Team Mode state is invalid".into()),
+            TeamQueryError::Database(error) => db_error_to_api_error(error),
+        }
+    }
+}
+
 pub fn team_routes(state: TeamRouterState) -> Router {
     Router::new()
         .route("/api/teams", post(create_team).get(list_teams))
         .route("/api/teams/{id}", get(get_team).delete(remove_team))
         .route("/api/teams/{id}/run-state", get(get_run_state))
+        .route("/api/teams/{id}/work-items", get(list_work_items))
+        .route(
+            "/api/teams/{id}/work-items/delegate",
+            post(team_work_commands::delegate_work),
+        )
+        .route("/api/teams/{id}/work-items/{work_item_id}", get(get_work_item))
+        .route(
+            "/api/teams/{id}/work-items/{work_item_id}/review",
+            post(team_work_commands::review_work),
+        )
+        .route(
+            "/api/teams/{id}/work-items/{work_item_id}/cancel",
+            post(team_work_commands::cancel_work),
+        )
+        .route(
+            "/api/teams/{id}/work-items/{work_item_id}/integrate",
+            post(team_work_commands::integrate_work),
+        )
+        .route(
+            "/api/teams/{id}/work-items/{work_item_id}/events",
+            get(list_work_item_events),
+        )
         .route("/api/teams/{id}/name", axum::routing::patch(rename_team))
         .route("/api/teams/{id}/agents", post(add_agent))
         .route("/api/teams/{id}/agents/{slot_id}", axum::routing::delete(remove_agent))
+        .route("/api/teams/{id}/agents/{slot_id}/runtime", post(ensure_agent_runtime))
         .route(
             "/api/teams/{id}/agents/{slot_id}/name",
             axum::routing::patch(rename_agent),
@@ -154,6 +200,45 @@ async fn get_run_state(
 ) -> Result<Json<ApiResponse<TeamRunStateResponse>>, ApiError> {
     let run_state = state.service.get_run_state(&user.id, &id).await?;
     Ok(Json(ApiResponse::ok(run_state)))
+}
+
+#[derive(serde::Deserialize)]
+struct WorkItemPathParams {
+    id: String,
+    work_item_id: String,
+}
+
+async fn list_work_items(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<Vec<TeamWorkItemResponse>>>, ApiError> {
+    let work_items = state.query_service.list_work_items(&user.id, &id).await?;
+    Ok(Json(ApiResponse::ok(work_items)))
+}
+
+async fn get_work_item(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(params): Path<WorkItemPathParams>,
+) -> Result<Json<ApiResponse<TeamWorkItemSnapshotResponse>>, ApiError> {
+    let snapshot = state
+        .query_service
+        .get_work_item_snapshot(&user.id, &params.id, &params.work_item_id)
+        .await?;
+    Ok(Json(ApiResponse::ok(snapshot)))
+}
+
+async fn list_work_item_events(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(params): Path<WorkItemPathParams>,
+) -> Result<Json<ApiResponse<Vec<TeamWorkEventResponse>>>, ApiError> {
+    let events = state
+        .query_service
+        .list_work_item_events(&user.id, &params.id, &params.work_item_id)
+        .await?;
+    Ok(Json(ApiResponse::ok(events)))
 }
 
 async fn remove_team(
@@ -241,7 +326,7 @@ async fn send_message(
     let Json(req) = body.map_err(ApiError::from)?;
     let ack = state
         .service
-        .send_message(&user.id, &id, &req.content, req.files)
+        .send_message_with_idempotency(&user.id, &id, &req.content, req.files, req.idempotency_key)
         .await?;
     Ok(Json(ApiResponse::ok(ack)))
 }
@@ -255,9 +340,28 @@ async fn send_message_to_agent(
     let Json(req) = body.map_err(ApiError::from)?;
     let ack = state
         .service
-        .send_message_to_agent(&user.id, &params.id, &params.slot_id, &req.content, req.files)
+        .send_message_to_agent(
+            &user.id,
+            &params.id,
+            &params.slot_id,
+            &req.content,
+            req.files,
+            req.idempotency_key,
+        )
         .await?;
     Ok(Json(ApiResponse::ok(ack)))
+}
+
+async fn ensure_agent_runtime(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(params): Path<AgentPathParams>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    state
+        .service
+        .ensure_agent_runtime(&user.id, &params.id, &params.slot_id)
+        .await?;
+    Ok(Json(ApiResponse::success()))
 }
 
 async fn cancel_run(
@@ -386,12 +490,6 @@ mod tests {
     }
 
     #[test]
-    fn task_not_found_maps_to_app_not_found() {
-        let err: ApiError = TeamError::TaskNotFound("tk-1".into()).into();
-        assert!(matches!(err, ApiError::NotFound(_)));
-    }
-
-    #[test]
     fn invalid_request_maps_to_bad_request() {
         let err: ApiError = TeamError::InvalidRequest("empty agents".into()).into();
         assert!(matches!(err, ApiError::BadRequest(_)));
@@ -439,12 +537,6 @@ mod tests {
     fn session_not_found_maps_to_not_found() {
         let err: ApiError = TeamError::SessionNotFound("t1".into()).into();
         assert!(matches!(err, ApiError::NotFound(_)));
-    }
-
-    #[test]
-    fn blocked_task_not_found_maps_to_bad_request() {
-        let err: ApiError = TeamError::BlockedTaskNotFound("tk-x".into()).into();
-        assert!(matches!(err, ApiError::BadRequest(_)));
     }
 
     #[test]

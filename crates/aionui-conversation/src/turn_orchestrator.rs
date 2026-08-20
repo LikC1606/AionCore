@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
 use aionui_ai_agent::{AgentError, AgentInstance, AgentSendError, AgentSessionKind, IWorkerTaskManager};
@@ -11,7 +12,8 @@ use crate::agent_health_policy::{AgentHealthAction, AgentHealthPolicy};
 use crate::runtime_state::RuntimeLifecycleState;
 use crate::runtime_state::TurnClaim;
 use crate::service::{
-    ConversationService, MAX_SYSTEM_RESPONSE_CONTINUATIONS_PER_TURN, agent_error_top_level_code, persist_session_key,
+    ConversationAgentTurnStarted, ConversationAgentTurnStartedCallback, ConversationService,
+    MAX_SYSTEM_RESPONSE_CONTINUATIONS_PER_TURN, agent_error_top_level_code, persist_session_key,
 };
 use crate::stream_relay::{RelayOutcome, StreamRelay, TurnAttemptSummary};
 use crate::turn_continuation_policy::{ContinuationDecision, TurnContinuationPolicy};
@@ -34,6 +36,10 @@ pub(crate) struct TurnStartInput {
     pub stored_workspace: String,
     pub turn_id: String,
     pub turn_claim: TurnClaim,
+    /// Fires exactly once after the first prompt has been accepted by the
+    /// Agent task. Task-option resolution, task build, workspace persistence,
+    /// runtime-mode setup, and `send_message` failures are all pre-acceptance.
+    pub on_started: Option<ConversationAgentTurnStartedCallback>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +70,8 @@ struct TurnAttemptInput {
     required_runtime_mode: Option<String>,
     continuation_count: usize,
     defer_clean_terminal_errors: bool,
+    on_started: Option<ConversationAgentTurnStartedCallback>,
+    prompt_accepted: Arc<AtomicBool>,
 }
 
 struct TurnAttemptResult {
@@ -263,48 +271,71 @@ impl ConversationTurnOrchestrator {
             let feedback_service = self.service.clone();
             let feedback_agent_id = availability_agent_id.clone();
             let (send_error_tx, send_error_rx) = oneshot::channel();
+            let on_started = input.on_started.clone();
+            let prompt_accepted = Arc::clone(&input.prompt_accepted);
 
-            tokio::spawn(async move {
-                if let Err(e) = send_agent.send_message(current_send).await {
-                    let failure_message = send_error_display_message(&e);
-                    record_agent_session_failure(
-                        &feedback_service,
-                        feedback_agent_id.as_deref(),
-                        "session_send_failed",
-                        &failure_message,
-                    )
-                    .await;
-                    let task_status = send_agent.status();
-                    let agent_type = send_agent.agent_type();
-                    error!(
-                        conversation_id = %conv_id_send,
-                        turn_id = %turn_id_for_send,
-                        ?agent_type,
-                        ?task_status,
-                        error = %ErrorChain(&e),
-                        "Agent send_message failed"
-                    );
-                    if task_status == Some(ConversationStatus::Finished) {
-                        debug!(
+            let send_task = tokio::spawn(async move {
+                match send_agent.send_message(current_send).await {
+                    Ok(()) => {
+                        if !prompt_accepted.swap(true, Ordering::SeqCst)
+                            && let Some(on_started) = on_started
+                        {
+                            on_started(ConversationAgentTurnStarted {
+                                conversation_id: conv_id_send,
+                                turn_id: turn_id_for_send,
+                            })
+                            .await;
+                        }
+                    }
+                    Err(e) => {
+                        let failure_message = send_error_display_message(&e);
+                        record_agent_session_failure(
+                            &feedback_service,
+                            feedback_agent_id.as_deref(),
+                            "session_send_failed",
+                            &failure_message,
+                        )
+                        .await;
+                        let task_status = send_agent.status();
+                        let agent_type = send_agent.agent_type();
+                        error!(
                             conversation_id = %conv_id_send,
                             turn_id = %turn_id_for_send,
                             ?agent_type,
-                            "Agent send_message failed on finished task; relay will prefer any runtime terminal before fallback"
+                            ?task_status,
+                            error = %ErrorChain(&e),
+                            "Agent send_message failed"
                         );
+                        if task_status == Some(ConversationStatus::Finished) {
+                            debug!(
+                                conversation_id = %conv_id_send,
+                                turn_id = %turn_id_for_send,
+                                ?agent_type,
+                                "Agent send_message failed on finished task; relay will prefer any runtime terminal before fallback"
+                            );
+                        }
+                        warn!(
+                            conversation_id = %conv_id_send,
+                            turn_id = %turn_id_for_send,
+                            ?agent_type,
+                            code = ?e.code(),
+                            ownership = ?e.ownership(),
+                            "Agent send_message returned error; offering fallback stream error to relay"
+                        );
+                        let _ = send_error_tx.send(e);
                     }
-                    warn!(
-                        conversation_id = %conv_id_send,
-                        turn_id = %turn_id_for_send,
-                        ?agent_type,
-                        code = ?e.code(),
-                        ownership = ?e.ownership(),
-                        "Agent send_message returned error; offering fallback stream error to relay"
-                    );
-                    let _ = send_error_tx.send(e);
                 }
             });
 
             let outcome = relay.consume_with_send_error(rx, send_error_rx).await;
+            if let Err(error) = send_task.await {
+                error!(
+                    conversation_id = %input.conv_id,
+                    turn_id = %input.turn_id,
+                    error = %error,
+                    "Agent send task terminated unexpectedly"
+                );
+            }
             aggregate_summary.merge(&outcome.attempt);
 
             if let Some(session_key) = agent.get_session_key() {
@@ -365,6 +396,7 @@ impl ConversationTurnOrchestrator {
         let mut replay_started_at = None;
         let mut final_error_message;
         let mut auth_failure = false;
+        let prompt_accepted = Arc::new(AtomicBool::new(false));
 
         info!(conversation_id = %conv_id, turn_id = %turn_id, "conversation turn orchestrator started");
 
@@ -383,6 +415,8 @@ impl ConversationTurnOrchestrator {
                     required_runtime_mode: input.required_runtime_mode.clone(),
                     continuation_count: 0,
                     defer_clean_terminal_errors: !replayed,
+                    on_started: input.on_started.clone(),
+                    prompt_accepted: Arc::clone(&prompt_accepted),
                 })
                 .await
             {

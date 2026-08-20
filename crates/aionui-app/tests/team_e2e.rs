@@ -304,6 +304,66 @@ async fn tc3c_team_conversation_rejects_standalone_runtime_ensure() {
     assert_eq!(body["details"]["team_id"], data["id"]);
 }
 
+#[tokio::test]
+async fn tc3d_team_conversation_snapshot_bootstrap_is_one_shot() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let data = create_team(&mut app, &services, &token, &csrf).await;
+    let conversation_id = data["assistants"][0]["conversation_id"].as_str().unwrap();
+
+    let identity_req = json_with_token(
+        "PATCH",
+        &format!("/api/conversations/{conversation_id}"),
+        json!({ "extra": { "slot_id": "forged-slot" } }),
+        &token,
+        &csrf,
+    );
+    let identity_resp = app.clone().oneshot(identity_req).await.unwrap();
+    assert_eq!(identity_resp.status(), StatusCode::BAD_REQUEST);
+
+    let snapshot = json!({
+        "skills": ["cron", "pdf"],
+        "mcp_server_ids": [],
+        "mcp_servers": [],
+        "mcp_statuses": [],
+        "session_mcp_servers": [],
+    });
+    let bootstrap_req = json_with_token(
+        "PATCH",
+        &format!("/api/conversations/{conversation_id}"),
+        json!({ "extra": snapshot }),
+        &token,
+        &csrf,
+    );
+    let bootstrap_resp = app.clone().oneshot(bootstrap_req).await.unwrap();
+    assert_eq!(bootstrap_resp.status(), StatusCode::OK);
+    let bootstrap_body = body_json(bootstrap_resp).await;
+    assert_eq!(bootstrap_body["data"]["extra"]["skills"], json!(["cron", "pdf"]));
+    assert!(bootstrap_body["data"]["extra"]["_team_snapshot_bootstrap_pending"].is_null());
+
+    let repeat_req = json_with_token(
+        "PATCH",
+        &format!("/api/conversations/{conversation_id}"),
+        json!({
+            "extra": {
+                "skills": ["other"],
+                "mcp_server_ids": [],
+                "mcp_servers": [],
+                "mcp_statuses": [],
+                "session_mcp_servers": [],
+            }
+        }),
+        &token,
+        &csrf,
+    );
+    let repeat_resp = app.oneshot(repeat_req).await.unwrap();
+    assert_eq!(repeat_resp.status(), StatusCode::BAD_REQUEST);
+    let repeat_body = body_json(repeat_resp).await;
+    assert_eq!(repeat_body["code"], "BAD_REQUEST");
+    assert!(repeat_body["error"].as_str().unwrap_or_default().contains("immutable"));
+}
+
 // TC-4: Explicit lead role is returned first
 #[tokio::test]
 async fn tc4_explicit_lead_is_returned_first() {
@@ -621,7 +681,7 @@ async fn trs2_run_state_returns_active_run_payload() {
     assert!(body["data"]["active_run"]["starting_batch_count"].is_number());
     assert!(body["data"]["active_run"]["running_batch_count"].is_number());
     assert!(body["data"]["active_run"]["active_enqueue_lease_count"].is_number());
-    assert!(body["data"]["active_run"]["slot_work"].as_array().unwrap().len() >= 1);
+    assert!(!body["data"]["active_run"]["slot_work"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1118,6 +1178,30 @@ async fn es1b_team_mcp_list_assistants_matches_assistant_projection() {
         "Team MCP runtime assistant list must match /api/assistants team_selectable projection"
     );
 
+    let describe_resp = mcp_call_tool(
+        &mut stream,
+        3,
+        "team_describe_assistant",
+        json!({
+            "assistant_id": DEFAULT_TEAM_ASSISTANT_ID,
+            "locale": "en-US"
+        }),
+    )
+    .await;
+    assert!(
+        !describe_resp["result"]["isError"].as_bool().unwrap_or(false),
+        "team_describe_assistant failed: {describe_resp}"
+    );
+    let description: Value = serde_json::from_str(mcp_text(&describe_resp)).expect("team_describe_assistant JSON");
+    assert_eq!(description["status"], "ok");
+    assert_eq!(description["assistant_id"], DEFAULT_TEAM_ASSISTANT_ID);
+    assert_eq!(description["name"], "Team E2E Assistant");
+    assert!(
+        description["description_markdown"]
+            .as_str()
+            .is_some_and(|value| { value.contains(DEFAULT_TEAM_ASSISTANT_ID) && value.contains("team_spawn_agent") })
+    );
+
     let stop_req = delete_with_token(&format!("/api/teams/{team_id}/session"), &token, &csrf);
     let stop_resp = app.oneshot(stop_req).await.unwrap();
     assert_eq!(stop_resp.status(), StatusCode::OK);
@@ -1378,6 +1462,72 @@ async fn sa1_send_message_to_agent() {
     );
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn sa2_send_message_to_agent_idempotency_survives_http_route() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let data = create_team(&mut app, &services, &token, &csrf).await;
+    let team_id = data["id"].as_str().unwrap();
+    let worker = &data["assistants"][1];
+    let slot_id = worker["slot_id"].as_str().unwrap();
+    let conversation_id = worker["conversation_id"].as_str().unwrap();
+
+    let start = json_with_token(
+        "POST",
+        &format!("/api/teams/{team_id}/session"),
+        json!({}),
+        &token,
+        &csrf,
+    );
+    let start_response = app.clone().oneshot(start).await.unwrap();
+    assert_eq!(start_response.status(), StatusCode::OK);
+
+    let endpoint = format!("/api/teams/{team_id}/agents/{slot_id}/messages");
+    let body = json!({
+        "content": "Only one durable intervention",
+        "idempotency_key": "terminal-receipt:team-e2e:slot-1:turn-1"
+    });
+    let first = app
+        .clone()
+        .oneshot(json_with_token("POST", &endpoint, body.clone(), &token, &csrf))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_body = body_json(first).await;
+
+    let second = app
+        .clone()
+        .oneshot(json_with_token("POST", &endpoint, body, &token, &csrf))
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+    let second_body = body_json(second).await;
+    assert_eq!(first_body["data"]["message_id"], second_body["data"]["message_id"]);
+
+    let repo = aionui_db::SqliteConversationRepository::new(services.database.pool().clone());
+    let messages = repo
+        .list_messages_page(
+            conversation_id,
+            &MessagePageParams {
+                limit: 50,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        messages
+            .items
+            .iter()
+            .filter(
+                |row| row.position.as_deref() == Some("right") && row.content.contains("Only one durable intervention")
+            )
+            .count(),
+        1
+    );
 }
 
 // ===========================================================================

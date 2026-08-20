@@ -3,7 +3,9 @@
 //! File system operations: read/write, path safety, file watching, snapshots, and zip.
 pub mod browse;
 pub mod error;
+pub mod git_delivery;
 pub mod path_safety;
+pub mod project_git;
 pub mod routes;
 pub mod service;
 pub mod snapshot_service;
@@ -23,4 +25,4 @@ pub use types::{
     CompareResult, ContentUpdateEvent, ContentUpdateOperation, CopyResult, DirOrFile, FileChangeInfo, FileMetadata,
     FileWatchEvent, OfficeFileAddedEvent, SnapshotInfo, SnapshotMode, WorkspaceFlatFile, ZipEntry,
 };
-pub use watch_service::FileWatchService;
+pub use watch_service::{DisabledFileWatchService, FileWatchService};

@@ -103,6 +103,52 @@ impl WebSocketManager {
         }
     }
 
+    /// Send an event only to connections whose authenticated token resolves
+    /// to `user_id`.
+    ///
+    /// Token resolution is supplied by the application boundary so this crate
+    /// stays independent from the concrete authentication implementation.
+    /// Invalid, expired, or revoked tokens must resolve to `None` and are
+    /// skipped.
+    pub fn broadcast_to_user(
+        &self,
+        user_id: &str,
+        msg: WebSocketMessage<serde_json::Value>,
+        resolve_user: &(dyn Fn(&str) -> Option<String> + Send + Sync),
+    ) {
+        let text = match serde_json::to_string(&msg) {
+            Ok(text) => text,
+            Err(error) => {
+                warn!(error = %error, "failed to serialize user-scoped message");
+                return;
+            }
+        };
+
+        let mut disconnected = Vec::new();
+        for entry in self.connections.iter() {
+            let conn_id = *entry.key();
+            let client = entry.value();
+            if resolve_user(&client.token).as_deref() != Some(user_id) {
+                continue;
+            }
+            match client.tx.try_send(WsOutbound::Text(text.clone())) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    warn!(
+                        %conn_id,
+                        code = RealtimeError::Backpressure.code(),
+                        "outbound channel full, user-scoped message dropped"
+                    );
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => disconnected.push(conn_id),
+            }
+        }
+
+        for conn_id in disconnected {
+            self.remove_client(conn_id);
+        }
+    }
+
     /// Send a message to a specific connection.
     pub fn send_to(&self, conn_id: ConnectionId, msg: WebSocketMessage<serde_json::Value>) {
         let text = match serde_json::to_string(&msg) {
@@ -364,6 +410,32 @@ mod tests {
             }
             _ => panic!("expected Text messages"),
         }
+    }
+
+    #[test]
+    fn broadcast_to_user_never_reaches_another_user() {
+        let mgr = WebSocketManager::new();
+        let (alice_tx, mut alice_rx) = new_client_tx();
+        let (bob_tx, mut bob_rx) = new_client_tx();
+        let (expired_tx, mut expired_rx) = new_client_tx();
+        mgr.add_client("token-alice".into(), alice_tx);
+        mgr.add_client("token-bob".into(), bob_tx);
+        mgr.add_client("token-expired".into(), expired_tx);
+
+        let resolver = |token: &str| match token {
+            "token-alice" => Some("alice".to_owned()),
+            "token-bob" => Some("bob".to_owned()),
+            _ => None,
+        };
+        mgr.broadcast_to_user(
+            "alice",
+            WebSocketMessage::new("team.changed", json!({ "team_id": "team-a" })),
+            &resolver,
+        );
+
+        assert!(alice_rx.try_recv().is_ok());
+        assert!(bob_rx.try_recv().is_err());
+        assert!(expired_rx.try_recv().is_err());
     }
 
     #[test]

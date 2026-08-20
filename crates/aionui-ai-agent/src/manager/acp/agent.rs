@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
-use super::agent_session_flow::PromptOutcome;
+use super::agent_session_flow::{PromptAttemptFailure, PromptOutcome};
 use super::error_mapping::AcpSendFailure;
 use super::mcp_startup_gate::McpStartupGate;
 
@@ -322,6 +322,12 @@ fn mark_session_opened_after_protocol_ready(
     }
     session.mark_opened();
     Ok(sid)
+}
+
+const MAX_PROMPT_SESSION_REBUILDS: usize = 1;
+
+fn prompt_session_recovery_available(completed_rebuilds: usize) -> bool {
+    completed_rebuilds < MAX_PROMPT_SESSION_REBUILDS
 }
 
 pub struct AcpAgentManager {
@@ -1052,45 +1058,88 @@ impl AcpAgentManager {
     /// on `AcpSession` (e.g. `pending_session_new_prelude`,
     /// flags) and prepends the appropriate block when set.
     async fn ensure_session_and_send(&self, data: &SendMessageData) -> Result<PromptOutcome, AcpSendFailure> {
-        let sid = self.ensure_session_opened().await.map_err(AcpSendFailure::from)?;
-        if !self.mcp_startup_gate.wait().await {
-            info!(
-                conversation_id = %self.params.conversation_id,
-                session_id = %sid,
-                "ACP first prompt suppressed because MCP startup wait was cancelled"
-            );
-            return Ok(PromptOutcome::Cancelled { session_id: sid });
-        }
+        let mut sid = self.ensure_session_opened().await.map_err(AcpSendFailure::from)?;
         self.runtime.reset_for_new_turn(ConversationStatus::Running);
         let raw_user_input = data.content.clone();
-        let matched_command = {
-            let session = self.session.read().await;
-            session
-                .available_commands()
-                .and_then(|commands| matched_slash_command(&raw_user_input, commands))
-        };
+        let mut stale_session_rebuilds = 0;
 
-        let content = {
-            let mut s = self.session.write().await;
-            let mut ctx = PromptCtx {
-                session: &mut s,
-                params: &self.params,
-                skill_manager: &self.skill_manager,
-                runtime: &self.runtime,
+        loop {
+            if !self.mcp_startup_gate.wait().await {
+                info!(
+                    conversation_id = %self.params.conversation_id,
+                    session_id = %sid,
+                    "ACP prompt suppressed because MCP startup wait was cancelled"
+                );
+                return Ok(PromptOutcome::Cancelled { session_id: sid });
+            }
+
+            let matched_command = {
+                let session = self.session.read().await;
+                session
+                    .available_commands()
+                    .and_then(|commands| matched_slash_command(&raw_user_input, commands))
             };
-            let transformed = self.pipeline.pre_send(&mut ctx, data.content.clone()).await;
-            self.commit_session_changes(&mut s).await;
-            transformed
-        };
 
-        self.dump_acp_final_input(&sid, data, &content);
+            // Always transform from the original user input. If a stale ACP
+            // session is rebuilt, session/new arms the one-shot prelude again;
+            // replaying already-transformed content would duplicate or omit it.
+            let content = {
+                let mut s = self.session.write().await;
+                let mut ctx = PromptCtx {
+                    session: &mut s,
+                    params: &self.params,
+                    skill_manager: &self.skill_manager,
+                    runtime: &self.runtime,
+                };
+                let transformed = self.pipeline.pre_send(&mut ctx, raw_user_input.clone()).await;
+                self.commit_session_changes(&mut s).await;
+                transformed
+            };
 
-        let data = SendMessageData {
-            content,
-            ..data.clone()
-        };
-        self.prompt_existing_session(&data, Some(&sid), matched_command.as_ref())
-            .await
+            self.dump_acp_final_input(&sid, data, &content);
+
+            let prompt_data = SendMessageData {
+                content,
+                ..data.clone()
+            };
+            match self
+                .prompt_existing_session(&prompt_data, Some(&sid), matched_command.as_ref())
+                .await
+            {
+                Ok(outcome) => return Ok(outcome),
+                Err(PromptAttemptFailure::SessionNotFoundWithoutOutput(error))
+                    if prompt_session_recovery_available(stale_session_rebuilds) =>
+                {
+                    stale_session_rebuilds += 1;
+                    sid = self
+                        .rebuild_opened_session_after_prompt_not_found(&sid, &error)
+                        .await
+                        .map_err(AcpSendFailure::from)?;
+                }
+                Err(error) => return Err(error.into_send_failure()),
+            }
+        }
+    }
+
+    async fn rebuild_opened_session_after_prompt_not_found(
+        &self,
+        stale_sid: &str,
+        error: &AcpError,
+    ) -> Result<String, AgentError> {
+        let _lock = self.session_lock.lock().await;
+        self.ensure_protocol_connected_for_operation("rebuild_after_prompt_session_not_found")?;
+
+        let sid = self.rebuild_after_session_not_found(stale_sid, error).await?;
+        let mut session = self.session.write().await;
+        let sid = mark_session_opened_after_protocol_ready(
+            &mut session,
+            sid,
+            self.protocol.is_connected(),
+            &self.params.conversation_id,
+            self.backend(),
+        )?;
+        self.commit_session_changes(&mut session).await;
+        Ok(sid)
     }
 
     fn dump_acp_final_input(&self, session_id: &str, data: &SendMessageData, final_content: &str) {
@@ -1814,6 +1863,13 @@ mod tests {
             !session.is_opened(),
             "warmup must not mark the aggregate opened when the protocol is already disconnected"
         );
+    }
+
+    #[test]
+    fn stale_prompt_session_recovery_budget_allows_exactly_one_rebuild() {
+        assert!(super::prompt_session_recovery_available(0));
+        assert!(!super::prompt_session_recovery_available(1));
+        assert!(!super::prompt_session_recovery_available(2));
     }
 
     #[test]

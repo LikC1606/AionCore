@@ -1,6 +1,5 @@
 mod common;
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use aionui_api_types::{
@@ -14,11 +13,9 @@ use aionui_team::message_projection::{
     TeamProjectionSource,
 };
 use aionui_team::prompts::{AvailableAssistant, build_lead_prompt, build_teammate_prompt, build_wake_payload};
-use aionui_team::types::{
-    MailboxMessage, MailboxMessageType, TaskStatus, TeamAgent, TeamTask, TeammateRole, TeammateStatus,
-};
+use aionui_team::types::{MailboxMessage, MailboxMessageType, TeamAgent, TeammateRole, TeammateStatus};
 use aionui_team::visibility::TeamVisibilityPolicy;
-use aionui_team::{Mailbox, TaskBoard, TeammateManager};
+use aionui_team::{Mailbox, TeammateManager};
 use async_trait::async_trait;
 use common::MockTeamRepo;
 
@@ -46,10 +43,6 @@ impl EventBroadcaster for RecordingBroadcaster {
     fn broadcast(&self, event: WebSocketMessage<serde_json::Value>) {
         self.events.lock().unwrap().push(event);
     }
-}
-
-fn roster(ids: &[&str]) -> HashSet<String> {
-    ids.iter().map(|id| (*id).to_owned()).collect()
 }
 
 #[derive(Default)]
@@ -316,7 +309,7 @@ fn lp1_lead_prompt_does_not_contain_member_snapshot() {
     assert!(!prompt.contains("- Lead ("), "lead snapshot leaked");
     assert!(!prompt.contains("- Alice ("), "teammate Alice snapshot leaked");
     assert!(!prompt.contains("- Bob ("), "teammate Bob snapshot leaked");
-    assert!(prompt.to_lowercase().contains("first team turn"));
+    assert!(prompt.contains("canonical WorkItem state"));
     assert!(prompt.contains("team_members"));
 }
 
@@ -333,8 +326,12 @@ fn lp2_lead_prompt_contains_tool_descriptions() {
     let expected_tools = [
         "team_send_message",
         "team_spawn_agent",
-        "team_task_create",
-        "team_task_list",
+        "team_inspect",
+        "team_delegate",
+        "team_progress",
+        "team_submit",
+        "team_review",
+        "team_cancel",
         "team_members",
         "team_rename_agent",
         "team_shutdown_agent",
@@ -346,23 +343,20 @@ fn lp2_lead_prompt_contains_tool_descriptions() {
     assert!(!prompt.contains("## Available Assistants for Spawning"));
 }
 
-// -- LP-3: Lead prompt contains task management guidance ---------------------
+// -- LP-3: Lead prompt contains compact work management guidance --------------
 
 #[test]
-fn lp3_lead_prompt_contains_task_management_guidance() {
+fn lp3_lead_prompt_contains_work_management_guidance() {
     let lead = make_agent("lead-1", "Lead", TeammateRole::Lead);
     let prompt = build_lead_prompt(&lead, "Gamma", &[], &default_assistants());
 
     assert!(
-        prompt.contains("Break the work into tasks"),
+        prompt.contains("Delegate bounded WorkItems"),
         "missing decompose guidance"
     );
-    assert!(prompt.contains("Assign tasks"), "missing assign guidance");
-    assert!(prompt.contains("dependency"), "missing dependency guidance");
-    assert!(
-        prompt.contains("When teammates report back"),
-        "missing teammate result-review guidance"
-    );
+    assert!(prompt.contains("team_review"), "missing review guidance");
+    assert!(prompt.contains("synthesize"), "missing synthesis guidance");
+    assert!(!prompt.contains("team_task_"), "legacy task protocol leaked");
 }
 
 // -- TP-1: Teammate prompt contains execution guidance -----------------------
@@ -375,16 +369,15 @@ fn tp1_teammate_prompt_contains_execution_guidance() {
 
     assert!(prompt.contains("## Team Governance"), "missing governance");
     assert!(
-        prompt.contains("You MUST use the `team_*` MCP tools for ALL team coordination."),
+        prompt.contains("backend is authoritative"),
         "missing canonical coordination rule"
     );
-    assert!(prompt.contains("## How to Work"), "missing execution guidance");
+    assert!(prompt.contains("## Allowed Actions"), "missing execution guidance");
     assert!(prompt.contains("team_send_message"), "missing communication tool");
-    assert!(prompt.contains("team_task_update"), "missing task update tool");
-    assert!(prompt.contains("shutdown_request"), "missing shutdown protocol");
+    assert!(prompt.contains("team_progress"), "missing progress tool");
     assert!(prompt.contains("shutdown_approved"), "missing shutdown_approved");
-    assert!(prompt.contains("STOP GENERATING"), "missing stop protocol");
-    assert!(prompt.contains("Slot ID: w1"), "missing teammate slot id");
+    assert!(prompt.contains("end the turn"), "missing stop protocol");
+    assert!(prompt.contains("Identity: Worker1 (`w1`)"), "missing teammate slot id");
     assert!(
         !prompt.contains("Teammates:"),
         "static teammate list must not be injected"
@@ -433,7 +426,7 @@ fn wp1_wake_payload_includes_unread_messages() {
             created_at: 0,
         },
     ];
-    let payload = build_wake_payload(&agent, &[], &messages, &roster(&["lead-1", "w1", "w2"]));
+    let payload = build_wake_payload(&agent, &messages, None);
 
     assert!(payload.contains("Feature X is done"));
     assert!(payload.contains("`w1`"));
@@ -443,54 +436,19 @@ fn wp1_wake_payload_includes_unread_messages() {
     assert!(payload.contains("Summary: Finished task Y"));
 }
 
-// -- WP-2: Wake payload includes current task list ---------------------------
+// -- WP-2: Wake payload includes current canonical work summary ---------------
 
 #[test]
-fn wp2_wake_payload_includes_task_list() {
+fn wp2_wake_payload_includes_canonical_work_summary() {
     let agent = make_agent("lead-1", "Lead", TeammateRole::Lead);
-    let tasks = vec![
-        TeamTask {
-            id: "aaaaaaaa-1111-2222-3333-444444444444".into(),
-            team_id: "t1".into(),
-            subject: "Implement auth".into(),
-            description: None,
-            status: TaskStatus::InProgress,
-            owner: Some("w1".into()),
-            blocked_by: vec![],
-            blocks: vec![],
-            metadata: None,
-            created_at: 0,
-            updated_at: 0,
-        },
-        TeamTask {
-            id: "bbbbbbbb-1111-2222-3333-444444444444".into(),
-            team_id: "t1".into(),
-            subject: "Write tests".into(),
-            description: None,
-            status: TaskStatus::Pending,
-            owner: Some("w2".into()),
-            blocked_by: vec!["aaaaaaaa-1111-2222-3333-444444444444".into()],
-            blocks: vec![],
-            metadata: None,
-            created_at: 0,
-            updated_at: 0,
-        },
-    ];
-    let payload = build_wake_payload(&agent, &tasks, &[], &roster(&["lead-1", "w1", "w2"]));
+    let summary = "## Current Team Work\n- `work-1` | running r2 | Implement auth | allowed: cancel\n";
+    let payload = build_wake_payload(&agent, &[], Some(summary));
 
-    assert!(payload.contains("Current Task Board Summary"));
-    assert!(payload.contains("Showing 2 of 2 tasks."));
+    assert!(payload.contains("Current Team Work"));
     assert!(payload.contains("Implement auth"));
-    assert!(payload.contains("in_progress"));
-    assert!(payload.contains("Write tests"));
-    assert!(payload.contains("pending"));
-    assert!(payload.contains("w1"));
-    assert!(payload.contains("w2"));
-    assert!(payload.contains("aaaaaaaa…"));
-    assert!(
-        !payload.contains("aaaaaaaa-1111-2222-3333-444444444444"),
-        "summary blocked_by column should use short task IDs"
-    );
+    assert!(payload.contains("running r2"));
+    assert!(payload.contains("allowed: cancel"));
+    assert!(!payload.contains("Task Board"));
 }
 
 // -- WP-3: Wake payload with no messages and no tasks builds normally --------
@@ -498,10 +456,10 @@ fn wp2_wake_payload_includes_task_list() {
 #[test]
 fn wp3_wake_payload_empty_builds_normally() {
     let agent = make_agent("w1", "Worker1", TeammateRole::Teammate);
-    let payload = build_wake_payload(&agent, &[], &[], &roster(&["w1"]));
+    let payload = build_wake_payload(&agent, &[], None);
 
     assert!(payload.contains("No new messages"));
-    assert!(payload.contains("No tasks on the board"));
+    assert!(payload.contains("Use `team_inspect`"));
     assert!(payload.contains("**Worker1**"));
     assert!(payload.contains("teammate"));
 }
@@ -516,13 +474,12 @@ fn wp3_wake_payload_empty_builds_normally() {
 async fn we1_agent_status_change_event() {
     let repo = Arc::new(MockTeamRepo::new());
     let mailbox = Arc::new(Mailbox::new(repo.clone()));
-    let task_board = Arc::new(TaskBoard::new(repo));
     let bc = Arc::new(RecordingBroadcaster::new());
     let agents = vec![
         make_agent("lead-1", "Lead", TeammateRole::Lead),
         make_agent("w1", "Worker", TeammateRole::Teammate),
     ];
-    let mgr = TeammateManager::new("t1".into(), &agents, mailbox, task_board, bc.clone());
+    let mgr = TeammateManager::new("t1".into(), &agents, mailbox, bc.clone());
 
     mgr.set_status("w1", TeammateStatus::Working).await.unwrap();
 
@@ -542,10 +499,9 @@ async fn we1_agent_status_change_event() {
 async fn we2_agent_spawned_event() {
     let repo = Arc::new(MockTeamRepo::new());
     let mailbox = Arc::new(Mailbox::new(repo.clone()));
-    let task_board = Arc::new(TaskBoard::new(repo));
     let bc = Arc::new(RecordingBroadcaster::new());
     let agents = vec![make_agent("lead-1", "Lead", TeammateRole::Lead)];
-    let mgr = TeammateManager::new("t1".into(), &agents, mailbox, task_board, bc.clone());
+    let mgr = TeammateManager::new("t1".into(), &agents, mailbox, bc.clone());
 
     let new_agent = make_agent("w2", "NewWorker", TeammateRole::Teammate);
     mgr.add_agent(&new_agent).await;
@@ -569,13 +525,12 @@ async fn we2_agent_spawned_event() {
 async fn we3_agent_removed_event() {
     let repo = Arc::new(MockTeamRepo::new());
     let mailbox = Arc::new(Mailbox::new(repo.clone()));
-    let task_board = Arc::new(TaskBoard::new(repo));
     let bc = Arc::new(RecordingBroadcaster::new());
     let agents = vec![
         make_agent("lead-1", "Lead", TeammateRole::Lead),
         make_agent("w1", "Worker", TeammateRole::Teammate),
     ];
-    let mgr = TeammateManager::new("t1".into(), &agents, mailbox, task_board, bc.clone());
+    let mgr = TeammateManager::new("t1".into(), &agents, mailbox, bc.clone());
 
     mgr.remove_agent("w1").await.unwrap();
 
@@ -597,13 +552,12 @@ async fn we3_agent_removed_event() {
 async fn we4_agent_renamed_event() {
     let repo = Arc::new(MockTeamRepo::new());
     let mailbox = Arc::new(Mailbox::new(repo.clone()));
-    let task_board = Arc::new(TaskBoard::new(repo));
     let bc = Arc::new(RecordingBroadcaster::new());
     let agents = vec![
         make_agent("lead-1", "Lead", TeammateRole::Lead),
         make_agent("w1", "Worker", TeammateRole::Teammate),
     ];
-    let mgr = TeammateManager::new("t1".into(), &agents, mailbox, task_board, bc.clone());
+    let mgr = TeammateManager::new("t1".into(), &agents, mailbox, bc.clone());
 
     mgr.rename_agent("w1", "SuperWorker").await.unwrap();
 

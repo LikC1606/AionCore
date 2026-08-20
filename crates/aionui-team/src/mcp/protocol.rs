@@ -117,12 +117,11 @@ pub async fn write_response<W: AsyncWriteExt + Unpin>(
 }
 
 // ---------------------------------------------------------------------------
-// MCP ready notification (W4-D24a)
+// MCP ready notification used by the credential-bound Team bridge.
 //
 // Bridge 在 TCP connect + initialize 成功后 fire-and-forget 发送一帧通知给
 // TeamMcpServer，声明对应 slot 已就绪。扁平结构（非 JSON-RPC），格式：
 //   { "type": "mcp_ready", "slot_id": "...", "auth_token": "..." }
-// 事实来源：docs/teams/phase1/aionui-audit.md §3.1 "MCP ready 握手"
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

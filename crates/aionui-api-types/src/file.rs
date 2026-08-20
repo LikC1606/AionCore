@@ -190,6 +190,314 @@ pub struct BrowseDirectoryResponse {
     pub is_root: Option<bool>,
 }
 
+/// Request body for `POST /api/fs/project-git/preflight`.
+#[derive(Debug, Deserialize)]
+pub struct ProjectGitPreflightRequest {
+    pub workspace: String,
+    #[serde(default, rename = "includeStatus")]
+    pub include_status: Option<bool>,
+}
+
+/// Read-only Git repository metadata shared by Electron and WebUI project
+/// selection. Field names intentionally match the desktop ProjectGit contract.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectGitRepositoryResponse {
+    pub workspace_root: String,
+    pub repo_root: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_prefix: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
+    pub detached: bool,
+    pub bare: bool,
+    pub dirty: bool,
+    pub staged_count: usize,
+    pub modified_count: usize,
+    pub untracked_count: usize,
+    pub dirty_file_count: usize,
+}
+
+/// Result of resolving a user-selected directory to a Git project.
+///
+/// A directory containing exactly one direct child repository resolves to that
+/// child. Multiple child repositories fail closed and are returned as
+/// `repositoryCandidates`, so the caller can ask the user to choose instead of
+/// silently binding the wrong project.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectGitPreflightResponse {
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository: Option<ProjectGitRepositoryResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub can_isolate: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository_candidates: Option<Vec<String>>,
+}
+
+/// Shared request used by read-only Project Git endpoints.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProjectGitDiscoverRequest {
+    pub workspace: String,
+}
+
+/// Request for a bounded Project Git history page.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectGitGraphRequest {
+    pub workspace: String,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub skip: Option<usize>,
+    #[serde(default)]
+    pub r#ref: Option<String>,
+    #[serde(default)]
+    pub all_refs: Option<bool>,
+}
+
+/// Request for a single revision.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProjectGitCommitRequest {
+    pub workspace: String,
+    pub sha: String,
+}
+
+/// Request for a committed diff.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectGitDiffRequest {
+    pub workspace: String,
+    pub sha: String,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub parent: Option<String>,
+    #[serde(default)]
+    pub context_lines: Option<u32>,
+}
+
+/// Request for a directory at a committed revision.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProjectGitTreeRequest {
+    pub workspace: String,
+    pub sha: String,
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+/// Request for a file at a committed revision.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProjectGitBlobRequest {
+    pub workspace: String,
+    pub sha: String,
+    pub path: String,
+}
+
+/// Request for a working-tree diff.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectGitWorkingDiffRequest {
+    pub workspace: String,
+    pub path: String,
+    #[serde(default)]
+    pub context_lines: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectGitCommitSummaryResponse {
+    pub sha: String,
+    pub short_sha: String,
+    pub parents: Vec<String>,
+    pub subject: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_preview: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author_email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authored_at: Option<String>,
+    pub refs: Vec<String>,
+    pub changed_file_count: usize,
+    pub additions: usize,
+    pub deletions: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectGitChangedFileResponse {
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_path: Option<String>,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub additions: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deletions: Option<usize>,
+    pub binary: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectGitDiscoverResponse {
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository: Option<ProjectGitRepositoryResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectGitGraphResponse {
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository: Option<ProjectGitRepositoryResponse>,
+    pub commits: Vec<ProjectGitCommitSummaryResponse>,
+    pub has_more: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_skip: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectGitCommitDetailResponse {
+    #[serde(flatten)]
+    pub summary: ProjectGitCommitSummaryResponse,
+    pub body: String,
+    pub files: Vec<ProjectGitChangedFileResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectGitCommitResponse {
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository: Option<ProjectGitRepositoryResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit: Option<ProjectGitCommitDetailResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectGitDiffResponse {
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository: Option<ProjectGitRepositoryResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    pub content: String,
+    pub truncated: bool,
+    pub binary: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectGitTreeEntryResponse {
+    pub path: String,
+    pub name: String,
+    pub kind: String,
+    pub mode: String,
+    pub object_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changed_in_revision: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectGitTreeResponse {
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository: Option<ProjectGitRepositoryResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    pub entries: Vec<ProjectGitTreeEntryResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectGitBlobResponse {
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository: Option<ProjectGitRepositoryResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<usize>,
+    pub binary: bool,
+    pub truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_base64: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectGitWorkingTreeResponse {
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository: Option<ProjectGitRepositoryResponse>,
+    pub files: Vec<ProjectGitChangedFileResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+pub type ProjectGitWorkingDiffResponse = ProjectGitDiffResponse;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectGitResearchBranchResponse {
+    pub name: String,
+    pub r#ref: String,
+    pub head: String,
+    pub short_head: String,
+    pub active: bool,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectGitFrontierResponse {
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository: Option<ProjectGitRepositoryResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_branch: Option<String>,
+    pub branches: Vec<ProjectGitResearchBranchResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // A. Core file operations — Response DTOs
 // ---------------------------------------------------------------------------

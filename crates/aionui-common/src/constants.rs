@@ -41,7 +41,11 @@ pub fn is_team_capable(backend: &str, agent_capabilities: Option<&serde_json::Va
     supports_team_mcp(backend, agent_capabilities) || supports_team_cli_fallback(agent_capabilities)
 }
 
-/// Determine if an agent supports Team MCP injection.
+/// Determine if an agent supports the Team MCP transport we can inject.
+///
+/// Team sessions currently expose the scoped runtime through a stdio bridge.
+/// HTTP-only MCP capability is therefore not sufficient; those agents must
+/// use the authenticated Team CLI bridge instead.
 pub fn supports_team_mcp(backend: &str, agent_capabilities: Option<&serde_json::Value>) -> bool {
     if backend == AIONRS_RUNTIME_BACKEND {
         return true;
@@ -84,7 +88,7 @@ fn has_enabled_team_mcp_transport(agent_capabilities: Option<&serde_json::Value>
     let Some(caps) = mcp_capability_object(agent_capabilities) else {
         return false;
     };
-    bool_field(caps, "stdio") || bool_field(caps, "http")
+    bool_field(caps, "stdio")
 }
 
 fn mcp_capability_object(agent_capabilities: Option<&serde_json::Value>) -> Option<&serde_json::Value> {
@@ -133,12 +137,12 @@ mod tests {
     }
 
     #[test]
-    fn acp_backends_require_stdio_or_http_capability_for_team_mcp() {
+    fn acp_backends_require_stdio_capability_for_team_mcp() {
         assert!(supports_team_mcp(
             "claude",
             Some(&json!({ "mcp_capabilities": { "stdio": true } }))
         ));
-        assert!(supports_team_mcp(
+        assert!(!supports_team_mcp(
             "codex",
             Some(&json!({ "mcp_capabilities": { "http": true, "sse": false } }))
         ));

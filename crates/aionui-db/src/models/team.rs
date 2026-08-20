@@ -41,29 +41,6 @@ pub struct MailboxMessageRow {
     pub created_at: TimestampMs,
 }
 
-/// Row mapping for the `team_tasks` table.
-///
-/// Task board entry with dependency tracking via `blocked_by` / `blocks`
-/// JSON arrays forming a bidirectional link graph.
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
-pub struct TeamTaskRow {
-    pub id: String,
-    pub team_id: String,
-    pub subject: String,
-    pub description: Option<String>,
-    /// Task status: 'pending', 'in_progress', 'completed', or 'deleted'.
-    pub status: String,
-    pub owner: Option<String>,
-    /// JSON array of task IDs that block this task.
-    pub blocked_by: String,
-    /// JSON array of task IDs that this task blocks.
-    pub blocks: String,
-    /// JSON object: arbitrary extension metadata.
-    pub metadata: Option<String>,
-    pub created_at: TimestampMs,
-    pub updated_at: TimestampMs,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,49 +79,5 @@ mod tests {
             created_at: 0,
         };
         assert_eq!(row.msg_type, "message");
-    }
-
-    #[test]
-    fn team_task_row_default_blocked_by_is_empty_json_array() {
-        let row = TeamTaskRow {
-            id: "tk1".into(),
-            team_id: "t1".into(),
-            subject: "Task".into(),
-            description: None,
-            status: "pending".into(),
-            owner: None,
-            blocked_by: "[]".into(),
-            blocks: "[]".into(),
-            metadata: None,
-            created_at: 0,
-            updated_at: 0,
-        };
-        let blocked: Vec<String> = serde_json::from_str(&row.blocked_by).expect("blocked_by should be valid JSON");
-        assert!(blocked.is_empty());
-        let blocks: Vec<String> = serde_json::from_str(&row.blocks).expect("blocks should be valid JSON");
-        assert!(blocks.is_empty());
-    }
-
-    #[test]
-    fn team_task_row_serialization_roundtrip() {
-        let row = TeamTaskRow {
-            id: "tk1".into(),
-            team_id: "t1".into(),
-            subject: "Implement feature".into(),
-            description: Some("Details".into()),
-            status: "in_progress".into(),
-            owner: Some("agent-1".into()),
-            blocked_by: r#"["tk0"]"#.into(),
-            blocks: r#"["tk2","tk3"]"#.into(),
-            metadata: Some(r#"{"priority":"high"}"#.into()),
-            created_at: 1000,
-            updated_at: 2000,
-        };
-        let json = serde_json::to_string(&row).expect("serialize");
-        let restored: TeamTaskRow = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(restored.id, row.id);
-        assert_eq!(restored.status, row.status);
-        assert_eq!(restored.blocked_by, row.blocked_by);
-        assert_eq!(restored.blocks, row.blocks);
     }
 }

@@ -48,6 +48,8 @@ pub struct SendMessageInput {
     pub message: String,
     #[serde(default)]
     pub files: Vec<String>,
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 }
 
 /// Arguments for the `team_spawn_agent` MCP tool call.
@@ -61,43 +63,6 @@ pub struct SpawnAgentInput {
     #[serde(default)]
     #[serde(alias = "assistantId")]
     pub assistant_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct TaskCreateInput {
-    pub subject: String,
-    pub description: Option<String>,
-    pub owner: Option<String>,
-    pub blocked_by: Option<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct TaskUpdateInput {
-    pub task_id: String,
-    pub status: Option<String>,
-    pub description: Option<String>,
-    pub owner: Option<String>,
-    pub blocked_by: Option<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub enum TaskListStatusInput {
-    Single(String),
-    Many(Vec<String>),
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TaskListInput {
-    #[serde(default)]
-    pub owner: Option<String>,
-    #[serde(default)]
-    pub status: Option<TaskListStatusInput>,
-    #[serde(default)]
-    pub include_deleted: Option<bool>,
-    #[serde(default)]
-    pub limit: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -141,29 +106,7 @@ pub fn parse_tool_call(
             })
         }
         "team_spawn_agent" => Err("handled directly by server".into()),
-        "team_task_create" => {
-            let input: TaskCreateInput = serde_json::from_value(arguments.clone())
-                .map_err(|e| format!("Invalid arguments for team_task_create: {e}"))?;
-            Ok(SchedulerAction::TaskCreate {
-                subject: input.subject,
-                description: input.description,
-                owner: input.owner,
-                blocked_by: input.blocked_by.unwrap_or_default(),
-            })
-        }
-        "team_task_update" => {
-            let input: TaskUpdateInput = serde_json::from_value(arguments.clone())
-                .map_err(|e| format!("Invalid arguments for team_task_update: {e}"))?;
-            Ok(SchedulerAction::TaskUpdate {
-                task_id: input.task_id,
-                status: input.status,
-                description: input.description,
-                owner: input.owner,
-                blocked_by: input.blocked_by,
-            })
-        }
-        "team_task_list"
-        | "team_members"
+        "team_members"
         | "team_rename_agent"
         | "team_shutdown_agent"
         | "team_list_assistants"
@@ -183,7 +126,7 @@ mod tests {
 
     #[test]
     fn all_descriptors_count() {
-        assert_eq!(all_tool_descriptors().len(), 10);
+        assert_eq!(all_tool_descriptors().len(), 14);
     }
 
     #[test]
@@ -192,7 +135,7 @@ mod tests {
         let mut names: Vec<&str> = descs.iter().map(|d| d.name.as_str()).collect();
         names.sort();
         names.dedup();
-        assert_eq!(names.len(), 10);
+        assert_eq!(names.len(), 14);
     }
 
     #[test]
@@ -300,6 +243,20 @@ mod tests {
     }
 
     #[test]
+    fn send_message_input_accepts_optional_idempotency_key() {
+        let keyed: SendMessageInput = serde_json::from_value(json!({
+            "to": "slot-1",
+            "message": "hello",
+            "idempotency_key": "tool-call-1"
+        }))
+        .unwrap();
+        assert_eq!(keyed.idempotency_key.as_deref(), Some("tool-call-1"));
+
+        let unkeyed: SendMessageInput = serde_json::from_value(json!({ "to": "slot-1", "message": "hello" })).unwrap();
+        assert_eq!(unkeyed.idempotency_key, None);
+    }
+
+    #[test]
     fn parse_spawn_agent_is_handled_directly_by_server() {
         let args = json!({"name": "Helper", "assistant_id": "word-creator"});
         let result = parse_tool_call("team_spawn_agent", &args, TeammateRole::Lead);
@@ -321,28 +278,6 @@ mod tests {
         let result = parse_tool_call("team_spawn_agent", &args, TeammateRole::Lead);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("handled directly by server"));
-    }
-
-    #[test]
-    fn parse_task_create() {
-        let args = json!({"subject": "Implement X", "owner": "slot-a"});
-        let action = parse_tool_call("team_task_create", &args, TeammateRole::Teammate).unwrap();
-        assert!(matches!(
-            action,
-            SchedulerAction::TaskCreate { subject, owner, .. }
-            if subject == "Implement X" && owner == Some("slot-a".into())
-        ));
-    }
-
-    #[test]
-    fn parse_task_update() {
-        let args = json!({"task_id": "tk-1", "status": "completed"});
-        let action = parse_tool_call("team_task_update", &args, TeammateRole::Teammate).unwrap();
-        assert!(matches!(
-            action,
-            SchedulerAction::TaskUpdate { task_id, status, .. }
-            if task_id == "tk-1" && status == Some("completed".into())
-        ));
     }
 
     #[test]
@@ -371,24 +306,6 @@ mod tests {
     fn parse_spawn_with_explicit_role_is_handled_directly_by_server() {
         let args = json!({"name": "W", "role": "worker", "assistant_id": "word-creator"});
         let result = parse_tool_call("team_spawn_agent", &args, TeammateRole::Lead);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("handled directly by server"));
-    }
-
-    #[test]
-    fn task_create_with_blocked_by() {
-        let args = json!({"subject": "Test", "blocked_by": ["tk-a", "tk-b"]});
-        let action = parse_tool_call("team_task_create", &args, TeammateRole::Lead).unwrap();
-        assert!(matches!(
-            action,
-            SchedulerAction::TaskCreate { blocked_by, .. }
-            if blocked_by == vec!["tk-a", "tk-b"]
-        ));
-    }
-
-    #[test]
-    fn parse_task_list_handled_by_server() {
-        let result = parse_tool_call("team_task_list", &json!({}), TeammateRole::Teammate);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("handled directly by server"));
     }

@@ -253,17 +253,24 @@ pub struct SendTeamMessageRequest {
     pub content: String,
     #[serde(default)]
     pub files: Option<Vec<String>>,
+    /// Stable caller key used by Retry/Recovery to collapse duplicate
+    /// foreground enqueue requests for the lead.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 }
 
 /// Request body for `POST /api/teams/:id/agents/:slotId/messages`.
 ///
 /// Sends a user message directly to a specific agent's mailbox.
-/// `files` semantics match [`SendTeamMessageRequest`].
+/// `files` semantics match [`SendTeamMessageRequest`]. Reusing an
+/// `idempotency_key` collapses duplicate delivery attempts for the same turn.
 #[derive(Debug, Deserialize)]
 pub struct SendAgentMessageRequest {
     pub content: String,
     #[serde(default)]
     pub files: Option<Vec<String>>,
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -288,6 +295,10 @@ pub enum TeamRunStatus {
 #[serde(rename_all = "snake_case")]
 pub enum TeamRunSource {
     UserMessage,
+    /// A run opened by an agent/system wake instead of a user message.
+    /// Keeping this distinct makes autonomous recovery and delegation visible
+    /// without misreporting it as user intervention.
+    SystemLifecycle,
 }
 
 #[derive(Debug, Deserialize)]
@@ -440,13 +451,19 @@ pub struct TeamAgentResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TeamResponse {
     pub id: String,
+    #[serde(default)]
+    pub user_id: String,
     pub name: String,
     #[serde(default)]
     pub workspace: String,
+    #[serde(default)]
+    pub workspace_mode: String,
     #[serde(alias = "agents")]
     pub assistants: Vec<TeamAgentResponse>,
     #[serde(skip_serializing_if = "Option::is_none", alias = "lead_agent_id")]
     pub leader_assistant_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_mode: Option<String>,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
 }
@@ -455,7 +472,101 @@ pub struct TeamResponse {
 pub type TeamListResponse = Vec<TeamResponse>;
 
 // ---------------------------------------------------------------------------
-// F. WebSocket event payloads
+// F. Team Mode query responses
+// ---------------------------------------------------------------------------
+
+/// Public projection of the result currently submitted for review.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamWorkSubmissionResponse {
+    pub kind: String,
+    pub producer_member_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_id: Option<String>,
+}
+
+/// Public branch coordinates assigned to a Git WorkItem. The server-local
+/// repository identity stays behind the Team Mode service boundary.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamGitWorkAssignmentResponse {
+    pub base_commit: String,
+    pub branch_ref: String,
+}
+
+/// Public WorkItem snapshot. Persistence-only receipt fields are deliberately
+/// absent from this contract.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamWorkItemResponse {
+    pub id: String,
+    pub team_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_work_item_id: Option<String>,
+    pub subject: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub controller_member_id: String,
+    pub assignee_member_id: String,
+    pub reviewer_member_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub integrator_member_id: Option<String>,
+    pub delivery_requirement: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_assignment: Option<TeamGitWorkAssignmentResponse>,
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_submission: Option<TeamWorkSubmissionResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accepted_delivery_id: Option<String>,
+    pub revision: u64,
+    pub created_at: TimestampMs,
+    pub updated_at: TimestampMs,
+}
+
+/// Public immutable Git delivery identity and lifecycle state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamGitDeliveryResponse {
+    pub id: String,
+    pub team_id: String,
+    pub work_item_id: String,
+    pub producer_member_id: String,
+    pub content_revision: u64,
+    pub base_commit: String,
+    pub branch_ref: String,
+    pub head_commit: String,
+    pub state: String,
+    pub revision: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merged_commit: Option<String>,
+    pub created_at: TimestampMs,
+    pub updated_at: TimestampMs,
+}
+
+/// Public event projection. Command receipt fingerprints, results, and
+/// idempotency keys stay private to the persistence/command boundary.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamWorkEventResponse {
+    pub sequence: u64,
+    pub event_id: String,
+    pub team_id: String,
+    pub work_item_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_id: Option<String>,
+    pub actor_member_id: String,
+    pub command_name: String,
+    pub work_item_revision: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_revision: Option<u64>,
+    pub created_at: TimestampMs,
+}
+
+/// Detail response for one WorkItem and all of its Git delivery attempts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamWorkItemSnapshotResponse {
+    pub work_item: TeamWorkItemResponse,
+    pub deliveries: Vec<TeamGitDeliveryResponse>,
+}
+
+// ---------------------------------------------------------------------------
+// G. WebSocket event payloads
 // ---------------------------------------------------------------------------
 
 /// Payload for `team.agentStatusChanged` WebSocket event.
@@ -883,9 +994,10 @@ mod tests {
 
     #[test]
     fn deserialize_send_agent_message_request() {
-        let raw = json!({ "content": "Do this task" });
+        let raw = json!({ "content": "Do this task", "idempotency_key": "terminal:turn-1" });
         let req: SendAgentMessageRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.content, "Do this task");
+        assert_eq!(req.idempotency_key.as_deref(), Some("terminal:turn-1"));
     }
 
     #[test]
@@ -955,8 +1067,10 @@ mod tests {
     fn serialize_team_response_snake_case() {
         let team = TeamResponse {
             id: "team-1".into(),
+            user_id: "user-1".into(),
             name: "Alpha".into(),
             workspace: "/workspace/team-1".into(),
+            workspace_mode: "shared".into(),
             assistants: vec![TeamAgentResponse {
                 slot_id: "slot-1".into(),
                 assistant_name: "Lead".into(),
@@ -972,14 +1086,18 @@ mod tests {
                 pending_confirmations: 0,
             }],
             leader_assistant_id: Some("slot-1".into()),
+            session_mode: Some("full_auto".into()),
             created_at: 1700000000000,
             updated_at: 1700001000000,
         };
         let json = serde_json::to_value(&team).unwrap();
         assert_eq!(json["id"], "team-1");
+        assert_eq!(json["user_id"], "user-1");
         assert_eq!(json["name"], "Alpha");
         assert_eq!(json["workspace"], "/workspace/team-1");
+        assert_eq!(json["workspace_mode"], "shared");
         assert_eq!(json["leader_assistant_id"], "slot-1");
+        assert_eq!(json["session_mode"], "full_auto");
         assert_eq!(json["created_at"], 1700000000000_i64);
         assert_eq!(json["updated_at"], 1700001000000_i64);
         assert_eq!(json["assistants"].as_array().unwrap().len(), 1);
@@ -990,10 +1108,13 @@ mod tests {
     fn serialize_team_response_no_lead() {
         let team = TeamResponse {
             id: "team-2".into(),
+            user_id: "user-1".into(),
             name: "Beta".into(),
             workspace: String::new(),
+            workspace_mode: "shared".into(),
             assistants: vec![],
             leader_assistant_id: None,
+            session_mode: None,
             created_at: 1700000000000,
             updated_at: 1700000000000,
         };
@@ -1095,8 +1216,10 @@ mod tests {
     fn team_response_roundtrip() {
         let team = TeamResponse {
             id: "team-1".into(),
+            user_id: "user-1".into(),
             name: "Alpha".into(),
             workspace: "/workspace/team-1".into(),
+            workspace_mode: "shared".into(),
             assistants: vec![
                 TeamAgentResponse {
                     slot_id: "s1".into(),
@@ -1128,6 +1251,7 @@ mod tests {
                 },
             ],
             leader_assistant_id: Some("s1".into()),
+            session_mode: Some("plan".into()),
             created_at: 1000,
             updated_at: 2000,
         };
@@ -1356,6 +1480,10 @@ mod tests {
         assert_eq!(
             serde_json::to_value(TeamRunSource::UserMessage).unwrap(),
             serde_json::json!("user_message")
+        );
+        assert_eq!(
+            serde_json::to_value(TeamRunSource::SystemLifecycle).unwrap(),
+            serde_json::json!("system_lifecycle")
         );
     }
 

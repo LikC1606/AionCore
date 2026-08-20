@@ -2,7 +2,7 @@
 //!
 //! **Purpose:** guard against the "agent claims a tool works but it is an
 //! empty shell" failure mode by exercising each user-visible capability
-//! through its real wiring (TCP MCP server, mailbox, task board, scheduler)
+//! through its real wiring (TCP MCP server, mailbox, scheduler)
 //! and asserting the observable side effect — not just a success return
 //! code.
 //!
@@ -16,9 +16,9 @@
 //!   when shutdown_agent / shutdown_approved mailbox wiring lands.
 //! - scenario 4 (crash → testament → leader wake) — `todo!()`, `#[ignore]`.
 //!   Unblocks when the crash handler is wired into the stream pipeline.
-//! - scenario 5 (MCP tool execution is not a no-op) — **runs now**. Uses
-//!   only pieces that already exist (mailbox + task board + TeamMcpServer)
-//!   and is the first real e2e guard.
+//! - scenario 5 (MCP tool execution has explicit runtime contracts) —
+//!   **runs now**. It guards against silent success when no Team session is
+//!   attached.
 //!
 //! All ignored scenarios must stay compiling so the scaffold itself never
 //! rots between waves.
@@ -30,7 +30,7 @@ use std::sync::Arc;
 use aionui_api_types::WebSocketMessage;
 use aionui_realtime::EventBroadcaster;
 use aionui_team::mcp::protocol::{read_frame, write_frame};
-use aionui_team::{Mailbox, TaskBoard, TeamAgent, TeamMcpServer, TeammateManager, TeammateRole};
+use aionui_team::{Mailbox, TeamAgent, TeamMcpServer, TeammateManager, TeammateRole};
 use common::MockTeamRepo;
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
@@ -50,11 +50,8 @@ impl EventBroadcaster for NullBroadcaster {
 /// a smoke test might need to assert a side effect.
 struct SmokeEnv {
     server: TeamMcpServer,
-    task_board: Arc<TaskBoard>,
-    repo: Arc<MockTeamRepo>,
     #[allow(dead_code)]
     scheduler: Arc<TeammateManager>,
-    team_id: String,
     lead_slot_id: String,
     worker_slot_id: String,
     auth_token: String,
@@ -67,7 +64,6 @@ struct SmokeEnv {
 async fn setup_team_with_lead() -> SmokeEnv {
     let repo = Arc::new(MockTeamRepo::new());
     let mailbox = Arc::new(Mailbox::new(repo.clone()));
-    let task_board = Arc::new(TaskBoard::new(repo.clone()));
     let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
 
     let team_id = "smoke-team".to_string();
@@ -103,7 +99,6 @@ async fn setup_team_with_lead() -> SmokeEnv {
         team_id.clone(),
         &agents,
         mailbox.clone(),
-        task_board.clone(),
         broadcaster.clone(),
     ));
 
@@ -120,10 +115,7 @@ async fn setup_team_with_lead() -> SmokeEnv {
 
     SmokeEnv {
         server,
-        task_board,
-        repo,
         scheduler,
-        team_id,
         lead_slot_id,
         worker_slot_id,
         auth_token,
@@ -269,8 +261,7 @@ async fn smoke_agent_crash_recovery() {
 //
 // This is the anchor scenario that guards against the core failure mode
 // the user called out: a tool returning `success` with no observable side
-// effect. It only uses pieces that already exist (mailbox + task board +
-// TeamMcpServer), so it runs in CI today.
+// effect. It runs against the real TeamMcpServer in CI today.
 
 #[tokio::test]
 async fn smoke_mcp_tool_execution_not_noop() {
@@ -296,31 +287,6 @@ async fn smoke_mcp_tool_execution_not_noop() {
             .contains("Team service not available"),
         "unexpected team_send_message error: {msg_resp}"
     );
-
-    // --- team_task_create → task board side effect -----------------------
-    let task_resp = mcp_call(
-        &mut stream,
-        11,
-        "team_task_create",
-        json!({ "subject": "Smoke test subject" }),
-    )
-    .await;
-    assert!(
-        !is_error_response(&task_resp),
-        "team_task_create returned error: {task_resp}"
-    );
-    let tasks = env.task_board.list_tasks(&env.team_id).await.unwrap();
-    assert!(
-        tasks.iter().any(|t| t.subject == "Smoke test subject"),
-        "team_task_create did not persist task, got {tasks:?}"
-    );
-
-    // --- repo-level cross-check: task rows actually hit storage --
-    // Even if the service layer lies, the repo-level mock's state is the
-    // ground truth for "did data move through the stack".
-    let repo_state = env.repo.state.lock().unwrap();
-    assert!(!repo_state.tasks.is_empty(), "no task rows reached the repo");
-    drop(repo_state);
 
     env.server.stop();
 }

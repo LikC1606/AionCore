@@ -8,8 +8,9 @@ use crate::models::{
     UpsertConversationAssistantSnapshotParams,
 };
 use crate::repository::conversation::{
-    ConversationFilters, ConversationRowUpdate, IConversationRepository, MessagePageCursor, MessagePageDirection,
-    MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow,
+    ConversationFilters, ConversationMessageIdempotencyParams, ConversationMessageReceipt,
+    ConversationMessageWriteResult, ConversationRowUpdate, IConversationRepository, MessagePageCursor,
+    MessagePageDirection, MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow,
 };
 
 /// SQLite-backed implementation of [`IConversationRepository`].
@@ -401,6 +402,21 @@ impl IConversationRepository for SqliteConversationRepository {
         Ok(rows)
     }
 
+    async fn list_team_bound(&self) -> Result<Vec<ConversationRow>, DbError> {
+        let rows = sqlx::query_as::<_, ConversationRow>(
+            "SELECT * FROM conversations \
+             WHERE CASE \
+               WHEN json_valid(extra) \
+               THEN COALESCE(NULLIF(TRIM(json_extract(extra, '$.teamId')), ''), '') <> '' \
+               ELSE 0 \
+             END \
+             ORDER BY created_at ASC, id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     async fn get_assistant_snapshot(
         &self,
         conversation_id: &str,
@@ -650,6 +666,117 @@ impl IConversationRepository for SqliteConversationRepository {
 
     async fn insert_message(&self, message: &MessageRow) -> Result<(), DbError> {
         self.insert_message_once(message).await.map_err(DbError::from)
+    }
+
+    async fn get_message_receipt(
+        &self,
+        conversation_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<ConversationMessageReceipt>, DbError> {
+        let row = sqlx::query_as::<_, (String, String, String)>(
+            "SELECT request_fingerprint, message_id, turn_id \
+             FROM conversation_message_receipts \
+             WHERE conversation_id = ? AND idempotency_key = ?",
+        )
+        .bind(conversation_id)
+        .bind(idempotency_key)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(
+            |(request_fingerprint, message_id, turn_id)| ConversationMessageReceipt {
+                request_fingerprint,
+                message_id,
+                turn_id,
+            },
+        ))
+    }
+
+    async fn insert_message_idempotent(
+        &self,
+        message: &MessageRow,
+        idempotency: &ConversationMessageIdempotencyParams<'_>,
+    ) -> Result<ConversationMessageWriteResult, DbError> {
+        if idempotency.key.is_empty() || idempotency.request_fingerprint.is_empty() || idempotency.turn_id.is_empty() {
+            return Err(DbError::Conflict(
+                "Conversation idempotency key, request fingerprint, and turn id must not be empty".into(),
+            ));
+        }
+
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let outcome = async {
+            let existing = sqlx::query_as::<_, (String, String, String)>(
+                "SELECT request_fingerprint, message_id, turn_id \
+                 FROM conversation_message_receipts \
+                 WHERE conversation_id = ? AND idempotency_key = ?",
+            )
+            .bind(&message.conversation_id)
+            .bind(idempotency.key)
+            .fetch_optional(&mut *transaction)
+            .await?;
+
+            if let Some((request_fingerprint, message_id, turn_id)) = existing {
+                if request_fingerprint != idempotency.request_fingerprint {
+                    return Ok(ConversationMessageWriteResult::IdempotencyConflict {
+                        existing_request_fingerprint: request_fingerprint,
+                    });
+                }
+                return Ok(ConversationMessageWriteResult::Existing(ConversationMessageReceipt {
+                    request_fingerprint,
+                    message_id,
+                    turn_id,
+                }));
+            }
+
+            sqlx::query(
+                "INSERT INTO messages \
+                    (id, conversation_id, msg_id, type, content, position, status, hidden, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&message.id)
+            .bind(&message.conversation_id)
+            .bind(&message.msg_id)
+            .bind(&message.r#type)
+            .bind(&message.content)
+            .bind(&message.position)
+            .bind(&message.status)
+            .bind(message.hidden)
+            .bind(message.created_at)
+            .execute(&mut *transaction)
+            .await?;
+
+            sqlx::query(
+                "INSERT INTO conversation_message_receipts \
+                    (conversation_id, idempotency_key, request_fingerprint, message_id, turn_id, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&message.conversation_id)
+            .bind(idempotency.key)
+            .bind(idempotency.request_fingerprint)
+            .bind(&message.id)
+            .bind(idempotency.turn_id)
+            .bind(message.created_at)
+            .execute(&mut *transaction)
+            .await?;
+
+            Ok(ConversationMessageWriteResult::Inserted)
+        }
+        .await;
+
+        match outcome {
+            Ok(ConversationMessageWriteResult::Inserted) => {
+                transaction.commit().await?;
+                Ok(ConversationMessageWriteResult::Inserted)
+            }
+            Ok(outcome) => {
+                transaction.rollback().await?;
+                Ok(outcome)
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
     }
 
     async fn upsert_message(&self, message: &MessageRow) -> Result<(), DbError> {

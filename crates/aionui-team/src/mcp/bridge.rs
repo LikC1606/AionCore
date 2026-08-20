@@ -6,7 +6,8 @@
 //! wire-level `agent_client_protocol::schema::McpServer::Stdio` variant and
 //! sent to the agent CLI, which then spawns `<backend> mcp-bridge` with the
 //! three `TEAM_MCP_*` env keys so it can proxy stdio↔TCP to the in-process
-//! team MCP server.
+//! team MCP server. The token is a per-member credential; the slot env value
+//! is compatibility metadata and is not trusted by the server for identity.
 
 use std::path::PathBuf;
 

@@ -2,8 +2,8 @@ use aionui_common::now_ms;
 use sqlx::SqlitePool;
 
 use crate::error::DbError;
-use crate::models::{MailboxMessageRow, TeamRow, TeamTaskRow};
-use crate::repository::team::{ITeamRepository, UpdateTaskParams, UpdateTeamParams};
+use crate::models::{MailboxMessageRow, TeamRow};
+use crate::repository::team::{ITeamRepository, MailboxIdempotencyParams, MailboxWriteResult, UpdateTeamParams};
 
 /// SQLite-backed implementation of [`ITeamRepository`].
 #[derive(Clone, Debug)]
@@ -117,13 +117,36 @@ impl ITeamRepository for SqliteTeamRepository {
     }
 
     async fn delete_team(&self, team_id: &str) -> Result<(), DbError> {
-        let result = sqlx::query("DELETE FROM teams WHERE id = ?")
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM teams WHERE id = ?")
             .bind(team_id)
-            .execute(&self.pool)
+            .fetch_optional(&mut *transaction)
             .await?;
-        if result.rows_affected() == 0 {
+        if exists.is_none() {
+            transaction.rollback().await?;
             return Err(DbError::NotFound(format!("team {team_id}")));
         }
+
+        // Mailbox and the pre-kernel task table have no foreign key to teams.
+        // Canonical WorkItems, Deliveries, Events, and integration attempts are
+        // removed by the Team aggregate's ON DELETE CASCADE graph.
+        sqlx::query("DELETE FROM mailbox WHERE team_id = ?")
+            .bind(team_id)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("DELETE FROM team_tasks WHERE team_id = ?")
+            .bind(team_id)
+            .execute(&mut *transaction)
+            .await?;
+        let result = sqlx::query("DELETE FROM teams WHERE id = ?")
+            .bind(team_id)
+            .execute(&mut *transaction)
+            .await?;
+        if result.rows_affected() != 1 {
+            transaction.rollback().await?;
+            return Err(DbError::NotFound(format!("team {team_id}")));
+        }
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -148,6 +171,87 @@ impl ITeamRepository for SqliteTeamRepository {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    async fn write_message_idempotent(
+        &self,
+        row: &MailboxMessageRow,
+        idempotency: &MailboxIdempotencyParams<'_>,
+    ) -> Result<MailboxWriteResult, DbError> {
+        if idempotency.scope.is_empty() || idempotency.key.is_empty() || idempotency.request_fingerprint.is_empty() {
+            return Err(DbError::Conflict(
+                "Mailbox idempotency scope, key, and request fingerprint must not be empty".into(),
+            ));
+        }
+
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let outcome = async {
+            let existing = sqlx::query_as::<_, (String, String)>(
+                "SELECT id, request_fingerprint FROM mailbox \
+                 WHERE team_id = ? AND idempotency_scope = ? AND idempotency_key = ?",
+            )
+            .bind(&row.team_id)
+            .bind(idempotency.scope)
+            .bind(idempotency.key)
+            .fetch_optional(&mut *transaction)
+            .await?;
+
+            if let Some((existing_id, existing_fingerprint)) = existing {
+                if existing_fingerprint != idempotency.request_fingerprint {
+                    return Ok(MailboxWriteResult::IdempotencyConflict {
+                        existing_request_fingerprint: existing_fingerprint,
+                    });
+                }
+                let existing_row = sqlx::query_as::<_, MailboxMessageRow>(
+                    "SELECT id, team_id, to_agent_id, from_agent_id, \
+                            type, content, summary, files, read, created_at \
+                     FROM mailbox WHERE id = ?",
+                )
+                .bind(existing_id)
+                .fetch_one(&mut *transaction)
+                .await?;
+                return Ok(MailboxWriteResult::Existing(existing_row));
+            }
+
+            sqlx::query(
+                "INSERT INTO mailbox \
+                    (id, team_id, to_agent_id, from_agent_id, type, content, summary, files, read, created_at, \
+                     idempotency_scope, idempotency_key, request_fingerprint) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&row.id)
+            .bind(&row.team_id)
+            .bind(&row.to_agent_id)
+            .bind(&row.from_agent_id)
+            .bind(&row.msg_type)
+            .bind(&row.content)
+            .bind(&row.summary)
+            .bind(&row.files)
+            .bind(row.read)
+            .bind(row.created_at)
+            .bind(idempotency.scope)
+            .bind(idempotency.key)
+            .bind(idempotency.request_fingerprint)
+            .execute(&mut *transaction)
+            .await?;
+            Ok(MailboxWriteResult::Inserted)
+        }
+        .await;
+
+        match outcome {
+            Ok(MailboxWriteResult::Inserted) => {
+                transaction.commit().await?;
+                Ok(MailboxWriteResult::Inserted)
+            }
+            Ok(outcome) => {
+                transaction.rollback().await?;
+                Ok(outcome)
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
     }
 
     async fn read_unread_and_mark(&self, team_id: &str, to_agent_id: &str) -> Result<Vec<MailboxMessageRow>, DbError> {
@@ -198,6 +302,49 @@ impl ITeamRepository for SqliteTeamRepository {
         .bind(to_agent_id)
         .fetch_all(&self.pool)
         .await?;
+        Ok(rows)
+    }
+
+    async fn list_team_ids_with_recoverable_unread_mailbox(
+        &self,
+        after_team_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<String>, DbError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = match after_team_id {
+            Some(after_team_id) => {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT DISTINCT m.team_id \
+                     FROM mailbox AS m \
+                     INNER JOIN teams AS t ON t.id = m.team_id \
+                     WHERE m.read = 0 \
+                       AND m.from_agent_id <> m.to_agent_id \
+                       AND m.team_id > ? \
+                     ORDER BY m.team_id ASC \
+                     LIMIT ?",
+                )
+                .bind(after_team_id)
+                .bind(i64::from(limit))
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT DISTINCT m.team_id \
+                     FROM mailbox AS m \
+                     INNER JOIN teams AS t ON t.id = m.team_id \
+                     WHERE m.read = 0 \
+                       AND m.from_agent_id <> m.to_agent_id \
+                     ORDER BY m.team_id ASC \
+                     LIMIT ?",
+                )
+                .bind(i64::from(limit))
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
         Ok(rows)
     }
 
@@ -256,160 +403,6 @@ impl ITeamRepository for SqliteTeamRepository {
 
     async fn delete_mailbox_by_team(&self, team_id: &str) -> Result<(), DbError> {
         sqlx::query("DELETE FROM mailbox WHERE team_id = ?")
-            .bind(team_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    // ── Tasks ────────────────────────────────────────────────────────
-
-    async fn create_task(&self, row: &TeamTaskRow) -> Result<(), DbError> {
-        sqlx::query(
-            "INSERT INTO team_tasks \
-                (id, team_id, subject, description, status, owner, \
-                 blocked_by, blocks, metadata, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&row.id)
-        .bind(&row.team_id)
-        .bind(&row.subject)
-        .bind(&row.description)
-        .bind(&row.status)
-        .bind(&row.owner)
-        .bind(&row.blocked_by)
-        .bind(&row.blocks)
-        .bind(&row.metadata)
-        .bind(row.created_at)
-        .bind(row.updated_at)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    async fn find_task_by_id(&self, team_id: &str, task_id: &str) -> Result<Option<TeamTaskRow>, DbError> {
-        let row = sqlx::query_as::<_, TeamTaskRow>("SELECT * FROM team_tasks WHERE team_id = ? AND id = ?")
-            .bind(team_id)
-            .bind(task_id)
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(row)
-    }
-
-    async fn update_task(&self, task_id: &str, params: &UpdateTaskParams) -> Result<(), DbError> {
-        let mut set_clauses = Vec::new();
-        if params.status.is_some() {
-            set_clauses.push("status = ?");
-        }
-        if params.description.is_some() {
-            set_clauses.push("description = ?");
-        }
-        if params.owner.is_some() {
-            set_clauses.push("owner = ?");
-        }
-        if params.blocked_by.is_some() {
-            set_clauses.push("blocked_by = ?");
-        }
-        if params.metadata.is_some() {
-            set_clauses.push("metadata = ?");
-        }
-
-        if set_clauses.is_empty() {
-            return Ok(());
-        }
-
-        set_clauses.push("updated_at = ?");
-        let sql = format!("UPDATE team_tasks SET {} WHERE id = ?", set_clauses.join(", "));
-
-        let mut query = sqlx::query(&sql);
-        if let Some(ref status) = params.status {
-            query = query.bind(status);
-        }
-        if let Some(ref description) = params.description {
-            query = query.bind(description);
-        }
-        if let Some(ref owner) = params.owner {
-            query = query.bind(owner);
-        }
-        if let Some(ref blocked_by) = params.blocked_by {
-            query = query.bind(blocked_by);
-        }
-        if let Some(ref metadata) = params.metadata {
-            query = query.bind(metadata);
-        }
-        query = query.bind(now_ms());
-        query = query.bind(task_id);
-
-        let result = query.execute(&self.pool).await?;
-        if result.rows_affected() == 0 {
-            return Err(DbError::NotFound(format!("task {task_id}")));
-        }
-        Ok(())
-    }
-
-    async fn list_tasks(&self, team_id: &str) -> Result<Vec<TeamTaskRow>, DbError> {
-        let rows =
-            sqlx::query_as::<_, TeamTaskRow>("SELECT * FROM team_tasks WHERE team_id = ? ORDER BY created_at ASC")
-                .bind(team_id)
-                .fetch_all(&self.pool)
-                .await?;
-        Ok(rows)
-    }
-
-    async fn append_to_blocks(&self, task_id: &str, blocked_task_id: &str) -> Result<(), DbError> {
-        // Read current blocks, append, and write back within a transaction.
-        let mut tx = self.pool.begin().await?;
-
-        let row = sqlx::query_as::<_, TeamTaskRow>("SELECT * FROM team_tasks WHERE id = ?")
-            .bind(task_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or_else(|| DbError::NotFound(format!("task {task_id}")))?;
-
-        let mut blocks: Vec<String> = serde_json::from_str(&row.blocks).unwrap_or_default();
-        if !blocks.contains(&blocked_task_id.to_string()) {
-            blocks.push(blocked_task_id.to_string());
-        }
-        let new_blocks = serde_json::to_string(&blocks).unwrap_or_else(|_| "[]".to_string());
-
-        sqlx::query("UPDATE team_tasks SET blocks = ?, updated_at = ? WHERE id = ?")
-            .bind(&new_blocks)
-            .bind(now_ms())
-            .bind(task_id)
-            .execute(&mut *tx)
-            .await?;
-
-        tx.commit().await?;
-        Ok(())
-    }
-
-    async fn remove_from_blocked_by(&self, task_id: &str, unblocked_task_id: &str) -> Result<(), DbError> {
-        // Read current blocked_by, remove, and write back within a transaction.
-        let mut tx = self.pool.begin().await?;
-
-        let row = sqlx::query_as::<_, TeamTaskRow>("SELECT * FROM team_tasks WHERE id = ?")
-            .bind(task_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or_else(|| DbError::NotFound(format!("task {task_id}")))?;
-
-        let mut blocked_by: Vec<String> = serde_json::from_str(&row.blocked_by).unwrap_or_default();
-        blocked_by.retain(|id| id != unblocked_task_id);
-        let new_blocked_by = serde_json::to_string(&blocked_by).unwrap_or_else(|_| "[]".to_string());
-
-        sqlx::query("UPDATE team_tasks SET blocked_by = ?, updated_at = ? WHERE id = ?")
-            .bind(&new_blocked_by)
-            .bind(now_ms())
-            .bind(task_id)
-            .execute(&mut *tx)
-            .await?;
-
-        tx.commit().await?;
-        Ok(())
-    }
-
-    async fn delete_tasks_by_team(&self, team_id: &str) -> Result<(), DbError> {
-        sqlx::query("DELETE FROM team_tasks WHERE team_id = ?")
             .bind(team_id)
             .execute(&self.pool)
             .await?;

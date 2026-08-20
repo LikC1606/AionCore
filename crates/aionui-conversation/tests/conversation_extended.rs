@@ -2,13 +2,17 @@ use std::sync::Arc;
 
 use aionui_ai_agent::{AgentError, IWorkerTaskManager};
 use aionui_api_types::{
-    CloneConversationRequest, CreateConversationRequest, ListMessagesQuery, SearchMessagesQuery, WebSocketMessage,
+    CloneConversationRequest, CreateConversationRequest, ListMessagesQuery, SearchMessagesQuery, SendMessageRequest,
+    WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, generate_prefixed_id, now_ms};
 use aionui_conversation::skill_resolver::SkillResolver;
 use aionui_conversation::{ConversationError, ConversationService};
 use aionui_db::models::MessageRow;
-use aionui_db::{IConversationRepository, SqliteConversationRepository, init_database_memory};
+use aionui_db::{
+    IConversationRepository, MessagePageDirection, MessagePageParams, SqliteConversationRepository,
+    init_database_memory,
+};
 use aionui_realtime::EventBroadcaster;
 use serde_json::json;
 use std::sync::Mutex;
@@ -132,6 +136,79 @@ fn make_create_req() -> CreateConversationRequest {
         "extra": { "workspace": workspace }
     }))
     .unwrap()
+}
+
+fn make_idempotent_send(content: &str, key: &str) -> SendMessageRequest {
+    serde_json::from_value(json!({
+        "content": content,
+        "idempotency_key": key
+    }))
+    .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ordinary_send_collapses_concurrent_retries_and_rejects_key_reuse() {
+    let (svc, repo, _broadcaster) = setup().await;
+    let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
+    let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(NoopTaskManager);
+    let mut sends = tokio::task::JoinSet::new();
+    for _ in 0..20 {
+        let svc = svc.clone();
+        let task_manager = task_manager.clone();
+        let conversation_id = conv.id.clone();
+        sends.spawn(async move {
+            svc.send_message(
+                USER_ID,
+                &conversation_id,
+                make_idempotent_send("one logical turn", "retry-key-1"),
+                &task_manager,
+            )
+            .await
+            .unwrap()
+        });
+    }
+
+    let mut responses = Vec::new();
+    while let Some(result) = sends.join_next().await {
+        responses.push(result.unwrap());
+    }
+    assert_eq!(responses.len(), 20);
+    assert!(responses.iter().all(|response| response.msg_id == responses[0].msg_id));
+    assert!(
+        responses
+            .iter()
+            .all(|response| response.turn_id == responses[0].turn_id)
+    );
+
+    let conflict = svc
+        .send_message(
+            USER_ID,
+            &conv.id,
+            make_idempotent_send("different payload", "retry-key-1"),
+            &task_manager,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(conflict, ConversationError::Busy { .. }));
+
+    let messages = repo
+        .list_messages_page(
+            &conv.id,
+            &MessagePageParams {
+                limit: 100,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        messages
+            .items
+            .iter()
+            .filter(|message| message.position.as_deref() == Some("right"))
+            .count(),
+        1
+    );
 }
 
 fn make_message(conv_id: &str, content: &str, offset_ms: i64) -> MessageRow {

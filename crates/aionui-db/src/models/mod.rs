@@ -14,6 +14,7 @@ mod remote_agent;
 mod skill;
 mod system_settings;
 mod team;
+mod team_mode;
 mod user;
 
 pub use acp_session::AcpSessionRow;
@@ -37,5 +38,6 @@ pub use provider::Provider;
 pub use remote_agent::RemoteAgentRow;
 pub use skill::{SkillImportRecordRow, SkillRow};
 pub use system_settings::SystemSettings;
-pub use team::{MailboxMessageRow, TeamRow, TeamTaskRow};
+pub use team::{MailboxMessageRow, TeamRow};
+pub use team_mode::{TeamGitDeliveryRow, TeamGitIntegrationAttemptRow, TeamWorkEventRow, TeamWorkItemRow};
 pub use user::User;

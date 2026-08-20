@@ -33,16 +33,16 @@ use aionui_common::{
 };
 use aionui_db::models::{
     AcpSessionRow, AgentMetadataRow, ConversationArtifactRow, ConversationAssistantSnapshotRow, ConversationRow,
-    MessageRow, UpdateAgentHandshakeParams, UpsertAgentMetadataParams,
+    MessageRow, TeamRow, UpdateAgentHandshakeParams, UpsertAgentMetadataParams,
 };
 use aionui_db::{
     ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, DbError, IAcpSessionRepository,
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
-    IAssistantPreferenceRepository, IConversationRepository, MessageRowUpdate, MessageSearchRow, PersistedSessionState,
-    SaveRuntimeStateParams, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
-    SqliteAssistantPreferenceRepository, UpdateAgentAvailabilitySnapshotParams, UpsertAssistantDefinitionParams,
-    UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams,
-    init_database_memory,
+    IAssistantPreferenceRepository, IConversationRepository, ITeamRepository, MessageRowUpdate, MessageSearchRow,
+    PersistedSessionState, SaveRuntimeStateParams, SqliteAssistantDefinitionRepository,
+    SqliteAssistantOverlayRepository, SqliteAssistantPreferenceRepository, SqliteTeamRepository,
+    UpdateAgentAvailabilitySnapshotParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
+    UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams, init_database_memory,
 };
 use aionui_db::{MessagePageCursor, MessagePageDirection, MessagePageParams, MessagePageResult};
 use aionui_extension::{AssistantRuleDispatcher, ExtensionError};
@@ -52,7 +52,9 @@ use tokio::sync::{Notify, broadcast};
 
 use crate::service::ConversationService;
 use crate::skill_resolver::{FixedSkillResolver, ResolvedAgentSkill, SkillResolver};
-use crate::{ConversationAgentTurnRequest, ConversationAgentTurnStatus, ConversationError};
+use crate::{
+    ConversationAgentTurnRequest, ConversationAgentTurnStartedCallback, ConversationAgentTurnStatus, ConversationError,
+};
 
 #[path = "service_test/acp_error_recovery_test.rs"]
 mod acp_error_recovery_test;
@@ -209,6 +211,7 @@ struct MockRepo {
     messages: Mutex<Vec<MessageRow>>,
     artifacts: Mutex<Vec<ConversationArtifactRow>>,
     assistant_snapshots: Mutex<Vec<ConversationAssistantSnapshotRow>>,
+    fail_next_update: AtomicBool,
 }
 
 impl MockRepo {
@@ -218,7 +221,12 @@ impl MockRepo {
             messages: Mutex::new(vec![]),
             artifacts: Mutex::new(vec![]),
             assistant_snapshots: Mutex::new(vec![]),
+            fail_next_update: AtomicBool::new(false),
         }
+    }
+
+    fn fail_next_update(&self) {
+        self.fail_next_update.store(true, Ordering::SeqCst);
     }
 }
 
@@ -256,6 +264,9 @@ impl IConversationRepository for MockRepo {
     }
 
     async fn update(&self, id: &str, updates: &ConversationRowUpdate) -> Result<(), aionui_db::DbError> {
+        if self.fail_next_update.swap(false, Ordering::SeqCst) {
+            return Err(aionui_db::DbError::Init("forced conversation update failure".into()));
+        }
         let mut rows = self.rows.lock().unwrap();
         let row = rows
             .iter_mut()
@@ -3310,6 +3321,35 @@ fn make_send_req() -> SendMessageRequest {
     .unwrap()
 }
 
+fn prompt_acceptance_counter() -> (Arc<AtomicUsize>, ConversationAgentTurnStartedCallback) {
+    let count = Arc::new(AtomicUsize::new(0));
+    let callback_count = Arc::clone(&count);
+    let callback: ConversationAgentTurnStartedCallback = Arc::new(move |_started| {
+        let callback_count = Arc::clone(&callback_count);
+        Box::pin(async move {
+            callback_count.fetch_add(1, Ordering::SeqCst);
+        })
+    });
+    (count, callback)
+}
+
+fn make_agent_turn_request(
+    conversation_id: String,
+    on_started: ConversationAgentTurnStartedCallback,
+) -> ConversationAgentTurnRequest {
+    ConversationAgentTurnRequest {
+        user_id: "user_1".into(),
+        conversation_id,
+        content: "run scheduled task".into(),
+        files: Vec::new(),
+        inject_skills: Vec::new(),
+        required_runtime_mode: None,
+        persist_user_message: false,
+        user_message_hidden: true,
+        on_started: Some(on_started),
+    }
+}
+
 fn assert_conversation_runtime_context(options: &BuildTaskOptions, user_id: &str, conversation_id: &str) {
     assert!(
         options
@@ -3453,6 +3493,118 @@ async fn run_agent_turn_injects_conversation_runtime_context() {
     let options = task_mgr.captured_options();
     assert_eq!(options.len(), 1);
     assert_conversation_runtime_context(&options[0], "user_1", &conv.id);
+}
+
+#[tokio::test]
+async fn run_agent_turn_reports_acceptance_only_after_prompt_send_succeeds() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (service, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = service.create("user_1", make_create_req()).await.unwrap();
+    let scripted_agent = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Finish(FinishEventData::default())]],
+    ));
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(scripted_agent));
+    let (accepted, callback) = prompt_acceptance_counter();
+
+    let outcome = service
+        .run_agent_turn(make_agent_turn_request(conv.id, callback))
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.status, ConversationAgentTurnStatus::Completed);
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn run_agent_turn_does_not_report_acceptance_when_task_options_fail() {
+    let (service, _broadcaster, repo, _task_mgr) = make_service();
+    let conv = service.create("user_1", make_create_req()).await.unwrap();
+    let missing_workspace = format!("/tmp/missing-{}", ConversationService::mint_msg_id());
+    repo.update(
+        &conv.id,
+        &ConversationRowUpdate {
+            extra: Some(json!({ "workspace": missing_workspace }).to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let (accepted, callback) = prompt_acceptance_counter();
+
+    let outcome = service
+        .run_agent_turn(make_agent_turn_request(conv.id, callback))
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.status, ConversationAgentTurnStatus::Failed);
+    assert_eq!(accepted.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn run_agent_turn_does_not_report_acceptance_when_agent_build_fails() {
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(FailingBuildTaskManager::new("forced build failure"));
+    let repo = Arc::new(MockRepo::new());
+    let service = ConversationService::new(
+        std::env::temp_dir(),
+        Arc::new(MockBroadcaster::new()),
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        task_mgr,
+        repo,
+        Arc::new(StubAgentMetadataRepo),
+        Arc::new(StubAcpSessionRepo::default()),
+    );
+    let conv = service.create("user_1", make_create_req()).await.unwrap();
+    let (accepted, callback) = prompt_acceptance_counter();
+
+    let outcome = service
+        .run_agent_turn(make_agent_turn_request(conv.id, callback))
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.status, ConversationAgentTurnStatus::Failed);
+    assert_eq!(accepted.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn run_agent_turn_does_not_report_acceptance_when_workspace_persistence_fails() {
+    let (service, _broadcaster, repo, _task_mgr) = make_service();
+    let conv = service.create("user_1", make_create_req()).await.unwrap();
+    repo.fail_next_update();
+    let (accepted, callback) = prompt_acceptance_counter();
+
+    let outcome = service
+        .run_agent_turn(make_agent_turn_request(conv.id, callback))
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.status, ConversationAgentTurnStatus::Failed);
+    assert_eq!(accepted.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn run_agent_turn_does_not_report_acceptance_when_prompt_send_fails() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (service, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = service.create("user_1", make_create_req()).await.unwrap();
+    let scripted_agent = Arc::new(
+        ScriptedAgent::new(&conv.id, vec![vec![]])
+            .with_agent_type(AgentType::Aionrs)
+            .with_status(None)
+            .with_send_error(AgentSendError::from_agent_error(AgentError::bad_gateway(
+                "forced prompt send failure",
+            ))),
+    );
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(scripted_agent));
+    let (accepted, callback) = prompt_acceptance_counter();
+
+    let outcome = service
+        .run_agent_turn(make_agent_turn_request(conv.id, callback))
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.status, ConversationAgentTurnStatus::Failed);
+    assert_eq!(accepted.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -4602,6 +4754,7 @@ async fn send_message_persists_openclaw_gateway_unreachable_tip_when_turn_build_
                 hidden: false,
                 files: vec![],
                 inject_skills: vec![],
+                idempotency_key: None,
             },
             &task_mgr,
         )
@@ -7117,6 +7270,151 @@ async fn warmup_restores_skill_links_for_custom_workspace() {
     assert_eq!(calls[0].workspace, workspace);
     assert_eq!(calls[0].rel_dirs, vec![".claude/skills"]);
     assert_eq!(calls[0].skill_names, vec!["cron"]);
+}
+
+fn team_snapshot_bootstrap_payload(skills: &[&str]) -> serde_json::Value {
+    json!({
+        "skills": skills,
+        "mcp_server_ids": [],
+        "mcp_servers": [],
+        "mcp_statuses": [],
+        "session_mcp_servers": [],
+    })
+}
+
+async fn make_core_bound_team_conversation() -> (
+    ConversationService,
+    Arc<MockRepo>,
+    Arc<dyn IWorkerTaskManager>,
+    ConversationResponse,
+) {
+    let (svc, _broadcaster, conversation_repo, task_mgr) = make_service();
+    let database = init_database_memory().await.unwrap();
+    let team_repo = Arc::new(SqliteTeamRepository::new(database.pool().clone()));
+    svc.with_team_repo(team_repo.clone());
+    let workspace = ensure_test_workspace_path();
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": {
+            "workspace": workspace,
+            "backend": "claude",
+            "teamId": "team-bootstrap-1",
+            "slot_id": "slot-bootstrap-1",
+            "role": "lead",
+            "_team_snapshot_bootstrap_pending": true,
+        },
+    }))
+    .unwrap();
+    let conversation = svc.create("u", req).await.unwrap();
+    team_repo
+        .create_team(&TeamRow {
+            id: "team-bootstrap-1".into(),
+            user_id: "u".into(),
+            name: "Bootstrap Team".into(),
+            workspace,
+            workspace_mode: "shared".into(),
+            agents: json!([{
+                "slot_id": "slot-bootstrap-1",
+                "conversation_id": conversation.id,
+                "role": "lead",
+            }])
+            .to_string(),
+            lead_agent_id: Some("slot-bootstrap-1".into()),
+            session_mode: None,
+            agents_version: "1.0.1".into(),
+            created_at: 1,
+            updated_at: 1,
+        })
+        .await
+        .unwrap();
+    (svc, conversation_repo, task_mgr, conversation)
+}
+
+#[tokio::test]
+async fn update_allows_one_core_bound_team_snapshot_bootstrap_then_freezes_it() {
+    let (svc, repo, task_mgr, conversation) = make_core_bound_team_conversation().await;
+
+    let identity_patch: UpdateConversationRequest = serde_json::from_value(json!({
+        "extra": { "teamId": "other-team" },
+    }))
+    .unwrap();
+    let err = svc
+        .update("u", &conversation.id, identity_patch, &task_mgr)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ConversationError::BadRequest { reason } if reason.contains("identity")));
+
+    let update_req: UpdateConversationRequest = serde_json::from_value(json!({
+        "extra": team_snapshot_bootstrap_payload(&["cron", "pdf"]),
+    }))
+    .unwrap();
+    let updated = svc.update("u", &conversation.id, update_req, &task_mgr).await.unwrap();
+    assert_eq!(updated.extra["skills"], json!(["cron", "pdf"]));
+    assert!(updated.extra.get("_team_snapshot_bootstrap_pending").is_none());
+
+    let persisted = repo.get(&conversation.id).await.unwrap().unwrap();
+    let persisted_extra: serde_json::Value = serde_json::from_str(&persisted.extra).unwrap();
+    assert!(persisted_extra.get("_team_snapshot_bootstrap_pending").is_none());
+
+    let repeat_req: UpdateConversationRequest = serde_json::from_value(json!({
+        "extra": team_snapshot_bootstrap_payload(&["other"]),
+    }))
+    .unwrap();
+    let err = svc
+        .update("u", &conversation.id, repeat_req, &task_mgr)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ConversationError::BadRequest { reason } if reason.contains("immutable")));
+}
+
+#[tokio::test]
+async fn update_rejects_forged_team_snapshot_bootstrap_without_team_binding() {
+    let (svc, _broadcaster, _repo, task_mgr) = make_service();
+    let workspace = ensure_test_workspace_path();
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": {
+            "workspace": workspace,
+            "backend": "claude",
+            "teamId": "forged-team",
+            "slot_id": "forged-slot",
+            "role": "lead",
+            "_team_snapshot_bootstrap_pending": true,
+        },
+    }))
+    .unwrap();
+    let conversation = svc.create("u", req).await.unwrap();
+    let update_req: UpdateConversationRequest = serde_json::from_value(json!({
+        "extra": team_snapshot_bootstrap_payload(&["cron"]),
+    }))
+    .unwrap();
+
+    let err = svc
+        .update("u", &conversation.id, update_req, &task_mgr)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ConversationError::BadRequest { reason } if reason.contains("immutable")));
+}
+
+#[tokio::test]
+async fn warmup_consumes_pending_team_snapshot_bootstrap_before_build() {
+    let (svc, repo, task_mgr, conversation) = make_core_bound_team_conversation().await;
+
+    svc.warmup("u", &conversation.id, &task_mgr).await.unwrap();
+
+    let persisted = repo.get(&conversation.id).await.unwrap().unwrap();
+    let persisted_extra: serde_json::Value = serde_json::from_str(&persisted.extra).unwrap();
+    assert!(persisted_extra.get("_team_snapshot_bootstrap_pending").is_none());
+
+    let update_req: UpdateConversationRequest = serde_json::from_value(json!({
+        "extra": team_snapshot_bootstrap_payload(&["late"]),
+    }))
+    .unwrap();
+    let err = svc
+        .update("u", &conversation.id, update_req, &task_mgr)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ConversationError::BadRequest { reason } if reason.contains("immutable")));
 }
 
 #[tokio::test]

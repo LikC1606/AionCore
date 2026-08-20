@@ -120,15 +120,24 @@ impl SlotWorkCoordinator {
                 created_new_run: false,
                 user_intervention: false,
             },
-            CausalBinding::InheritRunningBatch { caller_slot_id } => RunBinding {
-                team_run_id: state
+            CausalBinding::InheritRunningBatch { caller_slot_id } => {
+                let inherited_run_id = state
                     .slots
                     .get(caller_slot_id)
                     .and_then(|caller| caller.active.as_ref())
-                    .and_then(|active| active.batch.team_run_ids.first().cloned()),
-                created_new_run: false,
-                user_intervention: false,
-            },
+                    .and_then(|active| active.batch.team_run_ids.first().cloned());
+                match inherited_run_id {
+                    Some(team_run_id) => RunBinding {
+                        team_run_id: Some(team_run_id),
+                        created_new_run: false,
+                        user_intervention: false,
+                    },
+                    // A caller may remain inside its agent turn after the
+                    // previous run has settled. Keep the wake causally tracked
+                    // instead of rejecting it or leaving it run-less.
+                    None => self.run_causality.bind_system_enqueue(&request),
+                }
+            }
             CausalBinding::UserVisible | CausalBinding::ActiveRunOrBackground => {
                 self.run_causality.bind_enqueue(&request)
             }
@@ -674,34 +683,36 @@ impl SlotWorkCoordinator {
         CommitResult::Committed
     }
 
-    pub(crate) fn pause_slot(&self, slot_id: &str) -> PauseWorkResult {
+    pub(crate) fn pause_slot(&self, slot_id: &str) -> Result<PauseWorkResult, TeamError> {
         let mut state = self.lock_state();
         let slot = state
             .slots
-            .entry(slot_id.to_owned())
-            .or_insert_with(|| SlotState::new(TeamRunTargetRole::Teammate));
+            .get_mut(slot_id)
+            .ok_or_else(|| TeamError::AgentNotFound(slot_id.to_owned()))?;
         slot.paused = true;
         let cancel_target = slot.active.as_ref().map(|active| BatchCancelTarget {
             batch: active.batch.clone(),
             turn_id: active.turn_id.clone(),
         });
         let snapshot = Self::slot_snapshot_locked(&state, slot_id).expect("paused slot exists");
-        PauseWorkResult {
+        Ok(PauseWorkResult {
             cancel_target,
             slot: snapshot,
-        }
+        })
     }
 
     pub(crate) fn set_runtime_constraint(
         &self,
         slot_id: &str,
+        role: TeamRunTargetRole,
         constraint: RuntimeConstraint,
     ) -> RuntimeConstraintUpdate {
         let mut state = self.lock_state();
         let slot = state
             .slots
             .entry(slot_id.to_owned())
-            .or_insert_with(|| SlotState::new(TeamRunTargetRole::Teammate));
+            .or_insert_with(|| SlotState::new(role.clone()));
+        slot.role = role;
         slot.runtime_constraint = constraint.clone();
 
         let mut terminal_message_ids = Vec::new();
