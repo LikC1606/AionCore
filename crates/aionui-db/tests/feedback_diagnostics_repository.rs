@@ -1014,6 +1014,17 @@ async fn global_summary_includes_recent_diagnostics_without_sensitive_payloads()
 async fn client_ui_settings_profile_exports_existing_preferences() {
     let db = init_database_memory().await.unwrap();
     insert_feedback_fixture(&db).await;
+    sqlx::query(
+        "INSERT INTO client_preferences (key, value, updated_at) VALUES (?, ?, ?)",
+    )
+    .bind("memory.global.entries")
+    .bind(
+        r#"{"schema":"deepscientist.global-memory.v1","entries":[{"id":"private","enabled":true,"title":"Private context","content":"memory-body-must-not-enter-diagnostics","updatedAt":1}]}"#,
+    )
+    .bind(ANCHOR_UPDATED_AT + 101)
+    .execute(db.pool())
+    .await
+    .unwrap();
     let repo = SqliteFeedbackDiagnosticsRepository::new(db.pool().clone());
 
     let result = repo
@@ -1035,6 +1046,9 @@ async fn client_ui_settings_profile_exports_existing_preferences() {
     assert_eq!(profile.data["preferences"]["items"][0]["key"], "appearance.uiScale");
     assert_eq!(profile.data["system_settings"]["language"], "zh-CN");
     assert_eq!(profile.data["system_settings"]["command_queue_enabled"], true);
+    let serialized = serde_json::to_string(profile).unwrap();
+    assert!(!serialized.contains("memory.global.entries"));
+    assert!(!serialized.contains("memory-body-must-not-enter-diagnostics"));
 }
 
 #[tokio::test]

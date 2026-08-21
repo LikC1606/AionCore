@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 use aionui_api_types::{ClientPreferencesResponse, UpdateClientPreferencesRequest};
@@ -10,6 +10,15 @@ use crate::keep_awake::{DynKeepAwakeController, KEEP_AWAKE_KEY, NoopKeepAwakeCon
 
 /// Maximum allowed key length for client preferences.
 const MAX_KEY_LENGTH: usize = 255;
+const GLOBAL_MEMORY_KEY: &str = "memory.global.entries";
+const GLOBAL_MEMORY_SCHEMA: &str = "deepscientist.global-memory.v1";
+const GLOBAL_MEMORY_MAX_VALUE_BYTES: usize = 64 * 1024;
+const GLOBAL_MEMORY_MAX_ENTRIES: usize = 20;
+const GLOBAL_MEMORY_MAX_ID_CHARS: usize = 128;
+const GLOBAL_MEMORY_MAX_TITLE_CHARS: usize = 80;
+const GLOBAL_MEMORY_MAX_CONTENT_CHARS: usize = 2_000;
+const GLOBAL_MEMORY_MAX_ENABLED_CONTENT_CHARS: usize = 8_000;
+const GLOBAL_MEMORY_MAX_UPDATED_AT_MS: u64 = 8_640_000_000_000_000;
 
 /// Business logic for client preferences (generic key-value store).
 #[derive(Clone)]
@@ -83,6 +92,7 @@ impl ClientPrefService {
 
         for (key, value) in req {
             validate_key(&key)?;
+            validate_preference_value(&key, &value)?;
 
             if value.is_null() {
                 info!(
@@ -222,6 +232,107 @@ fn validate_key(key: &str) -> Result<(), SystemError> {
         )));
     }
     Ok(())
+}
+
+fn validate_preference_value(key: &str, value: &serde_json::Value) -> Result<(), SystemError> {
+    if key != GLOBAL_MEMORY_KEY || value.is_null() {
+        return Ok(());
+    }
+    let serialized_bytes = serde_json::to_vec(value)
+        .map_err(|error| SystemError::BadRequest(format!("Invalid global Memory value: {error}")))?
+        .len();
+    if serialized_bytes > GLOBAL_MEMORY_MAX_VALUE_BYTES {
+        return Err(global_memory_error(format!(
+            "value exceeds {GLOBAL_MEMORY_MAX_VALUE_BYTES} bytes"
+        )));
+    }
+    let object = value
+        .as_object()
+        .ok_or_else(|| global_memory_error("value must be an object"))?;
+    if object.len() != 2 || object.keys().any(|key| key != "schema" && key != "entries") {
+        return Err(global_memory_error("value contains unsupported fields"));
+    }
+    if object.get("schema").and_then(serde_json::Value::as_str) != Some(GLOBAL_MEMORY_SCHEMA) {
+        return Err(global_memory_error(format!("schema must be {GLOBAL_MEMORY_SCHEMA}")));
+    }
+    let entries = object
+        .get("entries")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| global_memory_error("entries must be an array"))?;
+    if entries.len() > GLOBAL_MEMORY_MAX_ENTRIES {
+        return Err(global_memory_error(format!(
+            "entries exceeds the limit of {GLOBAL_MEMORY_MAX_ENTRIES}"
+        )));
+    }
+
+    let mut ids = HashSet::new();
+    let mut enabled_content_chars = 0usize;
+    for (index, entry) in entries.iter().enumerate() {
+        let entry = entry
+            .as_object()
+            .ok_or_else(|| global_memory_error(format!("entries[{index}] must be an object")))?;
+        if entry.len() != 5
+            || entry
+                .keys()
+                .any(|key| !["id", "enabled", "title", "content", "updatedAt"].contains(&key.as_str()))
+        {
+            return Err(global_memory_error(format!(
+                "entries[{index}] contains unsupported fields"
+            )));
+        }
+        let id = required_global_memory_text(entry, index, "id", GLOBAL_MEMORY_MAX_ID_CHARS)?;
+        if !ids.insert(id) {
+            return Err(global_memory_error(format!("entries[{index}].id is duplicated")));
+        }
+        required_global_memory_text(entry, index, "title", GLOBAL_MEMORY_MAX_TITLE_CHARS)?;
+        let content = required_global_memory_text(entry, index, "content", GLOBAL_MEMORY_MAX_CONTENT_CHARS)?;
+        let enabled = entry
+            .get("enabled")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(|| global_memory_error(format!("entries[{index}].enabled must be a boolean")))?;
+        let updated_at = entry
+            .get("updatedAt")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| global_memory_error(format!("entries[{index}].updatedAt must be a non-negative integer")))?;
+        if updated_at > GLOBAL_MEMORY_MAX_UPDATED_AT_MS {
+            return Err(global_memory_error(format!(
+                "entries[{index}].updatedAt exceeds the JavaScript Date range"
+            )));
+        }
+        if enabled {
+            enabled_content_chars = enabled_content_chars.saturating_add(content.chars().count());
+        }
+    }
+    if enabled_content_chars > GLOBAL_MEMORY_MAX_ENABLED_CONTENT_CHARS {
+        return Err(global_memory_error(format!(
+            "enabled content exceeds {GLOBAL_MEMORY_MAX_ENABLED_CONTENT_CHARS} characters"
+        )));
+    }
+    Ok(())
+}
+
+fn required_global_memory_text<'a>(
+    entry: &'a serde_json::Map<String, serde_json::Value>,
+    index: usize,
+    field: &str,
+    max_chars: usize,
+) -> Result<&'a str, SystemError> {
+    let value = entry
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| global_memory_error(format!("entries[{index}].{field} must be a non-empty string")))?;
+    if value.chars().count() > max_chars {
+        return Err(global_memory_error(format!(
+            "entries[{index}].{field} exceeds {max_chars} characters"
+        )));
+    }
+    Ok(value)
+}
+
+fn global_memory_error(reason: impl std::fmt::Display) -> SystemError {
+    SystemError::BadRequest(format!("Invalid {GLOBAL_MEMORY_KEY}: {reason}"))
 }
 
 fn resolve_keep_awake_update(req: &UpdateClientPreferencesRequest) -> Result<Option<bool>, SystemError> {
@@ -484,6 +595,100 @@ mod tests {
         req.insert("x".repeat(256), json!(true));
         let err = svc.update_preferences(req).await.unwrap_err();
         assert!(matches!(err, SystemError::BadRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn global_memory_accepts_bounded_schema() {
+        let svc = setup().await;
+        let mut req = UpdateClientPreferencesRequest::new();
+        req.insert(
+            GLOBAL_MEMORY_KEY.into(),
+            json!({
+                "schema": GLOBAL_MEMORY_SCHEMA,
+                "entries": [{
+                    "id": "memory-1",
+                    "enabled": true,
+                    "title": "Units",
+                    "content": "Use SI units.",
+                    "updatedAt": 1,
+                }],
+            }),
+        );
+
+        svc.update_preferences(req).await.unwrap();
+
+        let stored = svc.get_preferences(Some(&[GLOBAL_MEMORY_KEY])).await.unwrap();
+        assert_eq!(stored[GLOBAL_MEMORY_KEY]["entries"][0]["title"], "Units");
+    }
+
+    #[tokio::test]
+    async fn global_memory_rejects_invalid_schema_and_oversized_content() {
+        let svc = setup().await;
+        for value in [
+            json!({ "schema": "wrong", "entries": [] }),
+            json!({
+                "schema": GLOBAL_MEMORY_SCHEMA,
+                "entries": [],
+                "unexpected": "must not be persisted",
+            }),
+            json!({
+                "schema": GLOBAL_MEMORY_SCHEMA,
+                "entries": [{
+                    "id": "memory-1",
+                    "enabled": true,
+                    "title": "Future",
+                    "content": "Content",
+                    "updatedAt": GLOBAL_MEMORY_MAX_UPDATED_AT_MS + 1,
+                }],
+            }),
+            json!({
+                "schema": GLOBAL_MEMORY_SCHEMA,
+                "entries": [{
+                    "id": "memory-1",
+                    "enabled": true,
+                    "title": "Too long",
+                    "content": "x".repeat(GLOBAL_MEMORY_MAX_CONTENT_CHARS + 1),
+                    "updatedAt": 1,
+                }],
+            }),
+        ] {
+            let mut req = UpdateClientPreferencesRequest::new();
+            req.insert(GLOBAL_MEMORY_KEY.into(), value);
+            assert!(matches!(
+                svc.update_preferences(req).await.unwrap_err(),
+                SystemError::BadRequest(_)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn global_memory_rejects_duplicate_ids_and_enabled_total_overflow() {
+        let svc = setup().await;
+        let base = |id: &str, content: String| {
+            json!({
+                "id": id,
+                "enabled": true,
+                "title": "Memory",
+                "content": content,
+                "updatedAt": 1,
+            })
+        };
+        for entries in [
+            vec![base("same", "a".into()), base("same", "b".into())],
+            (0..5)
+                .map(|index| base(&format!("memory-{index}"), "x".repeat(GLOBAL_MEMORY_MAX_CONTENT_CHARS)))
+                .collect(),
+        ] {
+            let mut req = UpdateClientPreferencesRequest::new();
+            req.insert(
+                GLOBAL_MEMORY_KEY.into(),
+                json!({ "schema": GLOBAL_MEMORY_SCHEMA, "entries": entries }),
+            );
+            assert!(matches!(
+                svc.update_preferences(req).await.unwrap_err(),
+                SystemError::BadRequest(_)
+            ));
+        }
     }
 
     #[tokio::test]

@@ -242,6 +242,76 @@ pub struct ProjectGitPreflightResponse {
     pub repository_candidates: Option<Vec<String>>,
 }
 
+/// Request for creating a server-owned project workspace. WebUI currently
+/// supports only the `managed` strategy; the remaining fields mirror the
+/// desktop contract so the renderer can use one bridge in both runtimes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectGitPrepareWorkspaceRequest {
+    pub base_dir: String,
+    pub goal: String,
+    pub conversation_id: String,
+    pub strategy: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_workspace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_kind: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectGitWorkspaceBindingResponse {
+    pub schema: String,
+    pub strategy: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    pub source_root: String,
+    pub workspace_root: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_commit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_dirty: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectGitPrepareWorkspaceResponse {
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binding: Option<ProjectGitWorkspaceBindingResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectGitBindConversationRequest {
+    pub workspace: String,
+    pub conversation_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectGitBindConversationResponse {
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository: Option<ProjectGitRepositoryResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub short_commit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// Shared request used by read-only Project Git endpoints.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProjectGitDiscoverRequest {
@@ -677,6 +747,35 @@ mod tests {
         });
         let req: CopyFilesRequest = serde_json::from_value(raw).unwrap();
         assert!(req.source_root.is_none());
+    }
+
+    #[test]
+    fn project_git_prepare_workspace_uses_the_renderer_camel_case_contract() {
+        let req: ProjectGitPrepareWorkspaceRequest = serde_json::from_value(json!({
+            "baseDir": "/srv/deepscientist",
+            "goal": "Test a managed project",
+            "conversationId": "project_123",
+            "strategy": "managed"
+        }))
+        .unwrap();
+        assert_eq!(req.base_dir, "/srv/deepscientist");
+        assert_eq!(req.conversation_id, "project_123");
+        assert!(req.source_workspace.is_none());
+
+        let value = serde_json::to_value(ProjectGitWorkspaceBindingResponse {
+            schema: "deepscientist.project_git.v1".to_owned(),
+            strategy: "managed".to_owned(),
+            project_id: Some("project_123".to_owned()),
+            source_root: "/srv/deepscientist/managed-projects/project_123".to_owned(),
+            workspace_root: "/srv/deepscientist/managed-projects/project_123".to_owned(),
+            branch: Some("main".to_owned()),
+            base_commit: Some("abc".to_owned()),
+            source_dirty: Some(false),
+        })
+        .unwrap();
+        assert_eq!(value["projectId"], "project_123");
+        assert_eq!(value["baseCommit"], "abc");
+        assert_eq!(value["sourceDirty"], false);
     }
 
     #[test]

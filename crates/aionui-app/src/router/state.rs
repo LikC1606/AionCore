@@ -457,6 +457,7 @@ pub fn build_file_state(services: &AppServices) -> Result<FileRouterState, Route
         watch_service,
         snapshot_service,
         allowed_roots,
+        work_dir: services.work_dir.clone(),
         browse_roots,
     })
 }

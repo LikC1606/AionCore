@@ -767,11 +767,12 @@ impl SqliteFeedbackDiagnosticsRepository {
         let preference_rows = sqlx::query(
             "SELECT key, value, updated_at \
              FROM client_preferences \
-             WHERE key LIKE 'appearance.%' \
+             WHERE key != 'memory.global.entries' \
+               AND (key LIKE 'appearance.%' \
                 OR key LIKE 'window.%' \
                 OR key LIKE 'display.%' \
                 OR key LIKE 'workspace.%' \
-                OR key LIKE 'settings.%' \
+                OR key LIKE 'settings.%') \
              ORDER BY updated_at DESC, key ASC \
              LIMIT 50",
         )

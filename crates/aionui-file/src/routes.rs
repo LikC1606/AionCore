@@ -12,14 +12,15 @@ use aionui_api_types::{
     ApiResponse, BrowseDirectoryQuery, BrowseDirectoryResponse, CancelZipRequest, CopyFilesRequest, CopyFilesResponse,
     CreateTempFileRequest, DirOrFileResponse, FetchRemoteImageRequest, FileChangeInfoResponse, FileMetadataResponse,
     FileWatchRequest, GetFileMetadataRequest, GetFilesByDirRequest, GetImageBase64Request, ListWorkspaceFilesRequest,
-    ProjectGitBlobRequest, ProjectGitBlobResponse, ProjectGitCommitRequest, ProjectGitCommitResponse,
-    ProjectGitDiffRequest, ProjectGitDiffResponse, ProjectGitDiscoverRequest, ProjectGitDiscoverResponse,
-    ProjectGitFrontierResponse, ProjectGitGraphRequest, ProjectGitGraphResponse, ProjectGitPreflightRequest,
-    ProjectGitPreflightResponse, ProjectGitTreeRequest, ProjectGitTreeResponse, ProjectGitWorkingDiffRequest,
-    ProjectGitWorkingDiffResponse, ProjectGitWorkingTreeResponse, ReadFileBufferRequest, ReadFileRequest,
-    RemoveEntryRequest, RenameRequest, RenameResponse, SnapshotBaselineRequest, SnapshotCompareResponse,
-    SnapshotDiscardRequest, SnapshotInfoResponse, SnapshotStageRequest, SnapshotWorkspaceRequest,
-    WorkspaceFlatFileResponse, WorkspaceOfficeWatchRequest, WriteFileRequest, ZipRequest,
+    ProjectGitBindConversationRequest, ProjectGitBindConversationResponse, ProjectGitBlobRequest,
+    ProjectGitBlobResponse, ProjectGitCommitRequest, ProjectGitCommitResponse, ProjectGitDiffRequest,
+    ProjectGitDiffResponse, ProjectGitDiscoverRequest, ProjectGitDiscoverResponse, ProjectGitFrontierResponse,
+    ProjectGitGraphRequest, ProjectGitGraphResponse, ProjectGitPreflightRequest, ProjectGitPreflightResponse,
+    ProjectGitPrepareWorkspaceRequest, ProjectGitPrepareWorkspaceResponse, ProjectGitTreeRequest,
+    ProjectGitTreeResponse, ProjectGitWorkingDiffRequest, ProjectGitWorkingDiffResponse, ProjectGitWorkingTreeResponse,
+    ReadFileBufferRequest, ReadFileRequest, RemoveEntryRequest, RenameRequest, RenameResponse, SnapshotBaselineRequest,
+    SnapshotCompareResponse, SnapshotDiscardRequest, SnapshotInfoResponse, SnapshotStageRequest,
+    SnapshotWorkspaceRequest, WorkspaceFlatFileResponse, WorkspaceOfficeWatchRequest, WriteFileRequest, ZipRequest,
 };
 use aionui_common::ApiError;
 use aionui_common::constants::UPLOAD_MAX_SIZE;
@@ -99,6 +100,10 @@ pub struct FileRouterState {
     pub watch_service: FileWatchServiceRef,
     pub snapshot_service: SnapshotServiceRef,
     pub allowed_roots: Vec<std::path::PathBuf>,
+    /// Backend-owned root for managed project creation. Unlike `browse_roots`,
+    /// this path is never supplied by the browser and must not be widened to a
+    /// home directory or filesystem root.
+    pub work_dir: std::path::PathBuf,
     /// Roots permitted by the shallow `/api/fs/browse` endpoint. This is
     /// typically wider than `allowed_roots` (it includes `cwd`, Windows
     /// drive letters, and `/` on Unix) because the WebUI host-file picker
@@ -129,6 +134,14 @@ pub fn file_routes(state: FileRouterState) -> Router {
         // A. Core file operations
         .route("/api/fs/browse", get(browse_directory))
         .route("/api/fs/project-git/preflight", post(project_git_preflight))
+        .route(
+            "/api/fs/project-git/prepare-workspace",
+            post(project_git_prepare_workspace),
+        )
+        .route(
+            "/api/fs/project-git/bind-conversation",
+            post(project_git_bind_conversation),
+        )
         .route("/api/fs/project-git/discover", post(project_git_discover))
         .route("/api/fs/project-git/graph", post(project_git_graph))
         .route("/api/fs/project-git/frontier", post(project_git_frontier))
@@ -216,6 +229,49 @@ async fn project_git_preflight(
     })
     .await
     .map_err(|error| ApiError::Internal(format!("Git preflight task failed: {error}")))??;
+    Ok(Json(ApiResponse::ok(response)))
+}
+
+async fn project_git_prepare_workspace(
+    State(state): State<FileRouterState>,
+    body: Result<Json<ProjectGitPrepareWorkspaceRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<ProjectGitPrepareWorkspaceResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let work_dir = state.work_dir.clone();
+    let response = tokio::task::spawn_blocking(move || crate::project_git::prepare_managed_workspace(req, work_dir))
+        .await
+        .map_err(|error| ApiError::Internal(format!("Managed Git preparation task failed: {error}")))??;
+    Ok(Json(ApiResponse::ok(response)))
+}
+
+fn resolve_project_bind_path(workspace: &str, allowed_roots: &[PathBuf]) -> Result<PathBuf, FileError> {
+    let workspace = workspace.trim();
+    if workspace.is_empty() {
+        return Err(FileError::BadRequest("workspace is required".to_owned()));
+    }
+    let allowed_root_refs: Vec<&Path> = allowed_roots.iter().map(PathBuf::as_path).collect();
+    let workspace = crate::path_safety::validate_path(workspace, &allowed_root_refs)?;
+    let repository = git2::Repository::discover(&workspace)
+        .map_err(|_| FileError::BadRequest("The selected workspace is not a Git repository.".to_owned()))?;
+    let repository_root = repository
+        .workdir()
+        .ok_or_else(|| FileError::BadRequest("Bare Git repositories cannot be bound to conversations.".to_owned()))?;
+    // A selected subdirectory may live below a repository whose root is above
+    // it. Validate the actual mutation target as well as the browser-supplied
+    // workspace before allowing HEAD to be amended.
+    crate::path_safety::validate_path(&repository_root.to_string_lossy(), &allowed_root_refs)?;
+    Ok(workspace)
+}
+
+async fn project_git_bind_conversation(
+    State(state): State<FileRouterState>,
+    body: Result<Json<ProjectGitBindConversationRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<ProjectGitBindConversationResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let workspace = resolve_project_bind_path(&req.workspace, &state.allowed_roots)?;
+    let response = tokio::task::spawn_blocking(move || crate::project_git::bind_project_conversation(req, workspace))
+        .await
+        .map_err(|error| ApiError::Internal(format!("Project Git binding task failed: {error}")))??;
     Ok(Json(ApiResponse::ok(response)))
 }
 
@@ -922,6 +978,36 @@ mod tests {
         assert!(!first.is_empty());
         assert_eq!(first, second);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn project_bind_path_accepts_a_git_workspace_inside_an_allowed_root() {
+        let allowed = tempfile::tempdir().unwrap();
+        let workspace = allowed.path().join("project");
+        std::fs::create_dir(&workspace).unwrap();
+        git2::Repository::init(&workspace).unwrap();
+
+        let resolved =
+            resolve_project_bind_path(&workspace.to_string_lossy(), &[allowed.path().to_path_buf()]).unwrap();
+        assert_eq!(resolved, std::fs::canonicalize(workspace).unwrap());
+    }
+
+    #[test]
+    fn project_bind_path_rejects_non_git_and_outside_workspaces() {
+        let allowed = tempfile::tempdir().unwrap();
+        let plain = allowed.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        assert!(matches!(
+            resolve_project_bind_path(&plain.to_string_lossy(), &[allowed.path().to_path_buf()]),
+            Err(FileError::BadRequest(_))
+        ));
+
+        let outside = tempfile::tempdir().unwrap();
+        git2::Repository::init(outside.path()).unwrap();
+        assert!(matches!(
+            resolve_project_bind_path(&outside.path().to_string_lossy(), &[allowed.path().to_path_buf()]),
+            Err(FileError::PathOutsideSandbox { .. })
+        ));
     }
 
     #[test]

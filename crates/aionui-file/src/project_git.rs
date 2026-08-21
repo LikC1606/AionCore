@@ -3,19 +3,22 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use aionui_api_types::{
-    ProjectGitBlobRequest, ProjectGitBlobResponse, ProjectGitChangedFileResponse, ProjectGitCommitDetailResponse,
-    ProjectGitCommitRequest, ProjectGitCommitResponse, ProjectGitCommitSummaryResponse, ProjectGitDiffRequest,
-    ProjectGitDiffResponse, ProjectGitDiscoverResponse, ProjectGitFrontierResponse, ProjectGitGraphRequest,
-    ProjectGitGraphResponse, ProjectGitPreflightResponse, ProjectGitRepositoryResponse,
-    ProjectGitResearchBranchResponse, ProjectGitTreeEntryResponse, ProjectGitTreeRequest, ProjectGitTreeResponse,
-    ProjectGitWorkingDiffRequest, ProjectGitWorkingTreeResponse,
+    ProjectGitBindConversationRequest, ProjectGitBindConversationResponse, ProjectGitBlobRequest,
+    ProjectGitBlobResponse, ProjectGitChangedFileResponse, ProjectGitCommitDetailResponse, ProjectGitCommitRequest,
+    ProjectGitCommitResponse, ProjectGitCommitSummaryResponse, ProjectGitDiffRequest, ProjectGitDiffResponse,
+    ProjectGitDiscoverResponse, ProjectGitFrontierResponse, ProjectGitGraphRequest, ProjectGitGraphResponse,
+    ProjectGitPreflightResponse, ProjectGitPrepareWorkspaceRequest, ProjectGitPrepareWorkspaceResponse,
+    ProjectGitRepositoryResponse, ProjectGitResearchBranchResponse, ProjectGitTreeEntryResponse, ProjectGitTreeRequest,
+    ProjectGitTreeResponse, ProjectGitWorkingDiffRequest, ProjectGitWorkingTreeResponse,
+    ProjectGitWorkspaceBindingResponse,
 };
 use base64::Engine;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use git2::{
-    BranchType, Delta, Diff, DiffFlags, DiffFormat, DiffOptions, ObjectType, Oid, Repository, Sort, Status,
-    StatusOptions,
+    BranchType, Delta, Diff, DiffFlags, DiffFormat, DiffOptions, ObjectType, Oid, Repository, RepositoryInitOptions,
+    Signature, Sort, Status, StatusOptions,
 };
+use serde_json::json;
 
 use crate::error::FileError;
 
@@ -23,10 +26,335 @@ const MAX_DIRECT_CHILDREN: usize = 256;
 const MAX_GRAPH_COMMITS: usize = 200;
 const MAX_TEXT_BYTES: usize = 5 * 1024 * 1024;
 const MAX_BINARY_BYTES: usize = 10 * 1024 * 1024;
+const PROJECT_MANIFEST_PATH: &str = ".deepscientist/project.json";
+const DEEPSCIENTIST_GITIGNORE_PATH: &str = ".deepscientist/.gitignore";
+
+const MANAGED_ROOT_GITIGNORE: &str = ".DS_Store\n\
+.deepscientist/artifact-repo/\n\
+.deepscientist/science-artifacts/\n\
+.deepscientist/factor-search/\n\
+.agents/skills/\n\
+.codex/skills/\n\
+node_modules/\n\
+out/\n\
+dist/\n\
+build/\n\
+coverage/\n\
+.cache/\n\
+__pycache__/\n\
+.pytest_cache/\n\
+*.log\n\
+.env\n\
+.env.*\n\
+*.pem\n\
+*.key\n";
+
+const MANAGED_LOCAL_EXCLUDES: &str = ".agents/\n\
+.codex/\n\
+.deepscientist/artifact-repo/\n\
+.deepscientist/science-artifacts/\n\
+.deepscientist/exports/\n\
+.deepscientist/factor-search/\n";
 
 struct RepositoryContext {
     repository: Repository,
     response: ProjectGitRepositoryResponse,
+}
+
+fn managed_conversation_id(value: &str) -> Result<&str, FileError> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 120
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        return Err(FileError::BadRequest(
+            "Invalid managed project conversation id.".to_owned(),
+        ));
+    }
+    Ok(value)
+}
+
+fn checkpoint_conversation_id(value: &str) -> Result<&str, FileError> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 120 || value.contains(['\0', '\n', '\r']) {
+        return Err(FileError::BadRequest("Invalid project conversation id.".to_owned()));
+    }
+    Ok(value)
+}
+
+fn managed_project_response(
+    workspace: &Path,
+    project_id: &str,
+    created: bool,
+) -> Result<ProjectGitPrepareWorkspaceResponse, FileError> {
+    let repository = Repository::open(workspace)
+        .map_err(|error| FileError::Internal(format!("Unable to open managed Git repository: {error}")))?;
+    let selected = fs::canonicalize(workspace)
+        .map_err(|error| FileError::Internal(format!("Unable to resolve managed project workspace: {error}")))?;
+    let repository_response = repository_response(&repository, &selected, false)?;
+    let head = repository_response
+        .head
+        .clone()
+        .ok_or_else(|| FileError::Internal("The managed project has no baseline commit.".to_owned()))?;
+    let root = response_path(&selected);
+    Ok(ProjectGitPrepareWorkspaceResponse {
+        ok: true,
+        workspace: Some(root.clone()),
+        project_id: Some(project_id.to_owned()),
+        created: Some(created),
+        binding: Some(ProjectGitWorkspaceBindingResponse {
+            schema: "deepscientist.project_git.v1".to_owned(),
+            strategy: "managed".to_owned(),
+            project_id: Some(project_id.to_owned()),
+            source_root: root.clone(),
+            workspace_root: root,
+            branch: repository_response.branch,
+            base_commit: Some(head),
+            source_dirty: Some(false),
+        }),
+        error: None,
+    })
+}
+
+fn validate_existing_managed_project(workspace: &Path, project_id: &str) -> Result<(), FileError> {
+    let manifest_path = workspace.join(PROJECT_MANIFEST_PATH);
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(&manifest_path)
+            .map_err(|_| FileError::BadRequest("The managed project manifest is missing.".to_owned()))?,
+    )
+    .map_err(|_| FileError::BadRequest("The managed project manifest is invalid.".to_owned()))?;
+    if manifest.get("managed").and_then(serde_json::Value::as_bool) != Some(true)
+        || manifest.get("projectId").and_then(serde_json::Value::as_str) != Some(project_id)
+    {
+        return Err(FileError::Forbidden(
+            "The existing workspace is not the expected managed project.".to_owned(),
+        ));
+    }
+    let repository = Repository::open(workspace)
+        .map_err(|_| FileError::BadRequest("The managed project Git repository is missing.".to_owned()))?;
+    let head = repository
+        .head()
+        .and_then(|reference| reference.peel_to_commit())
+        .map_err(|_| FileError::BadRequest("The managed project baseline is missing.".to_owned()))?;
+    let message = head.message().unwrap_or_default();
+    if !message.lines().any(|line| line == "DeepScientist-Checkpoint: true")
+        || !message.lines().any(|line| line == "DeepScientist-Stage: project")
+    {
+        return Err(FileError::Forbidden(
+            "The existing workspace is not a DeepScientist managed project.".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Create an idempotent managed repository below the server-owned work
+/// directory. `baseDir` is accepted for desktop contract parity, but it may not
+/// redirect the WebUI backend to another filesystem location.
+pub fn prepare_managed_workspace(
+    request: ProjectGitPrepareWorkspaceRequest,
+    trusted_work_dir: PathBuf,
+) -> Result<ProjectGitPrepareWorkspaceResponse, FileError> {
+    if request.strategy != "managed" {
+        return Err(FileError::BadRequest(
+            "WebUI project preparation currently supports only the managed strategy.".to_owned(),
+        ));
+    }
+    if request.source_workspace.is_some() || request.branch_kind.is_some() {
+        return Err(FileError::BadRequest(
+            "Managed project preparation does not accept a source workspace or branch kind.".to_owned(),
+        ));
+    }
+    let goal = request.goal.trim();
+    if goal.is_empty() || goal.chars().count() > 16_000 {
+        return Err(FileError::BadRequest("A bounded project goal is required.".to_owned()));
+    }
+    let conversation_id = managed_conversation_id(&request.conversation_id)?;
+
+    fs::create_dir_all(&trusted_work_dir)
+        .map_err(|error| FileError::Internal(format!("Unable to create the server work directory: {error}")))?;
+    let trusted_work_dir = fs::canonicalize(&trusted_work_dir)
+        .map_err(|error| FileError::Internal(format!("Unable to resolve the server work directory: {error}")))?;
+    let requested_base = fs::canonicalize(request.base_dir.trim())
+        .map_err(|_| FileError::Forbidden("Managed projects must use the server work directory.".to_owned()))?;
+    if requested_base != trusted_work_dir {
+        return Err(FileError::Forbidden(
+            "Managed projects must use the server work directory.".to_owned(),
+        ));
+    }
+
+    let managed_root = trusted_work_dir.join("managed-projects");
+    fs::create_dir_all(&managed_root)
+        .map_err(|error| FileError::Internal(format!("Unable to create the managed projects directory: {error}")))?;
+    let managed_root = fs::canonicalize(&managed_root)
+        .map_err(|error| FileError::Internal(format!("Unable to resolve the managed projects directory: {error}")))?;
+    let project_id = if conversation_id.starts_with("project_") {
+        conversation_id.to_owned()
+    } else {
+        format!("project_{conversation_id}")
+    };
+    let workspace = managed_root.join(&project_id);
+    if workspace.exists() {
+        validate_existing_managed_project(&workspace, &project_id)?;
+        return managed_project_response(&workspace, &project_id, false);
+    }
+
+    let temporary = managed_root.join(format!(
+        ".{project_id}.{}.{}.tmp",
+        std::process::id(),
+        Utc::now().timestamp_millis()
+    ));
+    fs::create_dir(&temporary)
+        .map_err(|error| FileError::Internal(format!("Unable to reserve the managed project workspace: {error}")))?;
+    let initialized = (|| -> Result<(), FileError> {
+        fs::create_dir_all(temporary.join(".deepscientist"))
+            .map_err(|error| FileError::Internal(format!("Unable to create managed project metadata: {error}")))?;
+        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        let name: String = goal.chars().take(120).collect();
+        let manifest = json!({
+            "schema": "deepscientist.project.v1",
+            "id": project_id,
+            "projectId": project_id,
+            "name": name,
+            "goal": goal,
+            "managed": true,
+            "createdAt": now,
+            "updatedAt": now,
+            "artifactRepoRelativePath": ".deepscientist/artifact-repo",
+            "scienceArtifactsRelativePath": ".deepscientist/science-artifacts",
+            "exportsRelativePath": ".deepscientist/exports"
+        });
+        fs::write(
+            temporary.join(PROJECT_MANIFEST_PATH),
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&manifest).expect("manifest serialization")
+            ),
+        )
+        .map_err(|error| FileError::Internal(format!("Unable to write the managed project manifest: {error}")))?;
+        fs::write(
+            temporary.join(DEEPSCIENTIST_GITIGNORE_PATH),
+            "/artifact-repo/\n/science-artifacts/\n/exports/\n",
+        )
+        .map_err(|error| FileError::Internal(format!("Unable to write managed project exclusions: {error}")))?;
+        fs::write(temporary.join(".gitignore"), MANAGED_ROOT_GITIGNORE)
+            .map_err(|error| FileError::Internal(format!("Unable to write the managed project .gitignore: {error}")))?;
+        fs::write(
+            temporary.join("README.md"),
+            format!("# DeepScientist Project\n\n## Goal\n\n{goal}\n"),
+        )
+        .map_err(|error| FileError::Internal(format!("Unable to write the managed project README: {error}")))?;
+
+        let mut options = RepositoryInitOptions::new();
+        options.initial_head("main");
+        let repository = Repository::init_opts(&temporary, &options).map_err(|error| {
+            FileError::Internal(format!("Unable to initialize the managed Git repository: {error}"))
+        })?;
+        let exclude_path = repository.path().join("info").join("exclude");
+        fs::write(&exclude_path, MANAGED_LOCAL_EXCLUDES)
+            .map_err(|error| FileError::Internal(format!("Unable to write managed Git exclusions: {error}")))?;
+        let mut index = repository
+            .index()
+            .map_err(|error| FileError::Internal(format!("Unable to open the managed Git index: {error}")))?;
+        for path in [
+            ".gitignore",
+            "README.md",
+            DEEPSCIENTIST_GITIGNORE_PATH,
+            PROJECT_MANIFEST_PATH,
+        ] {
+            index
+                .add_path(Path::new(path))
+                .map_err(|error| FileError::Internal(format!("Unable to stage {path}: {error}")))?;
+        }
+        index
+            .write()
+            .map_err(|error| FileError::Internal(format!("Unable to write the managed Git index: {error}")))?;
+        let tree_id = index
+            .write_tree()
+            .map_err(|error| FileError::Internal(format!("Unable to write the managed project tree: {error}")))?;
+        let tree = repository
+            .find_tree(tree_id)
+            .map_err(|error| FileError::Internal(format!("Unable to read the managed project tree: {error}")))?;
+        let signature = Signature::now("DeepScientist", "checkpoint@deepscientist.local")
+            .map_err(|error| FileError::Internal(format!("Unable to create the managed project signature: {error}")))?;
+        let message = format!(
+            "[project] initialize managed project\n\nDeepScientist-Checkpoint: true\nDeepScientist-Stage: project\nDeepScientist-Conversation: {conversation_id}"
+        );
+        repository
+            .commit(Some("HEAD"), &signature, &signature, &message, &tree, &[])
+            .map_err(|error| FileError::Internal(format!("Unable to create the managed project baseline: {error}")))?;
+        Ok(())
+    })();
+    if let Err(error) = initialized {
+        let _ = fs::remove_dir_all(&temporary);
+        return Err(error);
+    }
+    if let Err(error) = fs::rename(&temporary, &workspace) {
+        let _ = fs::remove_dir_all(&temporary);
+        if workspace.exists() {
+            validate_existing_managed_project(&workspace, &project_id)?;
+            return managed_project_response(&workspace, &project_id, false);
+        }
+        return Err(FileError::Internal(format!(
+            "Unable to publish the managed project workspace: {error}"
+        )));
+    }
+    managed_project_response(&workspace, &project_id, true)
+}
+
+/// Bind a DeepScientist project checkpoint to the real conversation id.
+///
+/// The caller is responsible for constraining `workspace` to a trusted root.
+/// Both server-managed projects and explicitly selected current worktrees are
+/// accepted, but an ordinary Git commit is never amended: the current HEAD
+/// must already carry the DeepScientist project-checkpoint trailers.
+pub fn bind_project_conversation(
+    request: ProjectGitBindConversationRequest,
+    workspace: PathBuf,
+) -> Result<ProjectGitBindConversationResponse, FileError> {
+    let conversation_id = checkpoint_conversation_id(&request.conversation_id)?;
+    let repository = Repository::discover(&workspace)
+        .map_err(|error| FileError::BadRequest(format!("Unable to open the project Git repository: {error}")))?;
+    let head = repository
+        .head()
+        .and_then(|reference| reference.peel_to_commit())
+        .map_err(|_| FileError::BadRequest("The project baseline is missing.".to_owned()))?;
+    let message = head.message().unwrap_or_default();
+    if !message.lines().any(|line| line == "DeepScientist-Checkpoint: true")
+        || !message.lines().any(|line| line == "DeepScientist-Stage: project")
+    {
+        return Err(FileError::Forbidden(
+            "The project baseline is not a DeepScientist project checkpoint.".to_owned(),
+        ));
+    }
+    let current = message
+        .lines()
+        .find_map(|line| line.strip_prefix("DeepScientist-Conversation: "));
+    let commit_id = if current == Some(conversation_id) {
+        head.id()
+    } else {
+        let mut lines: Vec<&str> = message
+            .lines()
+            .filter(|line| !line.starts_with("DeepScientist-Conversation: "))
+            .collect();
+        lines.push("DeepScientist-Conversation: __BOUND_CONVERSATION__");
+        let updated = lines.join("\n").replace("__BOUND_CONVERSATION__", conversation_id);
+        head.amend(Some("HEAD"), None, None, None, Some(&updated), None)
+            .map_err(|error| FileError::Internal(format!("Unable to bind the project baseline: {error}")))?
+    };
+    drop(head);
+    let selected = fs::canonicalize(&workspace)
+        .map_err(|error| FileError::Internal(format!("Unable to resolve the managed project workspace: {error}")))?;
+    let response = repository_response(&repository, &selected, false)?;
+    let commit = commit_id.to_string();
+    Ok(ProjectGitBindConversationResponse {
+        ok: true,
+        repository: Some(response),
+        short_commit: Some(short_oid(commit_id)),
+        commit: Some(commit),
+        error: None,
+    })
 }
 
 pub fn preflight_workspace(workspace: PathBuf) -> Result<ProjectGitPreflightResponse, FileError> {
@@ -889,6 +1217,118 @@ fn summarize_statuses(statuses: &git2::Statuses<'_>) -> (usize, usize, usize, us
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn prepare_request(base_dir: &Path, conversation_id: &str) -> ProjectGitPrepareWorkspaceRequest {
+        ProjectGitPrepareWorkspaceRequest {
+            base_dir: base_dir.to_string_lossy().into_owned(),
+            goal: "Audit a reproducible scientific claim".to_owned(),
+            conversation_id: conversation_id.to_owned(),
+            strategy: "managed".to_owned(),
+            source_workspace: None,
+            branch_kind: None,
+        }
+    }
+
+    fn initialize_project_checkpoint(workspace: &Path, conversation_id: &str) -> Oid {
+        fs::create_dir_all(workspace).unwrap();
+        fs::write(workspace.join("README.md"), "# Existing project\n").unwrap();
+        let mut options = RepositoryInitOptions::new();
+        options.initial_head("main");
+        let repository = Repository::init_opts(workspace, &options).unwrap();
+        let mut index = repository.index().unwrap();
+        index.add_path(Path::new("README.md")).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repository.find_tree(tree_id).unwrap();
+        let signature = Signature::now("DeepScientist", "checkpoint@deepscientist.local").unwrap();
+        repository
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                &format!(
+                    "[project] initialize selected project\n\nDeepScientist-Checkpoint: true\nDeepScientist-Stage: project\nDeepScientist-Conversation: {conversation_id}"
+                ),
+                &tree,
+                &[],
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn creates_and_idempotently_reuses_a_managed_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let first =
+            prepare_managed_workspace(prepare_request(root.path(), "project_test"), root.path().to_path_buf()).unwrap();
+        let workspace = PathBuf::from(first.workspace.as_deref().unwrap());
+
+        assert_eq!(first.created, Some(true));
+        assert_eq!(first.project_id.as_deref(), Some("project_test"));
+        assert!(workspace.starts_with(fs::canonicalize(root.path()).unwrap().join("managed-projects")));
+        assert!(workspace.join(PROJECT_MANIFEST_PATH).is_file());
+        assert!(workspace.join("README.md").is_file());
+        let repository = Repository::open(&workspace).unwrap();
+        assert_eq!(repository.head().unwrap().shorthand(), Some("main"));
+        assert!(
+            repository
+                .head()
+                .unwrap()
+                .peel_to_commit()
+                .unwrap()
+                .message()
+                .unwrap()
+                .contains("DeepScientist-Conversation: project_test")
+        );
+
+        let reused =
+            prepare_managed_workspace(prepare_request(root.path(), "project_test"), root.path().to_path_buf()).unwrap();
+        assert_eq!(reused.created, Some(false));
+        assert_eq!(reused.workspace, first.workspace);
+    }
+
+    #[test]
+    fn rejects_a_managed_workspace_base_outside_the_server_work_dir() {
+        let trusted = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let error = prepare_managed_workspace(
+            prepare_request(outside.path(), "project_outside"),
+            trusted.path().to_path_buf(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, FileError::Forbidden(_)));
+    }
+
+    #[test]
+    fn binds_an_existing_current_worktree_checkpoint_without_a_managed_manifest() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("selected-project");
+        let planned = initialize_project_checkpoint(&workspace, "project_planned");
+
+        let bound = bind_project_conversation(
+            ProjectGitBindConversationRequest {
+                workspace: workspace.to_string_lossy().into_owned(),
+                conversation_id: "conversation_real".to_owned(),
+            },
+            workspace.clone(),
+        )
+        .unwrap();
+        let commit = Oid::from_str(bound.commit.as_deref().unwrap()).unwrap();
+        assert_ne!(commit, planned);
+        let repository = Repository::open(&workspace).unwrap();
+        let message = repository.find_commit(commit).unwrap().message().unwrap().to_owned();
+        assert!(message.contains("DeepScientist-Conversation: conversation_real"));
+        assert!(!message.contains("DeepScientist-Conversation: project_planned"));
+
+        let rebound = bind_project_conversation(
+            ProjectGitBindConversationRequest {
+                workspace: workspace.to_string_lossy().into_owned(),
+                conversation_id: "conversation_real".to_owned(),
+            },
+            workspace,
+        )
+        .unwrap();
+        assert_eq!(rebound.commit, bound.commit);
+    }
 
     #[test]
     fn resolves_the_only_direct_child_repository() {
