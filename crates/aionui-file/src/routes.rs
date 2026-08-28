@@ -1,9 +1,13 @@
 #![allow(clippy::disallowed_types)]
 
 use axum::Router;
+use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, Json, Multipart, Query, State};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::Response;
 use axum::routing::{get, post};
+use base64::Engine;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use tower_http::limit::RequestBodyLimitLayer;
@@ -12,7 +16,7 @@ use aionui_api_types::{
     ApiResponse, BrowseDirectoryQuery, BrowseDirectoryResponse, CancelZipRequest, CopyFilesRequest, CopyFilesResponse,
     CreateTempFileRequest, DirOrFileResponse, FetchRemoteImageRequest, FileChangeInfoResponse, FileMetadataResponse,
     FileWatchRequest, GetFileMetadataRequest, GetFilesByDirRequest, GetImageBase64Request, ListWorkspaceFilesRequest,
-    ProjectGitBindConversationRequest, ProjectGitBindConversationResponse, ProjectGitBlobRequest,
+    PreviewFileQuery, ProjectGitBindConversationRequest, ProjectGitBindConversationResponse, ProjectGitBlobRequest,
     ProjectGitBlobResponse, ProjectGitCommitRequest, ProjectGitCommitResponse, ProjectGitDiffRequest,
     ProjectGitDiffResponse, ProjectGitDiscoverRequest, ProjectGitDiscoverResponse, ProjectGitFrontierResponse,
     ProjectGitGraphRequest, ProjectGitGraphResponse, ProjectGitPreflightRequest, ProjectGitPreflightResponse,
@@ -156,6 +160,7 @@ pub fn file_routes(state: FileRouterState) -> Router {
         .route("/api/fs/metadata", post(get_file_metadata))
         .route("/api/fs/read", post(read_file))
         .route("/api/fs/read-buffer", post(read_file_buffer))
+        .route("/api/fs/preview", get(preview_file))
         .route("/api/fs/write", post(write_file))
         .route("/api/fs/copy", post(copy_files))
         .route("/api/fs/remove", post(remove_entry))
@@ -237,6 +242,18 @@ async fn project_git_prepare_workspace(
     body: Result<Json<ProjectGitPrepareWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ProjectGitPrepareWorkspaceResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    if req.strategy == "current-worktree" {
+        let source_workspace = req
+            .source_workspace
+            .as_deref()
+            .ok_or_else(|| ApiError::BadRequest("A source workspace is required.".to_owned()))?;
+        let workspace = browse::resolve_browse_path(source_workspace, &state.browse_roots.get())?;
+        let response =
+            tokio::task::spawn_blocking(move || crate::project_git::prepare_current_workspace(req, workspace))
+                .await
+                .map_err(|error| ApiError::Internal(format!("Selected Git preparation task failed: {error}")))??;
+        return Ok(Json(ApiResponse::ok(response)));
+    }
     let work_dir = state.work_dir.clone();
     let response = tokio::task::spawn_blocking(move || crate::project_git::prepare_managed_workspace(req, work_dir))
         .await
@@ -453,11 +470,116 @@ async fn read_file_buffer(
         .read_file_buffer(&req.path, req.workspace.as_deref().map(Path::new))
         .await?;
     // Binary data is base64-encoded for JSON transport.
-    let encoded = data.map(|bytes| {
-        use base64::Engine;
-        base64::engine::general_purpose::STANDARD.encode(bytes)
-    });
+    let encoded = data.map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes));
     Ok(Json(ApiResponse::ok(encoded)))
+}
+
+fn decode_preview_path(encoded: &str, field: &str) -> Result<String, ApiError> {
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| ApiError::BadRequest(format!("invalid {field} encoding")))?;
+    String::from_utf8(bytes).map_err(|_| ApiError::BadRequest(format!("invalid {field} encoding")))
+}
+
+/// Parse one RFC 7233 byte range. Multiple ranges are deliberately rejected:
+/// the preview client only needs a single contiguous span.
+fn parse_preview_range(value: Option<&str>, size: u64) -> Result<Option<(u64, u64)>, ()> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if size == 0 {
+        return Err(());
+    }
+
+    let range = value.strip_prefix("bytes=").ok_or(())?;
+    if range.contains(',') {
+        return Err(());
+    }
+    let (start, end) = range.split_once('-').ok_or(())?;
+
+    if start.is_empty() {
+        let suffix = end.parse::<u64>().map_err(|_| ())?;
+        if suffix == 0 {
+            return Err(());
+        }
+        let length = suffix.min(size);
+        return Ok(Some((size - length, size - 1)));
+    }
+
+    let start = start.parse::<u64>().map_err(|_| ())?;
+    if start >= size {
+        return Err(());
+    }
+    let end = if end.is_empty() {
+        size - 1
+    } else {
+        end.parse::<u64>().map_err(|_| ())?.min(size - 1)
+    };
+    if end < start {
+        return Err(());
+    }
+    Ok(Some((start, end)))
+}
+
+fn range_not_satisfiable(size: u64) -> Result<Response, ApiError> {
+    Response::builder()
+        .status(StatusCode::RANGE_NOT_SATISFIABLE)
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CONTENT_RANGE, format!("bytes */{size}"))
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::empty())
+        .map_err(|error| ApiError::Internal(format!("cannot build range response: {error}")))
+}
+
+/// Serve a sandboxed local file to the WebUI. Browser PDF viewers request
+/// bounded ranges, avoiding whole-file base64 transport and wasted reads when
+/// navigation cancels an in-flight preview.
+async fn preview_file(
+    State(state): State<FileRouterState>,
+    Query(query): Query<PreviewFileQuery>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let path = decode_preview_path(&query.path, "path")?;
+    let workspace = query
+        .workspace
+        .as_deref()
+        .map(|value| decode_preview_path(value, "workspace"))
+        .transpose()?;
+    let extra_root = workspace.as_deref().map(Path::new);
+    let metadata = state.file_service.get_file_metadata(&path, extra_root).await?;
+    if metadata.is_directory {
+        return Err(ApiError::BadRequest("preview path must be a file".to_owned()));
+    }
+
+    let requested_range = headers.get(header::RANGE).and_then(|value| value.to_str().ok());
+    let range = match parse_preview_range(requested_range, metadata.size) {
+        Ok(range) => range,
+        Err(()) => return range_not_satisfiable(metadata.size),
+    };
+    let (start, end, status) = match range {
+        Some((start, end)) => (start, end, StatusCode::PARTIAL_CONTENT),
+        None if metadata.size > 0 => (0, metadata.size - 1, StatusCode::OK),
+        None => (0, 0, StatusCode::OK),
+    };
+    let length = if metadata.size == 0 { 0 } else { end - start + 1 };
+    let bytes = state
+        .file_service
+        .read_file_range(&path, extra_root, start, length)
+        .await?;
+
+    let mut response = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, metadata.mime_type)
+        .header(header::CONTENT_LENGTH, bytes.len().to_string())
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CACHE_CONTROL, "no-store")
+        .header("x-content-type-options", "nosniff");
+    if status == StatusCode::PARTIAL_CONTENT {
+        response = response.header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{}", metadata.size));
+    }
+    response
+        .body(Body::from(bytes))
+        .map_err(|error| ApiError::Internal(format!("cannot build preview response: {error}")))
 }
 
 async fn write_file(

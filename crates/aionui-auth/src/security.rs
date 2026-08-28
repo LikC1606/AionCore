@@ -13,10 +13,10 @@ fn allows_embedding(path: &str) -> bool {
     )
 }
 
-/// Office preview proxies serve content loaded in same-origin iframes by
-/// the web UI; `DENY` here blanks the preview (iOfficeAI/AionUi#3177).
+/// Preview routes serve content loaded in same-origin iframes by the WebUI;
+/// `DENY` here blanks PDF and Office previews (iOfficeAI/AionUi#3177).
 fn allows_same_origin_embedding(path: &str) -> bool {
-    path.starts_with("/api/ppt-proxy/") || path.starts_with("/api/office-watch-proxy/")
+    path == "/api/fs/preview" || path.starts_with("/api/ppt-proxy/") || path.starts_with("/api/office-watch-proxy/")
 }
 
 /// Middleware that adds security response headers to every response.
@@ -134,6 +134,29 @@ mod tests {
             );
             assert_eq!(response.headers().get("x-content-type-options").unwrap(), "nosniff");
         }
+    }
+
+    #[tokio::test]
+    async fn file_preview_route_gets_sameorigin_frame_headers() {
+        let app = Router::new()
+            .route("/api/fs/preview", get(|| async { "pdf" }))
+            .layer(middleware::from_fn(security_headers_middleware));
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/fs/preview?path=encoded")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.headers().get("x-frame-options").unwrap(), "SAMEORIGIN");
+        assert_eq!(
+            response.headers().get("content-security-policy").unwrap(),
+            "frame-ancestors 'self'"
+        );
     }
 
     #[tokio::test]

@@ -21,6 +21,7 @@ use crate::agent_task::AgentInstance;
 use crate::error::AgentError;
 use crate::factory::AgentFactoryDeps;
 use crate::factory::context::FactoryContext;
+use crate::factory::mcp_stdio_policy::{BENCHMARK_CONTAINER_MCP_NAME, validate_deepscientist_stdio_reference};
 use crate::manager::aionrs::{AionrsAgentManager, sanitize_session_messages};
 use crate::runtime_status::conversation_runtime_reporter;
 use crate::session_context::AionrsSessionBuildContext;
@@ -67,7 +68,7 @@ pub(super) async fn build(
         &ctx.conversation_id,
         deps.broadcaster.clone(),
     )
-    .await;
+    .await?;
 
     if !extra_mcp_servers.is_empty() {
         info!(
@@ -517,6 +518,7 @@ async fn row_to_mcp_server_config(
                         .collect()
                 })
                 .unwrap_or_default();
+            validate_deepscientist_stdio_reference(&row.name, command, &args)?;
             let (resolved_command, args, env) =
                 ensure_stdio_launch(command, &args, &env_entries, conversation_id, broadcaster).await?;
 
@@ -598,6 +600,7 @@ async fn session_server_to_mcp_server_config(
                 return Err("stdio: missing command".to_owned());
             }
             let entries: Vec<(String, String)> = env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            validate_deepscientist_stdio_reference(&server.name, command, args)?;
             let (command, args, env) =
                 ensure_stdio_launch(command, args, &entries, conversation_id, broadcaster).await?;
             Ok(McpServerConfig {
@@ -664,7 +667,7 @@ async fn merge_session_snapshot_mcp_servers(
     session_mcp_servers: &[SessionMcpServer],
     conversation_id: &str,
     broadcaster: Arc<dyn EventBroadcaster>,
-) {
+) -> Result<(), AgentError> {
     for server in session_mcp_servers {
         match session_server_to_mcp_server_config(server, conversation_id, broadcaster.clone()).await {
             Ok(config) => {
@@ -677,6 +680,11 @@ async fn merge_session_snapshot_mcp_servers(
                 }
             }
             Err(err) => {
+                if server.name == BENCHMARK_CONTAINER_MCP_NAME {
+                    return Err(AgentError::bad_request(format!(
+                        "benchmark-container MCP descriptor conversion failed: {err}"
+                    )));
+                }
                 warn!(
                     conversation_id = %conversation_id,
                     server_id = %server.id,
@@ -687,6 +695,7 @@ async fn merge_session_snapshot_mcp_servers(
             }
         }
     }
+    Ok(())
 }
 
 async fn ensure_stdio_launch(
@@ -1807,7 +1816,9 @@ mod tests {
             },
         }];
 
-        merge_session_snapshot_mcp_servers(&mut servers, &snapshot, "conv-override", test_broadcaster()).await;
+        merge_session_snapshot_mcp_servers(&mut servers, &snapshot, "conv-override", test_broadcaster())
+            .await
+            .expect("merge session snapshot");
 
         let server = servers.get("demo-mcp").expect("snapshot should remain");
         assert_eq!(server.transport, TransportType::Stdio);
@@ -1818,6 +1829,77 @@ mod tests {
             server.env.as_ref().and_then(|env| env.get("TOKEN")),
             Some(&"abc".to_owned())
         );
+    }
+
+    #[tokio::test]
+    async fn session_snapshot_skips_retired_project_agent_but_preserves_core_team() {
+        let command = std::env::current_exe()
+            .expect("current test executable")
+            .to_string_lossy()
+            .into_owned();
+        let snapshot = vec![
+            SessionMcpServer {
+                id: "retired-project-agent".into(),
+                name: "deepscientist-project-runtime-conv-1".into(),
+                transport: SessionMcpTransport::Stdio {
+                    command: command.clone(),
+                    args: vec!["mcp-team-stdio".into()],
+                    env: HashMap::new(),
+                },
+            },
+            SessionMcpServer {
+                id: "current-team".into(),
+                name: "aionui-team-mcp".into(),
+                transport: SessionMcpTransport::Stdio {
+                    command,
+                    args: vec!["mcp-team-stdio".into()],
+                    env: HashMap::new(),
+                },
+            },
+        ];
+        let mut servers = HashMap::new();
+
+        merge_session_snapshot_mcp_servers(&mut servers, &snapshot, "conv-team", test_broadcaster())
+            .await
+            .expect("optional retired server should be skipped");
+
+        assert!(!servers.contains_key("deepscientist-project-runtime-conv-1"));
+        assert!(servers.contains_key("aionui-team-mcp"));
+    }
+
+    #[tokio::test]
+    async fn missing_benchmark_container_script_remains_fail_hard() {
+        let command = std::env::current_exe()
+            .expect("current test executable")
+            .to_string_lossy()
+            .into_owned();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let snapshot = vec![SessionMcpServer {
+            id: BENCHMARK_CONTAINER_MCP_NAME.into(),
+            name: BENCHMARK_CONTAINER_MCP_NAME.into(),
+            transport: SessionMcpTransport::Stdio {
+                command,
+                args: vec![
+                    temp.path()
+                        .join("builtin-mcp-benchmark-container.js")
+                        .to_string_lossy()
+                        .into_owned(),
+                ],
+                env: HashMap::new(),
+            },
+        }];
+        let mut servers = HashMap::new();
+
+        let error = merge_session_snapshot_mcp_servers(&mut servers, &snapshot, "conv-benchmark", test_broadcaster())
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("benchmark-container MCP descriptor conversion failed")
+        );
+        assert!(error.to_string().contains("built-in MCP script is unavailable"));
     }
 
     #[test]

@@ -48,6 +48,16 @@ pub trait IFileService: Send + Sync {
     /// Files larger than 256 MB are rejected.
     async fn read_file_buffer(&self, path: &str, extra_root: Option<&Path>) -> Result<Option<Vec<u8>>, FileError>;
 
+    /// Read a bounded byte range from a file for an HTTP media preview.
+    /// The path is validated against the same sandbox as other read methods.
+    async fn read_file_range(
+        &self,
+        path: &str,
+        extra_root: Option<&Path>,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<u8>, FileError>;
+
     /// Write `data` to `path`. On success, emits a
     /// `fileStream.contentUpdate` event with `operation = write`.
     async fn write_file(&self, path: &str, data: &[u8], workspace: &str) -> Result<bool, FileError>;

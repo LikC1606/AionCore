@@ -42,6 +42,17 @@ pub struct ReadFileBufferRequest {
     pub workspace: Option<String>,
 }
 
+/// Query parameters for `GET /api/fs/preview`.
+///
+/// Paths are URL-safe base64 encoded so absolute server paths do not appear
+/// verbatim in access logs or browser history.
+#[derive(Debug, Deserialize)]
+pub struct PreviewFileQuery {
+    pub path: String,
+    #[serde(default)]
+    pub workspace: Option<String>,
+}
+
 /// Request body for `POST /api/fs/write` — write file.
 #[derive(Debug, Deserialize)]
 pub struct WriteFileRequest {

@@ -6,6 +6,7 @@ use crate::factory::AgentFactoryDeps;
 use crate::factory::acp_assembler::{WorkspaceInfo, assemble_acp_params};
 use crate::factory::acp_launch_policy::{AcpLaunchPolicyInput, apply_acp_launch_policy};
 use crate::factory::context::FactoryContext;
+use crate::factory::mcp_stdio_policy::{BENCHMARK_CONTAINER_MCP_NAME, validate_deepscientist_stdio_reference};
 use crate::manager::acp::{AcpAgentManager, CatalogForwarder};
 use crate::session_context::AcpSessionBuildContext;
 use crate::types::{AIONUI_BASE_URL_ENV, AIONUI_CONVERSATION_ID_ENV, AIONUI_RUNTIME_TOKEN_ENV, AIONUI_USER_ID_ENV};
@@ -22,8 +23,6 @@ use aionui_runtime::{
 use tracing::{info, warn};
 
 use crate::runtime_status::{conversation_acp_tool_runtime_reporter, conversation_runtime_reporter};
-
-const BENCHMARK_CONTAINER_MCP_NAME: &str = "deepscientist-benchmark-container";
 
 pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
@@ -436,6 +435,7 @@ async fn row_to_sdk_mcp_server(row: &McpServerRow) -> Result<McpServer, String> 
                 })
                 .unwrap_or_default();
             env_entries.sort_by(|a, b| a.0.cmp(&b.0));
+            validate_deepscientist_stdio_reference(&row.name, command, &args)?;
             let (resolved_command, args, env) = ensure_stdio_launch(command, &args, &env_entries).await?;
 
             let stdio = McpServerStdio::new(row.name.clone(), resolved_command)
@@ -487,6 +487,7 @@ async fn session_server_to_sdk_mcp_server(server: &SessionMcpServer) -> Result<M
             }
             let mut entries: Vec<(String, String)> = env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
             entries.sort_by(|a, b| a.0.cmp(&b.0));
+            validate_deepscientist_stdio_reference(&server.name, command, args)?;
             let (command, args, env) = ensure_stdio_launch(command, args, &entries).await?;
             Ok(McpServer::Stdio(
                 McpServerStdio::new(server.name.clone(), command).args(args).env(env),
@@ -709,6 +710,56 @@ mod tests {
 
         assert!(validate_required_session_mcp_server(&server, &capabilities).is_ok());
         assert!(!session_server_supported_by_capabilities(&server, &capabilities));
+    }
+
+    #[tokio::test]
+    async fn session_snapshot_guard_rejects_retired_project_agent_but_preserves_core_team() {
+        let command = std::env::current_exe()
+            .expect("current test executable")
+            .to_string_lossy()
+            .into_owned();
+        let retired = SessionMcpServer {
+            id: "retired-project-agent".to_owned(),
+            name: "ds-team-project-runtime-conv-1".to_owned(),
+            transport: SessionMcpTransport::Stdio {
+                command: command.clone(),
+                args: vec!["mcp-bridge".to_owned()],
+                env: std::collections::HashMap::new(),
+            },
+        };
+        let team = SessionMcpServer {
+            id: "current-team".to_owned(),
+            name: "ds-team-runtime-0".to_owned(),
+            transport: SessionMcpTransport::Stdio {
+                command,
+                args: vec!["mcp-bridge".to_owned()],
+                env: std::collections::HashMap::new(),
+            },
+        };
+
+        let retired_error = session_server_to_sdk_mcp_server(&retired).await.unwrap_err();
+        assert!(retired_error.contains("retired DeepScientist project-agent MCP reference"));
+        assert!(session_server_to_sdk_mcp_server(&team).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn database_row_guard_rejects_a_missing_deepscientist_builtin_script() {
+        let command = std::env::current_exe()
+            .expect("current test executable")
+            .to_string_lossy()
+            .into_owned();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let missing_script = temp.path().join("builtin-mcp-medical-evidence.js");
+        let config = serde_json::json!({
+            "command": command,
+            "args": [missing_script],
+            "env": {},
+        })
+        .to_string();
+        let row = make_row("medical-evidence", "stdio", &config, true, false);
+
+        let error = row_to_sdk_mcp_server(&row).await.unwrap_err();
+        assert!(error.contains("DeepScientist built-in MCP script is unavailable"));
     }
 
     fn stdio_config_for_existing_command() -> String {

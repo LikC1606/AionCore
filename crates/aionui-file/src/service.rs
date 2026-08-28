@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -323,6 +323,26 @@ fn read_file_buffer_sync(path: &Path) -> Result<Option<Vec<u8>>, FileError> {
         std::fs::read(path).map_err(|e| FileError::Internal(format!("cannot read file '{}': {e}", path.display())))?;
 
     Ok(Some(bytes))
+}
+
+/// Read only the requested byte range instead of materializing the entire
+/// document. This keeps browser PDF/media range requests bounded and makes a
+/// disconnected client cheap to abandon.
+fn read_file_range_sync(path: &Path, offset: u64, length: u64) -> Result<Vec<u8>, FileError> {
+    if validate_file_for_read(path)?.is_none() || length == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| FileError::Internal(format!("cannot open file '{}': {e}", path.display())))?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|e| FileError::Internal(format!("cannot seek file '{}': {e}", path.display())))?;
+
+    let mut bytes = Vec::with_capacity(usize::try_from(length).unwrap_or(0));
+    file.take(length)
+        .read_to_end(&mut bytes)
+        .map_err(|e| FileError::Internal(format!("cannot read file range '{}': {e}", path.display())))?;
+    Ok(bytes)
 }
 
 /// Write data to a file synchronously. Creates the file if it does not exist.
@@ -688,6 +708,26 @@ impl crate::traits::IFileService for FileService {
         tokio::task::spawn_blocking(move || read_file_buffer_sync(&canonical))
             .await
             .map_err(|e| FileError::Internal(format!("read file buffer task failed: {e}")))?
+    }
+
+    async fn read_file_range(
+        &self,
+        path: &str,
+        extra_root: Option<&Path>,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<u8>, FileError> {
+        if has_traversal(path) {
+            return Err(FileError::BadRequest(
+                "path contains invalid traversal patterns".to_owned(),
+            ));
+        }
+
+        let roots = self.allowed_roots_refs();
+        let canonical = validate_path_with_extra_root(path, &roots, extra_root)?;
+        tokio::task::spawn_blocking(move || read_file_range_sync(&canonical, offset, length))
+            .await
+            .map_err(|e| FileError::Internal(format!("read file range task failed: {e}")))?
     }
 
     async fn write_file(&self, path: &str, data: &[u8], workspace: &str) -> Result<bool, FileError> {

@@ -3,10 +3,24 @@
 mod common;
 
 use axum::http::StatusCode;
+use base64::Engine;
+use http_body_util::BodyExt;
 use serde_json::json;
 use tower::ServiceExt;
 
-use common::{body_json, build_app, build_app_with_file_roots, json_with_token, setup_and_login};
+use common::{body_json, build_app, build_app_with_file_roots, get_with_token, json_with_token, setup_and_login};
+
+fn preview_query(path: &std::path::Path, workspace: Option<&std::path::Path>) -> String {
+    let encode = |value: &std::path::Path| {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value.to_string_lossy().as_bytes())
+    };
+    let mut uri = format!("/api/fs/preview?path={}", encode(path));
+    if let Some(workspace) = workspace {
+        uri.push_str("&workspace=");
+        uri.push_str(&encode(workspace));
+    }
+    uri
+}
 
 // ===========================================================================
 // Auth guard
@@ -62,6 +76,91 @@ async fn fs_endpoints_require_auth() {
             StatusCode::FORBIDDEN,
             "expected 403 for unauthenticated {uri}"
         );
+    }
+}
+
+#[tokio::test]
+async fn file_preview_requires_auth() {
+    let (app, _services) = build_app().await;
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let request = axum::http::Request::builder()
+        .method("GET")
+        .uri(preview_query(file.path(), file.path().parent()))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn file_preview_serves_mime_and_byte_ranges() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let (mut app, services) = build_app_with_file_roots(vec![sandbox.path().to_path_buf()]).await;
+    let (token, _csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let file = workspace.path().join("sample.pdf");
+    std::fs::write(&file, b"%PDF-1.7\npreview-body").unwrap();
+    let uri = preview_query(&file, Some(workspace.path()));
+
+    let mut request = get_with_token(&uri, &token);
+    request.headers_mut().insert("range", "bytes=5-9".parse().unwrap());
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(response.headers()["content-type"], "application/pdf");
+    assert_eq!(response.headers()["accept-ranges"], "bytes");
+    assert_eq!(response.headers()["content-range"], "bytes 5-9/21");
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+    assert_eq!(response.headers()["x-frame-options"], "SAMEORIGIN");
+    assert_eq!(response.headers()["content-security-policy"], "frame-ancestors 'self'");
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body[..], b"1.7\np");
+
+    let response = app.oneshot(get_with_token(&uri, &token)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-length"], "21");
+}
+
+#[tokio::test]
+async fn file_preview_rejects_invalid_ranges_and_workspace_escape() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let (mut app, services) = build_app_with_file_roots(vec![sandbox.path().to_path_buf()]).await;
+    let (token, _csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let file = workspace.path().join("sample.pdf");
+    std::fs::write(&file, b"%PDF-test").unwrap();
+    let uri = preview_query(&file, Some(workspace.path()));
+
+    let mut request = get_with_token(&uri, &token);
+    request.headers_mut().insert("range", "bytes=99-100".parse().unwrap());
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(response.headers()["content-range"], "bytes */9");
+
+    let outside_file = outside.path().join("private.pdf");
+    std::fs::write(&outside_file, b"private").unwrap();
+    let response = app
+        .clone()
+        .oneshot(get_with_token(
+            &preview_query(&outside_file, Some(workspace.path())),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&outside_file, workspace.path().join("linked.pdf")).unwrap();
+        let response = app
+            .oneshot(get_with_token(
+                &preview_query(&workspace.path().join("linked.pdf"), Some(workspace.path())),
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 }
 

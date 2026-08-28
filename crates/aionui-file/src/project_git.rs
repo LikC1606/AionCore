@@ -303,6 +303,139 @@ pub fn prepare_managed_workspace(
     managed_project_response(&workspace, &project_id, true)
 }
 
+/// Initialize an explicitly selected server workspace as a Git project.
+///
+/// The caller must resolve and authorize `workspace` against the WebUI browse
+/// roots before invoking this function. Existing project files are never
+/// staged: only the small DeepScientist manifest is committed as the baseline.
+pub fn prepare_current_workspace(
+    request: ProjectGitPrepareWorkspaceRequest,
+    workspace: PathBuf,
+) -> Result<ProjectGitPrepareWorkspaceResponse, FileError> {
+    if request.strategy != "current-worktree" {
+        return Err(FileError::BadRequest(
+            "Selected project preparation requires the current-worktree strategy.".to_owned(),
+        ));
+    }
+    if request.branch_kind.is_some() {
+        return Err(FileError::BadRequest(
+            "Current worktree preparation does not accept a branch kind.".to_owned(),
+        ));
+    }
+    let source_workspace = request
+        .source_workspace
+        .as_deref()
+        .ok_or_else(|| FileError::BadRequest("A source workspace is required.".to_owned()))?;
+    let workspace = fs::canonicalize(&workspace)
+        .map_err(|error| FileError::BadRequest(format!("Unable to resolve selected project workspace: {error}")))?;
+    let requested_source = fs::canonicalize(source_workspace)
+        .map_err(|error| FileError::BadRequest(format!("Unable to resolve source workspace: {error}")))?;
+    if requested_source != workspace {
+        return Err(FileError::Forbidden(
+            "The selected project workspace does not match the authorized source workspace.".to_owned(),
+        ));
+    }
+    if Repository::discover(&workspace).is_ok() {
+        return Err(FileError::BadRequest(
+            "The selected workspace is already a Git repository; bind it without initialization.".to_owned(),
+        ));
+    }
+    let goal = request.goal.trim();
+    if goal.is_empty() || goal.chars().count() > 16_000 {
+        return Err(FileError::BadRequest("A bounded project goal is required.".to_owned()));
+    }
+    let conversation_id = managed_conversation_id(&request.conversation_id)?;
+    let project_id = if conversation_id.starts_with("project_") {
+        conversation_id.to_owned()
+    } else {
+        format!("project_{conversation_id}")
+    };
+
+    fs::create_dir_all(workspace.join(".deepscientist"))
+        .map_err(|error| FileError::Internal(format!("Unable to create project metadata: {error}")))?;
+    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let name: String = goal.chars().take(120).collect();
+    let manifest = json!({
+        "schema": "deepscientist.project.v1",
+        "id": project_id,
+        "projectId": project_id,
+        "name": name,
+        "goal": goal,
+        "managed": false,
+        "createdAt": now,
+        "updatedAt": now,
+        "artifactRepoRelativePath": ".deepscientist/artifact-repo",
+        "scienceArtifactsRelativePath": ".deepscientist/science-artifacts",
+        "exportsRelativePath": ".deepscientist/exports"
+    });
+    fs::write(
+        workspace.join(PROJECT_MANIFEST_PATH),
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&manifest).expect("manifest serialization")
+        ),
+    )
+    .map_err(|error| FileError::Internal(format!("Unable to write project manifest: {error}")))?;
+    fs::write(
+        workspace.join(DEEPSCIENTIST_GITIGNORE_PATH),
+        "/artifact-repo/\n/science-artifacts/\n/exports/\n",
+    )
+    .map_err(|error| FileError::Internal(format!("Unable to write project exclusions: {error}")))?;
+
+    let mut options = RepositoryInitOptions::new();
+    options.initial_head("main");
+    let repository = Repository::init_opts(&workspace, &options)
+        .map_err(|error| FileError::Internal(format!("Unable to initialize Git in the selected project: {error}")))?;
+    fs::write(repository.path().join("info").join("exclude"), MANAGED_LOCAL_EXCLUDES)
+        .map_err(|error| FileError::Internal(format!("Unable to write project Git exclusions: {error}")))?;
+    let mut index = repository
+        .index()
+        .map_err(|error| FileError::Internal(format!("Unable to open the project Git index: {error}")))?;
+    for path in [DEEPSCIENTIST_GITIGNORE_PATH, PROJECT_MANIFEST_PATH] {
+        index
+            .add_path(Path::new(path))
+            .map_err(|error| FileError::Internal(format!("Unable to stage {path}: {error}")))?;
+    }
+    index
+        .write()
+        .map_err(|error| FileError::Internal(format!("Unable to write the project Git index: {error}")))?;
+    let tree_id = index
+        .write_tree()
+        .map_err(|error| FileError::Internal(format!("Unable to write the project tree: {error}")))?;
+    let tree = repository
+        .find_tree(tree_id)
+        .map_err(|error| FileError::Internal(format!("Unable to read the project tree: {error}")))?;
+    let signature = Signature::now("DeepScientist", "checkpoint@deepscientist.local")
+        .map_err(|error| FileError::Internal(format!("Unable to create the project signature: {error}")))?;
+    let message = format!(
+        "[project] initialize project history\n\nDeepScientist-Checkpoint: true\nDeepScientist-Stage: project\nDeepScientist-Conversation: {conversation_id}"
+    );
+    let commit_id = repository
+        .commit(Some("HEAD"), &signature, &signature, &message, &tree, &[])
+        .map_err(|error| FileError::Internal(format!("Unable to create the project baseline: {error}")))?;
+    drop(tree);
+
+    let response = repository_response(&repository, &workspace, true)?;
+    let root = response_path(&workspace);
+    Ok(ProjectGitPrepareWorkspaceResponse {
+        ok: true,
+        workspace: Some(root.clone()),
+        project_id: Some(project_id.clone()),
+        created: Some(true),
+        binding: Some(ProjectGitWorkspaceBindingResponse {
+            schema: "deepscientist.project_git.v1".to_owned(),
+            strategy: "current-worktree".to_owned(),
+            project_id: Some(project_id),
+            source_root: root.clone(),
+            workspace_root: root,
+            branch: response.branch,
+            base_commit: Some(commit_id.to_string()),
+            source_dirty: Some(response.dirty),
+        }),
+        error: None,
+    })
+}
+
 /// Bind a DeepScientist project checkpoint to the real conversation id.
 ///
 /// The caller is responsible for constraining `workspace` to a trusted root.
@@ -1229,6 +1362,17 @@ mod tests {
         }
     }
 
+    fn prepare_current_request(workspace: &Path, conversation_id: &str) -> ProjectGitPrepareWorkspaceRequest {
+        ProjectGitPrepareWorkspaceRequest {
+            base_dir: workspace.to_string_lossy().into_owned(),
+            goal: "Audit an existing server project".to_owned(),
+            conversation_id: conversation_id.to_owned(),
+            strategy: "current-worktree".to_owned(),
+            source_workspace: Some(workspace.to_string_lossy().into_owned()),
+            branch_kind: None,
+        }
+    }
+
     fn initialize_project_checkpoint(workspace: &Path, conversation_id: &str) -> Oid {
         fs::create_dir_all(workspace).unwrap();
         fs::write(workspace.join("README.md"), "# Existing project\n").unwrap();
@@ -1296,6 +1440,39 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, FileError::Forbidden(_)));
+    }
+
+    #[test]
+    fn initializes_only_deepscientist_metadata_in_an_approved_plain_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("selected-project");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("user-data.csv"), "symbol,value\nA,1\n").unwrap();
+
+        let result = prepare_current_workspace(
+            prepare_current_request(&workspace, "project_selected"),
+            fs::canonicalize(&workspace).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(result.created, Some(true));
+        assert_eq!(result.project_id.as_deref(), Some("project_selected"));
+        assert_eq!(
+            result.binding.as_ref().map(|binding| binding.strategy.as_str()),
+            Some("current-worktree")
+        );
+        let repository = Repository::open(&workspace).unwrap();
+        let head = repository.head().unwrap().peel_to_commit().unwrap();
+        assert!(
+            head.message()
+                .unwrap()
+                .contains("DeepScientist-Conversation: project_selected")
+        );
+        let tree = head.tree().unwrap();
+        assert!(tree.get_path(Path::new(PROJECT_MANIFEST_PATH)).is_ok());
+        assert!(tree.get_path(Path::new(DEEPSCIENTIST_GITIGNORE_PATH)).is_ok());
+        assert!(tree.get_path(Path::new("user-data.csv")).is_err());
+        assert!(workspace.join("user-data.csv").is_file());
     }
 
     #[test]

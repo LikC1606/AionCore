@@ -104,7 +104,7 @@ pub use file::{
     BrowseDirectoryQuery, BrowseDirectoryResponse, BrowseEntry, CancelZipRequest, CopyFilesRequest, CopyFilesResponse,
     CreateTempFileRequest, DirOrFileResponse, FetchRemoteImageRequest, FileChangeInfoResponse, FileMetadataResponse,
     FileWatchRequest, GetFileMetadataRequest, GetFilesByDirRequest, GetImageBase64Request, ListWorkspaceFilesRequest,
-    ProjectGitBindConversationRequest, ProjectGitBindConversationResponse, ProjectGitBlobRequest,
+    PreviewFileQuery, ProjectGitBindConversationRequest, ProjectGitBindConversationResponse, ProjectGitBlobRequest,
     ProjectGitBlobResponse, ProjectGitChangedFileResponse, ProjectGitCommitDetailResponse, ProjectGitCommitRequest,
     ProjectGitCommitResponse, ProjectGitCommitSummaryResponse, ProjectGitDiffRequest, ProjectGitDiffResponse,
     ProjectGitDiscoverRequest, ProjectGitDiscoverResponse, ProjectGitFrontierResponse, ProjectGitGraphRequest,
