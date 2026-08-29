@@ -104,10 +104,20 @@ pub async fn prepare_managed_acp_tool_to_root(
     root: &Path,
 ) -> Result<ResolvedManagedAcpTool, ManagedAcpToolError> {
     let spec = platform_spec()?;
+    let target_root = bundle_tool_root(root, tool, spec);
+
+    if managed_resources::requires_bundled_resources() {
+        return activate_local_tool_source(tool, spec, &target_root, None)?.ok_or_else(|| {
+            ManagedAcpToolError::invalid(format!(
+                "bundled managed {} artifact unavailable for export",
+                tool.display_name()
+            ))
+        });
+    }
+
     let node_runtime = ensure_node_runtime_with_reporter(None)
         .await
         .map_err(|error| ManagedAcpToolError::invalid(format!("prepare managed Node runtime: {error}")))?;
-    let target_root = bundle_tool_root(root, tool, spec);
     let staging_root = bundle_prepare_staging_root(tool, spec, root);
     if staging_root.exists() {
         let _ = fs::remove_dir_all(&staging_root);
@@ -1424,6 +1434,62 @@ mod tests {
             error
                 .to_string()
                 .contains("bundled managed Codex ACP artifact failed validation")
+        );
+    }
+
+    #[tokio::test]
+    async fn bundled_export_materializes_acp_without_preparing_node_or_using_npm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundled_root = tmp.path().join("bundled");
+        if !crate::test_support::run_in_env_child(
+            "acp_tool_runtime::tests::bundled_export_materializes_acp_without_preparing_node_or_using_npm",
+            |command| {
+                command.env("AIONUI_BUNDLED_MANAGED_RESOURCES", &bundled_root);
+            },
+        ) {
+            return;
+        }
+
+        let bundled_root = PathBuf::from(std::env::var_os("AIONUI_BUNDLED_MANAGED_RESOURCES").unwrap());
+        let tool = ManagedAcpToolId::CodexAcp;
+        let spec = platform_spec().unwrap();
+        let source_root = bundled_root
+            .join("acp")
+            .join(tool.slug())
+            .join(tool.version())
+            .join(spec.manifest_key);
+        let entrypoint = source_root
+            .join("node_modules")
+            .join("@agentclientprotocol")
+            .join("codex-acp")
+            .join("dist")
+            .join("index.js");
+        let platform_binary = source_root.join(platform_binary_relative_path(tool, spec).unwrap());
+        fs::create_dir_all(entrypoint.parent().unwrap()).unwrap();
+        fs::create_dir_all(platform_binary.parent().unwrap()).unwrap();
+        fs::write(&entrypoint, "console.log('bundled codex acp');\n").unwrap();
+        fs::write(&platform_binary, "bundled codex\n").unwrap();
+        fs::write(source_root.join("package.json"), "{}\n").unwrap();
+        fs::write(source_root.join("package-lock.json"), "{}\n").unwrap();
+        fs::write(
+            source_root.join("manifest.json"),
+            br#"{"entrypoint":"node_modules/@agentclientprotocol/codex-acp/dist/index.js","path_entries":[]}"#,
+        )
+        .unwrap();
+
+        managed_resources::set_managed_resources_mode(managed_resources::ManagedResourcesMode::Bundled);
+        let output_root = tmp.path().join("export");
+        let result = prepare_managed_acp_tool_to_root(tool, &output_root).await;
+        managed_resources::set_managed_resources_mode(managed_resources::ManagedResourcesMode::Download);
+
+        let resolved = result.expect("bundled ACP export should not require Node or npm");
+        assert!(resolved.entrypoint.is_file());
+        assert!(resolved.root.starts_with(&output_root));
+        assert!(
+            resolved
+                .root
+                .join(platform_binary_relative_path(tool, spec).unwrap())
+                .is_file()
         );
     }
 

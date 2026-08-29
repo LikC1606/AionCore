@@ -104,6 +104,7 @@ pub fn materialize_directory(source_root: &Path, target_root: &Path) -> std::io:
         fs::remove_dir_all(target_root)?;
     }
     fs::create_dir_all(target_root)?;
+    let canonical_source_root = fs::canonicalize(source_root)?;
     let mut directory_permissions = Vec::new();
 
     for entry in WalkDir::new(source_root) {
@@ -131,7 +132,7 @@ pub fn materialize_directory(source_root: &Path, target_root: &Path) -> std::io:
             if let Some(parent) = target_path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            copy_symlink(entry.path(), &target_path)?;
+            copy_symlink(entry.path(), &target_path, &canonical_source_root, target_root)?;
             continue;
         }
 
@@ -217,12 +218,201 @@ fn copy_materialized_permissions(source: &Path, target: &Path, is_directory: boo
     fs::set_permissions(target, permissions)
 }
 
-fn copy_symlink(source: &Path, target: &Path) -> std::io::Result<()> {
+fn copy_symlink(source: &Path, target: &Path, source_root: &Path, target_root: &Path) -> std::io::Result<()> {
     let link_target = fs::read_link(source)?;
-    if target.exists() {
+    let relative_to_source = if link_target.is_absolute() {
+        resolve_absolute_link_inside_source(source, &link_target, source_root)?
+    } else {
+        resolve_relative_link_inside_source(source, &link_target, source_root)?
+    };
+    let mapped_target = target_root.join(relative_to_source);
+    let target_parent = target.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("managed resource symlink has no parent: {}", target.display()),
+        )
+    })?;
+    let materialized_link_target = relative_path(target_parent, &mapped_target)?;
+
+    if fs::symlink_metadata(target).is_ok() {
         fs::remove_file(target)?;
     }
-    create_symlink(&link_target, target, source)
+    create_symlink(&materialized_link_target, target, source)
+}
+
+fn resolve_relative_link_inside_source(
+    source: &Path,
+    link_target: &Path,
+    source_root: &Path,
+) -> std::io::Result<PathBuf> {
+    let source_parent = source.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("managed resource symlink has no parent: {}", source.display()),
+        )
+    })?;
+    let resolved = fs::canonicalize(source_parent.join(link_target)).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!(
+                "managed resource relative symlink target is unavailable: {} -> {}: {error}",
+                source.display(),
+                link_target.display()
+            ),
+        )
+    })?;
+    resolved.strip_prefix(source_root).map(Path::to_path_buf).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "managed resource relative symlink escapes its source tree: {} -> {}",
+                source.display(),
+                link_target.display()
+            ),
+        )
+    })
+}
+
+fn resolve_absolute_link_inside_source(
+    source: &Path,
+    link_target: &Path,
+    source_root: &Path,
+) -> std::io::Result<PathBuf> {
+    if let Ok(resolved) = fs::canonicalize(link_target) {
+        return resolved.strip_prefix(source_root).map(Path::to_path_buf).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "managed resource absolute symlink escapes its source tree: {} -> {}",
+                    source.display(),
+                    link_target.display()
+                ),
+            )
+        });
+    }
+
+    let source_parent = source.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("managed resource symlink has no parent: {}", source.display()),
+        )
+    })?;
+    let canonical_source_parent = fs::canonicalize(source_parent)?;
+    let source_location = canonical_source_parent.join(source.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("managed resource symlink has no filename: {}", source.display()),
+        )
+    })?);
+    let source_relative = source_location.strip_prefix(source_root).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "managed resource symlink is outside its source tree: {}",
+                source.display()
+            ),
+        )
+    })?;
+    let mut source_components = source_relative.components();
+    let is_npm_bin_link = source_components
+        .next()
+        .is_some_and(|part| part.as_os_str() == "node_modules")
+        && source_components.next().is_some_and(|part| part.as_os_str() == ".bin");
+    if !is_npm_bin_link {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "managed resource absolute symlink target is unavailable: {} -> {}",
+                source.display(),
+                link_target.display()
+            ),
+        ));
+    }
+
+    let target_components = link_target.components().collect::<Vec<_>>();
+    let node_modules_index = target_components
+        .iter()
+        .rposition(|part| part.as_os_str() == "node_modules")
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "managed npm bin link has no recoverable node_modules target: {} -> {}",
+                    source.display(),
+                    link_target.display()
+                ),
+            )
+        })?;
+    let mut recovered_relative = PathBuf::new();
+    for component in &target_components[node_modules_index..] {
+        match component {
+            std::path::Component::Normal(part) => recovered_relative.push(part),
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "managed npm bin link has an unsafe target: {} -> {}",
+                        source.display(),
+                        link_target.display()
+                    ),
+                ));
+            }
+        }
+    }
+
+    let recovered = fs::canonicalize(source_root.join(&recovered_relative)).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!(
+                "managed npm bin link target could not be recovered inside its source tree: {} -> {}: {error}",
+                source.display(),
+                link_target.display()
+            ),
+        )
+    })?;
+    recovered.strip_prefix(source_root).map(Path::to_path_buf).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "managed npm bin link recovery escaped its source tree: {} -> {}",
+                source.display(),
+                link_target.display()
+            ),
+        )
+    })
+}
+
+fn relative_path(from_directory: &Path, to_path: &Path) -> std::io::Result<PathBuf> {
+    let from_components = from_directory.components().collect::<Vec<_>>();
+    let to_components = to_path.components().collect::<Vec<_>>();
+    let shared_components = from_components
+        .iter()
+        .zip(&to_components)
+        .take_while(|(from, to)| from == to)
+        .count();
+
+    if shared_components == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "managed resource symlink paths do not share a filesystem root: {} and {}",
+                from_directory.display(),
+                to_path.display()
+            ),
+        ));
+    }
+
+    let mut relative = PathBuf::new();
+    for _ in shared_components..from_components.len() {
+        relative.push("..");
+    }
+    for component in &to_components[shared_components..] {
+        relative.push(component.as_os_str());
+    }
+    if relative.as_os_str().is_empty() {
+        relative.push(".");
+    }
+    Ok(relative)
 }
 
 #[cfg(unix)]
@@ -336,6 +526,99 @@ mod tests {
             fs::read_link(&copied_link).expect("read link"),
             PathBuf::from("../lib/node_modules/npm/bin/npm-cli.js")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_directory_rewrites_internal_absolute_symlinks_as_relocatable_links() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source-tool");
+        let source_entrypoint = source.join("node_modules/package/dist/index.js");
+        let source_bin = source.join("node_modules/.bin/tool");
+        fs::create_dir_all(source_entrypoint.parent().expect("entrypoint parent")).expect("create package");
+        fs::create_dir_all(source_bin.parent().expect("bin parent")).expect("create bin");
+        fs::write(&source_entrypoint, b"console.log('tool');\n").expect("write entrypoint");
+        std::os::unix::fs::symlink(&source_entrypoint, &source_bin).expect("create absolute symlink");
+
+        let target = temp.path().join("target-tool");
+        materialize_directory(&source, &target).expect("materialize");
+
+        let copied_link = target.join("node_modules/.bin/tool");
+        assert_eq!(
+            fs::read_link(&copied_link).expect("read copied link"),
+            PathBuf::from("../package/dist/index.js")
+        );
+        fs::remove_dir_all(&source).expect("remove source staging tree");
+        let relocated = temp.path().join("relocated-tool");
+        fs::rename(&target, &relocated).expect("relocate materialized tree");
+        assert_eq!(
+            fs::read(relocated.join("node_modules/.bin/tool")).expect("read relocated link target"),
+            b"console.log('tool');\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_directory_recovers_stale_absolute_npm_bin_links_from_a_previous_staging_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source-tool");
+        let source_entrypoint = source.join("node_modules/package/dist/index.js");
+        let source_bin = source.join("node_modules/.bin/tool");
+        fs::create_dir_all(source_entrypoint.parent().expect("entrypoint parent")).expect("create package");
+        fs::create_dir_all(source_bin.parent().expect("bin parent")).expect("create bin");
+        fs::write(&source_entrypoint, b"console.log('tool');\n").expect("write entrypoint");
+        std::os::unix::fs::symlink(
+            temp.path()
+                .join("deleted-staging/project/node_modules/package/dist/index.js"),
+            &source_bin,
+        )
+        .expect("create stale absolute symlink");
+
+        let target = temp.path().join("target-tool");
+        materialize_directory(&source, &target).expect("recover stale npm bin link");
+
+        let copied_link = target.join("node_modules/.bin/tool");
+        assert_eq!(
+            fs::read_link(&copied_link).expect("read recovered link"),
+            PathBuf::from("../package/dist/index.js")
+        );
+        assert_eq!(
+            fs::read(&copied_link).expect("read recovered link target"),
+            b"console.log('tool');\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_directory_rejects_absolute_symlinks_outside_the_source_tree() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source-tool");
+        let external = temp.path().join("external.js");
+        fs::create_dir_all(source.join("bin")).expect("create source");
+        fs::write(&external, b"external\n").expect("write external target");
+        std::os::unix::fs::symlink(&external, source.join("bin/tool")).expect("create external symlink");
+
+        let error = materialize_directory(&source, &temp.path().join("target-tool"))
+            .expect_err("external absolute symlink should be rejected");
+
+        assert!(error.to_string().contains("escapes its source tree"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_directory_rejects_relative_symlinks_outside_the_source_tree() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source-tool");
+        let external = temp.path().join("external.js");
+        fs::create_dir_all(source.join("bin")).expect("create source");
+        fs::write(&external, b"external\n").expect("write external target");
+        std::os::unix::fs::symlink(Path::new("../../external.js"), source.join("bin/tool"))
+            .expect("create external symlink");
+
+        let error = materialize_directory(&source, &temp.path().join("target-tool"))
+            .expect_err("external relative symlink should be rejected");
+
+        assert!(error.to_string().contains("escapes its source tree"), "{error}");
     }
 
     #[cfg(unix)]
