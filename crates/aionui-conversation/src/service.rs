@@ -59,7 +59,11 @@ use crate::turn_orchestrator::{ConversationTurnOrchestrator, ConversationTurnSta
 use std::sync::RwLock;
 
 pub(crate) const MAX_SYSTEM_RESPONSE_CONTINUATIONS_PER_TURN: usize = 4;
-const ACP_CANCEL_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
+// Cancellation is a user-facing control. Give ACP a short grace period to
+// flush its terminal event, then kill the process tree rather than leaving a
+// hidden worker alive for the remainder of a long-running turn.
+pub(crate) const ACP_CANCEL_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const ACP_CANCEL_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 const LEGACY_CONVERSATION_ARCHIVED_MESSAGE: &str =
     "This historical conversation can no longer be continued. Please start a new conversation.";
 const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer supported for new conversations.";
@@ -3249,7 +3253,32 @@ impl ConversationService {
         };
 
         self.runtime_state.mark_cancelling(conversation_id);
-        if let Err(e) = agent.cancel().await {
+        let cancel_result = if agent.agent_type() == AgentType::Acp {
+            match tokio::time::timeout(ACP_CANCEL_REQUEST_TIMEOUT, agent.cancel()).await {
+                Ok(result) => result,
+                Err(_) => {
+                    warn!(
+                        conversation_id,
+                        turn_id,
+                        timeout_ms = ACP_CANCEL_REQUEST_TIMEOUT.as_millis() as u64,
+                        "ACP cancel request did not complete; scheduling immediate process termination"
+                    );
+                    let task_manager = Arc::clone(task_manager);
+                    let conv_id = conversation_id.to_owned();
+                    tokio::spawn(async move {
+                        task_manager
+                            .kill_and_wait(&conv_id, Some(AgentKillReason::UserCancelTimeout))
+                            .await;
+                    });
+                    return Ok(CancelConversationResponse {
+                        runtime: self.runtime_summary_for(conversation_id).await,
+                    });
+                }
+            }
+        } else {
+            agent.cancel().await
+        };
+        if let Err(e) = cancel_result {
             self.runtime_state.clear_cancelling(conversation_id);
             warn!(conversation_id, turn_id, error = %ErrorChain(&e), "Failed to cancel agent");
             return Err(e.into());

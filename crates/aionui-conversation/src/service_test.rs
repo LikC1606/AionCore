@@ -50,7 +50,7 @@ use aionui_realtime::EventBroadcaster;
 use serde_json::json;
 use tokio::sync::{Notify, broadcast};
 
-use crate::service::ConversationService;
+use crate::service::{ACP_CANCEL_DRAIN_TIMEOUT, ConversationService};
 use crate::skill_resolver::{FixedSkillResolver, ResolvedAgentSkill, SkillResolver};
 use crate::{
     ConversationAgentTurnRequest, ConversationAgentTurnStartedCallback, ConversationAgentTurnStatus, ConversationError,
@@ -5765,7 +5765,7 @@ async fn cancel_timeout_kills_acp_task_when_turn_still_claimed() {
         .unwrap();
 
     tokio::task::yield_now().await;
-    tokio::time::advance(Duration::from_secs(15) + Duration::from_millis(1)).await;
+    tokio::time::advance(ACP_CANCEL_DRAIN_TIMEOUT + Duration::from_millis(1)).await;
     tokio::task::yield_now().await;
 
     assert_eq!(
@@ -5794,7 +5794,7 @@ async fn cancel_timeout_does_not_kill_non_acp_task() {
         .unwrap();
 
     tokio::task::yield_now().await;
-    tokio::time::advance(Duration::from_secs(15) + Duration::from_millis(1)).await;
+    tokio::time::advance(ACP_CANCEL_DRAIN_TIMEOUT + Duration::from_millis(1)).await;
     tokio::task::yield_now().await;
 
     assert!(task_mgr.kill_records().is_empty());

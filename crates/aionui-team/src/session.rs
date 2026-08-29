@@ -1130,38 +1130,66 @@ impl TeamSession {
         if !result.terminal_message_ids.is_empty() {
             self.mailbox.mark_read_batch(&result.terminal_message_ids).await?;
         }
-        for target in result.cancel_targets {
-            let Some(turn_id) = target.turn_id else {
-                continue;
-            };
-            let agent = self.scheduler.get_agent(&target.batch.slot_id).await?;
-            if let Err(error) = self
-                .cancellation_port
-                .cancel_agent_turn(&self.user_id, &agent.conversation_id, &turn_id)
-                .await
-            {
-                warn!(
-                    team_id = %self.team.id,
-                    team_run_id,
-                    slot_id = %target.batch.slot_id,
-                    turn_id,
-                    error = %error,
-                    "team run cancellation failed for active turn"
+        // Cancel every active slot concurrently. A slow or unavailable ACP
+        // child must not delay cancellation of its siblings.
+        let cancellation_port = Arc::clone(&self.cancellation_port);
+        let scheduler = Arc::clone(&self.scheduler);
+        let user_id = self.user_id.clone();
+        let team_id = self.team.id.clone();
+        let team_run_id = team_run_id.to_owned();
+        let emitter = self.team_event_emitter();
+        futures_util::future::join_all(result.cancel_targets.into_iter().filter_map(|target| {
+            let turn_id = target.turn_id?;
+            let slot_id = target.batch.slot_id;
+            let cancellation_port = Arc::clone(&cancellation_port);
+            let scheduler = Arc::clone(&scheduler);
+            let user_id = user_id.clone();
+            let team_id = team_id.clone();
+            let team_run_id = team_run_id.clone();
+            let emitter = Arc::clone(&emitter);
+            Some(async move {
+                let agent = match scheduler.get_agent(&slot_id).await {
+                    Ok(agent) => agent,
+                    Err(error) => {
+                        warn!(
+                            team_id = %team_id,
+                            team_run_id,
+                            slot_id = %slot_id,
+                            turn_id,
+                            error = %error,
+                            "team run cancellation could not resolve active agent"
+                        );
+                        return;
+                    }
+                };
+                if let Err(error) = cancellation_port
+                    .cancel_agent_turn(&user_id, &agent.conversation_id, &turn_id)
+                    .await
+                {
+                    warn!(
+                        team_id = %team_id,
+                        team_run_id,
+                        slot_id = %slot_id,
+                        turn_id,
+                        error = %error,
+                        "team run cancellation failed for active turn"
+                    );
+                }
+                emitter.broadcast_child_turn(
+                    TEAM_CHILD_TURN_CANCELLED_EVENT,
+                    TeamChildTurnPayload {
+                        team_id,
+                        team_run_id,
+                        slot_id,
+                        role: target_role_for(agent.role),
+                        conversation_id: agent.conversation_id,
+                        turn_id,
+                        status: TeamRunStatus::Cancelled,
+                    },
                 );
-            }
-            self.team_event_emitter().broadcast_child_turn(
-                TEAM_CHILD_TURN_CANCELLED_EVENT,
-                TeamChildTurnPayload {
-                    team_id: self.team.id.clone(),
-                    team_run_id: team_run_id.to_owned(),
-                    slot_id: target.batch.slot_id,
-                    role: target_role_for(agent.role),
-                    conversation_id: agent.conversation_id,
-                    turn_id,
-                    status: TeamRunStatus::Cancelled,
-                },
-            );
-        }
+            })
+        }))
+        .await;
         Ok(())
     }
 
