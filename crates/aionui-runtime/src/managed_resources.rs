@@ -291,6 +291,14 @@ fn resolve_absolute_link_inside_source(
         });
     }
 
+    if let Some(root_name) = source_root.file_name()
+        && let Some(recovered_relative) = path_suffix_after_component(link_target, root_name)
+        && let Ok(recovered) = fs::canonicalize(source_root.join(&recovered_relative))
+        && let Ok(relative) = recovered.strip_prefix(source_root)
+    {
+        return Ok(relative.to_path_buf());
+    }
+
     let source_parent = source.parent().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -329,11 +337,8 @@ fn resolve_absolute_link_inside_source(
         ));
     }
 
-    let target_components = link_target.components().collect::<Vec<_>>();
-    let node_modules_index = target_components
-        .iter()
-        .rposition(|part| part.as_os_str() == "node_modules")
-        .ok_or_else(|| {
+    let recovered_relative =
+        path_suffix_from_component(link_target, std::ffi::OsStr::new("node_modules")).ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
@@ -343,22 +348,6 @@ fn resolve_absolute_link_inside_source(
                 ),
             )
         })?;
-    let mut recovered_relative = PathBuf::new();
-    for component in &target_components[node_modules_index..] {
-        match component {
-            std::path::Component::Normal(part) => recovered_relative.push(part),
-            _ => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "managed npm bin link has an unsafe target: {} -> {}",
-                        source.display(),
-                        link_target.display()
-                    ),
-                ));
-            }
-        }
-    }
 
     let recovered = fs::canonicalize(source_root.join(&recovered_relative)).map_err(|error| {
         std::io::Error::new(
@@ -380,6 +369,33 @@ fn resolve_absolute_link_inside_source(
             ),
         )
     })
+}
+
+fn path_suffix_after_component(path: &Path, marker: &std::ffi::OsStr) -> Option<PathBuf> {
+    let components = path.components().collect::<Vec<_>>();
+    let marker_index = components.iter().rposition(|part| part.as_os_str() == marker)?;
+    let suffix = components.get(marker_index + 1..)?;
+    if suffix.is_empty() {
+        return None;
+    }
+    normal_components_to_path(suffix)
+}
+
+fn path_suffix_from_component(path: &Path, marker: &std::ffi::OsStr) -> Option<PathBuf> {
+    let components = path.components().collect::<Vec<_>>();
+    let marker_index = components.iter().rposition(|part| part.as_os_str() == marker)?;
+    normal_components_to_path(components.get(marker_index..)?)
+}
+
+fn normal_components_to_path(components: &[std::path::Component<'_>]) -> Option<PathBuf> {
+    let mut result = PathBuf::new();
+    for component in components {
+        match component {
+            std::path::Component::Normal(part) => result.push(part),
+            _ => return None,
+        }
+    }
+    (!result.as_os_str().is_empty()).then_some(result)
 }
 
 fn relative_path(from_directory: &Path, to_path: &Path) -> std::io::Result<PathBuf> {
@@ -585,6 +601,38 @@ mod tests {
         assert_eq!(
             fs::read(&copied_link).expect("read recovered link target"),
             b"console.log('tool');\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_directory_recovers_stale_absolute_links_from_the_same_versioned_resource_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("node-v24.11.0-linux-x64");
+        let source_cli = source.join("lib/node_modules/npm/bin/npm-cli.js");
+        let source_bin = source.join("bin/npm");
+        fs::create_dir_all(source_cli.parent().expect("cli parent")).expect("create npm package");
+        fs::create_dir_all(source_bin.parent().expect("bin parent")).expect("create bin");
+        fs::write(&source_cli, b"console.log('npm');\n").expect("write npm cli");
+        std::os::unix::fs::symlink(
+            temp.path().join(
+                "deleted-staging/managed-resources/node/node-v24.11.0-linux-x64/lib/node_modules/npm/bin/npm-cli.js",
+            ),
+            &source_bin,
+        )
+        .expect("create stale Node symlink");
+
+        let target = temp.path().join("target-node");
+        materialize_directory(&source, &target).expect("recover stale versioned resource link");
+
+        let copied_link = target.join("bin/npm");
+        assert_eq!(
+            fs::read_link(&copied_link).expect("read recovered link"),
+            PathBuf::from("../lib/node_modules/npm/bin/npm-cli.js")
+        );
+        assert_eq!(
+            fs::read(&copied_link).expect("read recovered link target"),
+            b"console.log('npm');\n"
         );
     }
 
