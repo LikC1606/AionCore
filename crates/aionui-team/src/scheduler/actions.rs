@@ -65,6 +65,25 @@ impl TeammateManager {
     }
 
     pub async fn finalize_turn(&self, slot_id: &str, actions: &[SchedulerAction]) -> Result<Option<String>, TeamError> {
+        self.finalize_turn_with_lead_notification(slot_id, actions, true).await
+    }
+
+    /// Finalize a Worker turn without adding a synthetic Lead notification
+    /// when a durable delivery already woke the Lead.
+    pub async fn finalize_turn_without_lead_notification(
+        &self,
+        slot_id: &str,
+        actions: &[SchedulerAction],
+    ) -> Result<Option<String>, TeamError> {
+        self.finalize_turn_with_lead_notification(slot_id, actions, false).await
+    }
+
+    async fn finalize_turn_with_lead_notification(
+        &self,
+        slot_id: &str,
+        actions: &[SchedulerAction],
+        notify_lead: bool,
+    ) -> Result<Option<String>, TeamError> {
         let mut summary: Option<String> = None;
         for action in actions {
             if let SchedulerAction::IdleNotification { summary: s } = action {
@@ -76,7 +95,8 @@ impl TeammateManager {
             self.execute_action(slot_id, action).await?;
         }
 
-        self.mark_idle(slot_id, summary.as_deref()).await
+        self.mark_idle_with_lead_notification(slot_id, summary.as_deref(), notify_lead)
+            .await
     }
 
     async fn handle_send_message(

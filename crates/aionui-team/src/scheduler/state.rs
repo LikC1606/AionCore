@@ -44,6 +44,25 @@ impl TeammateManager {
     }
 
     pub async fn mark_idle(&self, slot_id: &str, summary: Option<&str>) -> Result<Option<String>, TeamError> {
+        self.mark_idle_with_lead_notification(slot_id, summary, true).await
+    }
+
+    /// Mark a Worker idle without writing the synthetic Lead notification
+    /// when the Worker already delivered a durable message to the Lead.
+    pub async fn mark_idle_without_lead_notification(
+        &self,
+        slot_id: &str,
+        summary: Option<&str>,
+    ) -> Result<Option<String>, TeamError> {
+        self.mark_idle_with_lead_notification(slot_id, summary, false).await
+    }
+
+    pub(crate) async fn mark_idle_with_lead_notification(
+        &self,
+        slot_id: &str,
+        summary: Option<&str>,
+        notify_lead: bool,
+    ) -> Result<Option<String>, TeamError> {
         self.set_status(slot_id, TeammateStatus::Idle).await?;
 
         let is_lead = {
@@ -58,19 +77,21 @@ impl TeammateManager {
             return Ok(None);
         }
 
-        if let Some(lead_slot_id) = self.find_lead_slot_id().await
-            && lead_slot_id != slot_id
-        {
-            self.mailbox
-                .write(
-                    &self.team_id,
-                    &lead_slot_id,
-                    slot_id,
-                    MailboxMessageType::IdleNotification,
-                    summary.unwrap_or("idle"),
-                    summary,
-                )
-                .await?;
+        if notify_lead {
+            if let Some(lead_slot_id) = self.find_lead_slot_id().await
+                && lead_slot_id != slot_id
+            {
+                self.mailbox
+                    .write(
+                        &self.team_id,
+                        &lead_slot_id,
+                        slot_id,
+                        MailboxMessageType::IdleNotification,
+                        summary.unwrap_or("idle"),
+                        summary,
+                    )
+                    .await?;
+            }
         }
 
         self.maybe_wake_leader_when_all_idle().await

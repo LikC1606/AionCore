@@ -193,6 +193,7 @@ enum ExecuteResult {
 async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: WakeInput) -> ExecuteResult {
     ctx.session.mirror_unread_to_conversation(&input).await;
     let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Working).await;
+    ctx.scheduler.begin_turn(&ctx.slot_id);
 
     let files = input
         .unread
@@ -316,6 +317,7 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
         }
         Err(error) if !prompt_accepted_seen.load(Ordering::SeqCst) && is_retryable_start_skip(&error) => {
             ctx.session.work_coordinator().retry_start(&batch, "already_running");
+            ctx.scheduler.clear_turn(&ctx.slot_id);
             let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Idle).await;
             return ExecuteResult::WaitForSignal;
         }
@@ -336,6 +338,7 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
             )
             .await;
             ctx.session.work_coordinator().fail_batch(&batch, "turn_start_failed");
+            ctx.scheduler.clear_turn(&ctx.slot_id);
             let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Error).await;
             return ExecuteResult::ContinueDraining;
         }
@@ -383,20 +386,34 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
         }
     }
 
-    match ctx.scheduler.finalize_turn(&ctx.slot_id, &[]).await {
+    // A successful Worker delivery already woke the Lead through its durable
+    // Message. Use the turn-bound signal rather than current mailbox state:
+    // Lead may have consumed the message before this finalization runs.
+    let lead_delivery = ctx.scheduler.take_lead_delivery(&ctx.slot_id).unwrap_or(false);
+    let suppress_duplicate_lead_wake = outcome.status.is_success() && lead_delivery;
+    let finalize_result = if suppress_duplicate_lead_wake {
+        ctx.scheduler
+            .finalize_turn_without_lead_notification(&ctx.slot_id, &[])
+            .await
+    } else {
+        ctx.scheduler.finalize_turn(&ctx.slot_id, &[]).await
+    };
+    match finalize_result {
         Ok(Some(wake_target)) if wake_target != ctx.slot_id => {
-            if let Err(error) = ctx
-                .session
-                .enqueue_leader_settle_signal(&wake_target, WorkSource::IdleNotification)
-                .await
-            {
-                warn!(
-                    team_id = %ctx.team_id,
-                    slot_id = %ctx.slot_id,
-                    wake_target,
-                    error = %error,
-                    "leader settle signal enqueue failed"
-                );
+            if !suppress_duplicate_lead_wake {
+                if let Err(error) = ctx
+                    .session
+                    .enqueue_leader_settle_signal(&wake_target, WorkSource::IdleNotification)
+                    .await
+                {
+                    warn!(
+                        team_id = %ctx.team_id,
+                        slot_id = %ctx.slot_id,
+                        wake_target,
+                        error = %error,
+                        "leader settle signal enqueue failed"
+                    );
+                }
             }
         }
         Ok(_) => {}

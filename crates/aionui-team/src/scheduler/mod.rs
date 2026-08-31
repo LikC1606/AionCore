@@ -117,6 +117,10 @@ pub struct TeammateManager {
     pub(crate) mailbox: Arc<Mailbox>,
     pub(crate) events: TeamEventEmitter,
     pub(crate) active_wakes: DashSet<String>,
+    /// Per-slot state for the currently executing event-loop turn. The flag
+    /// is set only after that turn successfully commits a durable message to
+    /// the Lead, so mailbox read timing cannot cause duplicate wakes.
+    pub(crate) active_turn_lead_deliveries: DashMap<String, bool>,
     // Reason: Finish / Error events may fire back-to-back for the same
     // conversation; without this dedup window, finalize_turn would run twice
     // and double-write the IdleNotification (aionui-audit 4.3, 8 #3).
@@ -151,6 +155,7 @@ impl TeammateManager {
             mailbox,
             events,
             active_wakes: DashSet::new(),
+            active_turn_lead_deliveries: DashMap::new(),
             finalized_turns: Arc::new(DashMap::new()),
             wake_timeouts: Arc::new(DashMap::new()),
         }
@@ -175,5 +180,31 @@ impl TeammateManager {
             .values()
             .find(|s| s.agent.role == TeammateRole::Lead)
             .map(|s| s.agent.slot_id.clone())
+    }
+
+    /// Start tracking delivery side effects for one event-loop turn.
+    pub(crate) fn begin_turn(&self, slot_id: &str) {
+        self.active_turn_lead_deliveries.insert(slot_id.to_owned(), false);
+    }
+
+    /// Record a durable message to the Lead for the active turn. Calls made
+    /// outside the event loop are intentionally ignored.
+    pub(crate) fn record_lead_delivery(&self, slot_id: &str) {
+        if let Some(mut entry) = self.active_turn_lead_deliveries.get_mut(slot_id) {
+            *entry = true;
+        }
+    }
+
+    /// Consume the turn-bound delivery flag during finalization. A missing
+    /// entry preserves legacy behavior for callers outside the event loop.
+    pub(crate) fn take_lead_delivery(&self, slot_id: &str) -> Option<bool> {
+        self.active_turn_lead_deliveries
+            .remove(slot_id)
+            .map(|(_, delivered)| delivered)
+    }
+
+    /// Discard turn tracking after a turn fails before normal finalization.
+    pub(crate) fn clear_turn(&self, slot_id: &str) {
+        self.active_turn_lead_deliveries.remove(slot_id);
     }
 }

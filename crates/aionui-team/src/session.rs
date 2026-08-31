@@ -839,6 +839,11 @@ impl TeamSession {
             mailbox_replayed,
             "agent message mailbox enqueue resolved"
         );
+        // Record only after the enqueue commit succeeds. This signal remains
+        // valid even if Lead consumes the row before Worker finalization.
+        if to_agent.role == TeammateRole::Lead {
+            self.scheduler.record_lead_delivery(from_slot_id);
+        }
         self.event_loops.notify(to_slot_id);
         Ok(AgentMessageQueueResult {
             team_run_id: commit.team_run_id,

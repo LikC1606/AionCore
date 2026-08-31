@@ -110,6 +110,48 @@ async fn initial_status_is_idle() {
 }
 
 #[tokio::test]
+async fn turn_delivery_flag_is_consumed_after_lead_reads_message() {
+    let agents = make_team_agents();
+    let (mgr, _) = make_manager(&agents);
+
+    mgr.begin_turn("worker-1");
+    mgr.mailbox
+        .write(
+            "t1",
+            "lead-1",
+            "worker-1",
+            MailboxMessageType::Message,
+            "proof complete",
+            None,
+        )
+        .await
+        .unwrap();
+    mgr.record_lead_delivery("worker-1");
+
+    // The Lead may consume the delivery before Worker finalization runs.
+    let consumed = mgr.mailbox.read_unread("t1", "lead-1").await.unwrap();
+    assert_eq!(consumed.len(), 1);
+    assert_eq!(mgr.take_lead_delivery("worker-1"), Some(true));
+    assert_eq!(mgr.take_lead_delivery("worker-1"), None);
+}
+
+#[tokio::test]
+async fn turn_without_lead_delivery_keeps_idle_notification_semantics() {
+    let agents = make_team_agents();
+    let (mgr, _) = make_manager(&agents);
+
+    mgr.begin_turn("worker-1");
+    assert_eq!(mgr.take_lead_delivery("worker-1"), Some(false));
+    mgr.mark_idle("worker-1", Some("finished without delivery"))
+        .await
+        .unwrap();
+
+    let lead_messages = mgr.mailbox.read_unread("t1", "lead-1").await.unwrap();
+    assert_eq!(lead_messages.len(), 1);
+    assert_eq!(lead_messages[0].msg_type, MailboxMessageType::IdleNotification);
+}
+
+#[tokio::test]
 async fn set_status_updates_and_broadcasts() {
     let agents = make_team_agents();
     let (mgr, bc) = make_manager(&agents);
