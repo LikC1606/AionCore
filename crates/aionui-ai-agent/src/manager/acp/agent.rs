@@ -451,6 +451,7 @@ impl AcpAgentManager {
         let (domain_event_tx, domain_event_rx) = mpsc::channel(256);
         let (permission_tx, permission_rx) = mpsc::channel(32);
         let runtime = AgentRuntime::new(params.conversation_id.clone(), params.workspace.path.clone(), 256);
+        runtime.spawn_event_activity_tracker();
 
         // Race the handshake against process exit. The SDK's stdout EOF
         // detection can lag (observed: 30s on Windows when the agent dies

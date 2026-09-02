@@ -1,5 +1,6 @@
 mod manager;
 
+pub(crate) use manager::ACTIVE_TURN_SLOW_THRESHOLD_MS;
 pub use manager::TeamRunManager;
 
 use aionui_api_types::TeamRunTargetRole;

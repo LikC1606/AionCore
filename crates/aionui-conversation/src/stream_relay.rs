@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use aionui_ai_agent::protocol::events::{ErrorEventData, TipType};
 use aionui_ai_agent::{AgentSendError, AgentStreamEvent, protocol::events::ThinkingEventData};
@@ -10,7 +11,7 @@ use aionui_common::{ErrorChain, normalize_keys_to_snake_case, now_ms};
 
 use crate::runtime_persistence::RuntimePersistenceCoordinator;
 use crate::runtime_state::ConversationRuntimeStateService;
-use crate::service::ConversationService;
+use crate::service::{ConversationAgentTurnStarted, ConversationAgentTurnStartedCallback, ConversationService};
 use crate::stream_persistence::{
     PersistedTextSegment, StreamPersistenceAdapter, TextSegmentState, ThinkingSegmentState,
 };
@@ -112,6 +113,8 @@ pub struct StreamRelay {
     adapter: StreamPersistenceAdapter,
     complete_turn: bool,
     defer_clean_terminal_errors: bool,
+    on_started: Option<ConversationAgentTurnStartedCallback>,
+    prompt_accepted: Option<Arc<AtomicBool>>,
 }
 
 impl StreamRelay {
@@ -137,6 +140,8 @@ impl StreamRelay {
             adapter,
             complete_turn: true,
             defer_clean_terminal_errors: false,
+            on_started: None,
+            prompt_accepted: None,
         }
     }
 
@@ -168,6 +173,20 @@ impl StreamRelay {
 
     pub fn with_defer_clean_terminal_errors(mut self, enabled: bool) -> Self {
         self.defer_clean_terminal_errors = enabled;
+        self
+    }
+
+    /// Notify the Team coordinator as soon as the agent stream accepts a
+    /// turn. ACP emits a `Start` event before the prompt RPC completes, while
+    /// lightweight test agents may only emit their first terminal/output
+    /// event; both cases provide a useful ownership boundary.
+    pub fn with_started_callback(
+        mut self,
+        on_started: Option<ConversationAgentTurnStartedCallback>,
+        prompt_accepted: Arc<AtomicBool>,
+    ) -> Self {
+        self.on_started = on_started;
+        self.prompt_accepted = Some(prompt_accepted);
         self
     }
 
@@ -229,6 +248,7 @@ impl StreamRelay {
         let mut attempt = TurnAttemptSummary::default();
 
         loop {
+            let mut injected_send_error = false;
             let recv_result = if send_error_done {
                 if let Some(send_error) = pending_send_error.take() {
                     match rx.try_recv() {
@@ -246,6 +266,7 @@ impl StreamRelay {
                                 ownership = ?send_error.ownership(),
                                 "Injecting stream error for failed agent send"
                             );
+                            injected_send_error = true;
                             Ok(AgentStreamEvent::Error(send_error.into_stream_error()))
                         }
                         Err(TryRecvError::Lagged(n)) => Err(broadcast::error::RecvError::Lagged(n)),
@@ -280,6 +301,33 @@ impl StreamRelay {
                         continue;
                     }
 
+                    let establishes_turn = matches!(
+                        &event,
+                        AgentStreamEvent::Start(_)
+                            | AgentStreamEvent::Thinking(_)
+                            | AgentStreamEvent::Text(_)
+                            | AgentStreamEvent::ToolCall(_)
+                            | AgentStreamEvent::AcpToolCall(_)
+                            | AgentStreamEvent::ToolGroup(_)
+                            | AgentStreamEvent::Tips(_)
+                            | AgentStreamEvent::Finish(_)
+                            | AgentStreamEvent::Error(_)
+                    );
+                    if establishes_turn
+                        && !injected_send_error
+                        && !self
+                            .prompt_accepted
+                            .as_ref()
+                            .is_some_and(|accepted| accepted.swap(true, Ordering::SeqCst))
+                    {
+                        if let Some(on_started) = self.on_started.clone() {
+                            on_started(ConversationAgentTurnStarted {
+                                conversation_id: self.conversation_id.clone(),
+                                turn_id: self.turn_id.clone(),
+                            })
+                            .await;
+                        }
+                    }
                     if !first_agent_event_logged {
                         first_agent_event_logged = true;
                         info!(
@@ -936,6 +984,51 @@ mod tests {
 
         let content: serde_json::Value = serde_json::from_str(&msg.content).unwrap();
         assert_eq!(content["content"], "Hello World");
+    }
+
+    #[tokio::test]
+    async fn started_callback_fires_on_start_event_before_terminal() {
+        use aionui_ai_agent::protocol::events::{FinishEventData, StartEventData};
+        use tokio::sync::oneshot;
+
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+        let accepted = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = oneshot::channel();
+        let started_tx = Arc::new(Mutex::new(Some(started_tx)));
+        let callback_tx = Arc::clone(&started_tx);
+        let callback: ConversationAgentTurnStartedCallback = Arc::new(move |started| {
+            let callback_tx = Arc::clone(&callback_tx);
+            Box::pin(async move {
+                if let Some(tx) = callback_tx.lock().unwrap().take() {
+                    let _ = tx.send(started);
+                }
+            })
+        });
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo,
+            bus,
+        )
+        .with_started_callback(Some(callback), Arc::clone(&accepted));
+        let relay_task = tokio::spawn(relay.consume(tx.subscribe()));
+
+        tx.send(AgentStreamEvent::Start(StartEventData { session_id: None }))
+            .unwrap();
+        let started = tokio::time::timeout(std::time::Duration::from_secs(1), started_rx)
+            .await
+            .expect("started callback should run on Start")
+            .expect("started callback sender should remain available");
+        assert_eq!(started.conversation_id, "conv-1");
+        assert_eq!(started.turn_id, "turn-1");
+        assert!(accepted.load(Ordering::SeqCst));
+
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+        relay_task.await.unwrap();
     }
 
     #[tokio::test]

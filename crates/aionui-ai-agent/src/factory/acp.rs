@@ -29,6 +29,7 @@ pub(super) async fn build(
     build_context: AcpSessionBuildContext,
     ctx: FactoryContext,
 ) -> Result<AgentInstance, AgentError> {
+    let belongs_to_team = build_context.belongs_to_team;
     let mut config = build_context.config;
 
     // Resolve the catalog row — prefer explicit agent_id, fall
@@ -61,9 +62,16 @@ pub(super) async fn build(
             config: &config,
             session_snapshot: build_context.session_snapshot.as_ref(),
             runtime_env: &ctx.runtime_env,
+            belongs_to_team,
         },
     )
     .map_err(AgentError::bad_request)?;
+    if belongs_to_team && meta.backend.as_deref() == Some("codex") {
+        info!(
+            conversation_id = %ctx.conversation_id,
+            "Codex native multi-agent disabled for Team-bound ACP session"
+        );
+    }
     let session_snapshot = build_context.session_snapshot;
 
     // Load user-configured MCP servers from the DB so they reach
@@ -775,11 +783,6 @@ mod tests {
         .to_string()
     }
 
-    fn path_test_lock() -> &'static tokio::sync::Mutex<()> {
-        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
-    }
-
     fn is_npx_command_path(command: &str) -> bool {
         command == "npx" || command.ends_with("/npx") || command.ends_with("\\npx.cmd")
     }
@@ -872,7 +875,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn row_to_sdk_stdio_flattens_resolved_npx_command() {
-        let _lock = path_test_lock().lock().await;
+        let _lock = crate::factory::bundled_runtime_test_lock().lock().await;
         let runtime = install_fake_bundled_runtime();
         let _runtime_data_dir = test_runtime_data_dir();
         let _runtime_mode = BundledRuntimeModeGuard::install(runtime.path());
@@ -900,7 +903,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn resolve_agent_command_spec_flattens_bare_npx_command() {
-        let _lock = path_test_lock().lock().await;
+        let _lock = crate::factory::bundled_runtime_test_lock().lock().await;
         let runtime = install_fake_bundled_runtime();
         let _runtime_data_dir = test_runtime_data_dir();
         let _runtime_mode = BundledRuntimeModeGuard::install(runtime.path());
@@ -981,7 +984,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn row_to_sdk_stdio_roundtrip() {
-        let _lock = path_test_lock().lock().await;
+        let _lock = crate::factory::bundled_runtime_test_lock().lock().await;
         let runtime = install_fake_bundled_runtime();
         let _runtime_data_dir = test_runtime_data_dir();
         let _runtime_mode = BundledRuntimeModeGuard::install(runtime.path());

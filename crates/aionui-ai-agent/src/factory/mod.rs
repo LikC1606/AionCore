@@ -23,6 +23,12 @@ use crate::session_context::AgentSessionKind;
 use crate::task_manager::AgentFactory;
 use crate::types::BuildTaskOptions;
 
+#[cfg(test)]
+pub(crate) fn bundled_runtime_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 /// Dependencies needed by the agent factory to construct agents.
 pub struct AgentFactoryDeps {
     pub skill_manager: Arc<AcpSkillManager>,

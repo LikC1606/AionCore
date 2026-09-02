@@ -1,12 +1,14 @@
 use std::sync::Arc;
 
 use aionui_api_types::{TeamRunSource, TeamRunStatus, TeamRunTargetRole};
+use aionui_common::now_ms;
 
 use crate::events::TeamEventEmitter;
-use crate::team_run::TeamRunManager;
+use crate::team_run::{ACTIVE_TURN_SLOW_THRESHOLD_MS, TeamRunManager};
 use crate::test_utils::workspace_harness::RecordingBroadcaster;
 use crate::work_coordinator::{
-    CausalBinding, EnqueueRequest, ReconcileDecision, RuntimeConstraint, SlotWorkCoordinator,
+    CausalBinding, EnqueueRequest, ReconcileDecision, RuntimeConstraint, SlotPhase, SlotWorkCoordinator,
+    SlotWorkSnapshot,
 };
 use crate::work_source::WorkSource;
 
@@ -280,6 +282,34 @@ fn published_dynamic_attach_failure_blocks_only_related_work_and_preserves_healt
     let healthy = coordinator.slot_snapshot("lead-1").unwrap();
     assert_eq!(healthy.runtime_constraint, RuntimeConstraint::Ready);
     assert_eq!(healthy.queued_background_count, 1);
+}
+
+#[test]
+fn active_turn_slow_tracks_activity_silence_instead_of_total_duration() {
+    let now = now_ms();
+    let active = SlotWorkSnapshot {
+        slot_id: "worker-1".into(),
+        role: TeamRunTargetRole::Teammate,
+        state: SlotPhase::Running,
+        queued_foreground_count: 0,
+        queued_background_count: 0,
+        active_batch: None,
+        active_turn_id: Some("turn-1".into()),
+        active_turn_started_at_ms: Some(now - ACTIVE_TURN_SLOW_THRESHOLD_MS as i64 - 1),
+        active_turn_last_activity_at_ms: Some(now),
+        runtime_constraint: RuntimeConstraint::Ready,
+        team_run_id: None,
+    };
+
+    let active_payload = TeamRunManager::slot_payload(&active);
+    assert!(active_payload.active_turn_elapsed_ms.unwrap() >= ACTIVE_TURN_SLOW_THRESHOLD_MS);
+    assert_eq!(active_payload.active_turn_slow, Some(false));
+
+    let stalled = SlotWorkSnapshot {
+        active_turn_last_activity_at_ms: active.active_turn_started_at_ms,
+        ..active
+    };
+    assert_eq!(TeamRunManager::slot_payload(&stalled).active_turn_slow, Some(true));
 }
 
 #[test]

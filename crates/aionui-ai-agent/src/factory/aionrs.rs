@@ -770,11 +770,6 @@ mod tests {
         path::{Path, PathBuf},
     };
 
-    fn path_test_lock() -> &'static tokio::sync::Mutex<()> {
-        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
-    }
-
     #[cfg(unix)]
     fn test_runtime_data_dir() -> &'static PathBuf {
         static DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -970,7 +965,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn row_to_mcp_server_config_flattens_resolved_npx_command() {
-        let _lock = path_test_lock().lock().await;
+        let _lock = crate::factory::bundled_runtime_test_lock().lock().await;
         let runtime = install_fake_bundled_runtime();
         let _runtime_data_dir = test_runtime_data_dir();
         let _runtime_mode = BundledRuntimeModeGuard::install(runtime.path());

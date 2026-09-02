@@ -14,6 +14,7 @@ pub(super) struct AcpLaunchPolicyInput<'a> {
     pub config: &'a AcpBuildExtra,
     pub session_snapshot: Option<&'a PersistedSessionState>,
     pub runtime_env: &'a [(String, String)],
+    pub belongs_to_team: bool,
 }
 
 pub(super) fn apply_acp_launch_policy(
@@ -23,7 +24,13 @@ pub(super) fn apply_acp_launch_policy(
     let initial_mode = initial_mode_from_build_context(input.metadata, input.config, input.session_snapshot);
     apply_codex_runtime_config_args(command_spec, input.metadata, initial_mode.as_deref());
     append_runtime_env(command_spec, input.runtime_env);
-    append_codex_config_env(command_spec, input.metadata, initial_mode.as_deref(), input.runtime_env)?;
+    append_codex_config_env(
+        command_spec,
+        input.metadata,
+        initial_mode.as_deref(),
+        input.runtime_env,
+        input.belongs_to_team,
+    )?;
     append_claude_provider_env(command_spec, input.metadata);
     Ok(())
 }
@@ -113,6 +120,7 @@ fn append_codex_config_env(
     metadata: &AgentMetadata,
     initial_mode: Option<&str>,
     runtime_env: &[(String, String)],
+    belongs_to_team: bool,
 ) -> Result<(), String> {
     if metadata.backend.as_deref() != Some("codex") {
         return Ok(());
@@ -123,6 +131,14 @@ fn append_codex_config_env(
         return Err("Codex launch rejects a caller-provided CODEX_CONFIG".to_owned());
     }
     let sandbox_mode = codex_sandbox_mode_for_requested_mode(initial_mode);
+    let mut features = serde_json::Map::from_iter([("shell_snapshot".to_owned(), json!(false))]);
+    if belongs_to_team {
+        // DeepScientist Team members are ACP conversations managed by Core,
+        // not Codex-native child threads. Exposing Codex's second orchestration
+        // layer lets a native empty `wait` block the ACP turn while Team
+        // deliveries queue behind it in Core's event loop.
+        features.insert("multi_agent".to_owned(), json!(false));
+    }
     let config = json!({
         "allow_login_shell": false,
         "shell_environment_policy": {
@@ -131,7 +147,7 @@ fn append_codex_config_env(
             "include_only": [],
             "exclude": ["DEEPSEEK_API_KEY"],
         },
-        "features": {"shell_snapshot": false},
+        "features": features,
         "sandbox_mode": sandbox_mode,
     });
     command_spec.env.push(aionui_common::EnvVar {
@@ -217,6 +233,7 @@ mod tests {
                 config: &config,
                 session_snapshot: None,
                 runtime_env: &[("AIONUI_CONVERSATION_ID".into(), "conv-1".into())],
+                belongs_to_team: false,
             },
         )
         .expect("Codex launch policy should materialize CODEX_CONFIG");
@@ -260,6 +277,7 @@ mod tests {
                 config: &config,
                 session_snapshot: None,
                 runtime_env: &[],
+                belongs_to_team: false,
             },
         )
         .expect("Codex launch policy should materialize CODEX_CONFIG");
@@ -295,6 +313,7 @@ mod tests {
                 config: &AcpBuildExtra::default(),
                 session_snapshot: None,
                 runtime_env: &[],
+                belongs_to_team: false,
             },
         )
         .expect("Codex launch policy should materialize CODEX_CONFIG");
@@ -307,8 +326,40 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&config.value).expect("valid CODEX_CONFIG JSON");
         assert_eq!(value["allow_login_shell"], false);
         assert_eq!(value["features"]["shell_snapshot"], false);
+        assert!(value["features"].get("multi_agent").is_none());
         assert_eq!(value["shell_environment_policy"]["exclude"][0], "DEEPSEEK_API_KEY");
         assert_eq!(value["shell_environment_policy"]["include_only"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn apply_acp_launch_policy_disables_native_multi_agent_for_team_codex() {
+        let mut command_spec = CommandSpec {
+            command: "node".into(),
+            args: vec!["codex-acp.js".into()],
+            env: vec![],
+            cwd: None,
+        };
+        let metadata = agent_metadata_with_backend(Some("codex"));
+
+        apply_acp_launch_policy(
+            &mut command_spec,
+            AcpLaunchPolicyInput {
+                metadata: &metadata,
+                config: &AcpBuildExtra::default(),
+                session_snapshot: None,
+                runtime_env: &[],
+                belongs_to_team: true,
+            },
+        )
+        .expect("Team Codex launch policy should materialize CODEX_CONFIG");
+
+        let config = command_spec
+            .env
+            .iter()
+            .find(|entry| entry.name == CODEX_CONFIG_ENV)
+            .expect("Codex launch must inject CODEX_CONFIG");
+        let value: serde_json::Value = serde_json::from_str(&config.value).expect("valid CODEX_CONFIG JSON");
+        assert_eq!(value["features"]["multi_agent"], false);
     }
 
     #[test]
@@ -330,6 +381,7 @@ mod tests {
                 config: &AcpBuildExtra::default(),
                 session_snapshot: None,
                 runtime_env: &[],
+                belongs_to_team: false,
             },
         )
         .expect_err("conflicting CODEX_CONFIG must fail closed");
@@ -352,6 +404,7 @@ mod tests {
                 config: &AcpBuildExtra::default(),
                 session_snapshot: None,
                 runtime_env: &[(CODEX_CONFIG_ENV.into(), "{\"features\":{}}".into())],
+                belongs_to_team: false,
             },
         )
         .expect_err("runtime CODEX_CONFIG override must fail closed");
@@ -379,6 +432,7 @@ mod tests {
                 config: &AcpBuildExtra::default(),
                 session_snapshot: Some(&snapshot),
                 runtime_env: &[],
+                belongs_to_team: false,
             },
         )
         .expect("Codex launch policy should materialize CODEX_CONFIG");
@@ -415,6 +469,7 @@ mod tests {
                 config: &config,
                 session_snapshot: None,
                 runtime_env: &[],
+                belongs_to_team: false,
             },
         )
         .expect("non-Codex launch policy should succeed");

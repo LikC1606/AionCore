@@ -142,6 +142,7 @@ impl SlotWorkCoordinator {
             active_batch,
             active_turn_id,
             active_turn_started_at_ms,
+            active_turn_last_activity_at_ms: active_turn_started_at_ms,
             runtime_constraint: slot.runtime_constraint.clone(),
             team_run_id,
         })

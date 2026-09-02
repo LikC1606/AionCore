@@ -13,7 +13,8 @@ use aionui_ai_agent::types::BuildTaskOptions;
 use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, IWorkerTaskManager, WorkerTaskManagerImpl};
 use aionui_api_types::{
     AcpBuildExtra, AcpConfigOptionDto, AcpConfigSelectOptionDto, AddAgentRequest, CreateTeamRequest,
-    GetConfigOptionsResponse, TeamAgentInput, TeamToolCall, TeamToolName, TeamToolTransport, WebSocketMessage,
+    GetConfigOptionsResponse, TeamAgentInput, TeamRunTargetRole, TeamToolCall, TeamToolName, TeamToolTransport,
+    WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, AgentType, PaginatedResult, ProviderWithModel};
 use aionui_db::models::{
@@ -6771,6 +6772,114 @@ async fn sa_send_message_to_agent_with_active_session() {
     svc.send_message_to_agent("user1", &created.id, &worker_slot, "Do this", None, None)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn worker_delivery_targets_the_team_lead() {
+    let svc = setup();
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "T".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    let lead_slot = created.assistants[0].slot_id.clone();
+    let worker_slot = created.assistants[1].slot_id.clone();
+
+    let acknowledgement = svc
+        .send_agent_delivery_to_lead(
+            "user1",
+            &created.id,
+            &worker_slot,
+            "Proof route ready",
+            None,
+            Some("delivery-1".into()),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(acknowledgement.target.slot_id, lead_slot);
+    assert_eq!(acknowledgement.target.role, TeamRunTargetRole::Lead);
+    assert!(acknowledgement.team_run_id.is_some());
+}
+
+#[tokio::test]
+async fn worker_delivery_rejects_cross_user_access() {
+    let svc = setup();
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Private".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    let worker_slot = created.assistants[1].slot_id.clone();
+
+    let result = svc
+        .send_agent_delivery_to_lead("user2", &created.id, &worker_slot, "Proof route ready", None, None)
+        .await;
+
+    assert!(matches!(result, Err(aionui_team::TeamError::Forbidden(_))));
+}
+
+#[tokio::test]
+async fn artifact_dispatch_rebinds_only_the_target_worker_to_the_prepared_workspace() {
+    let canonical = tempfile::tempdir().unwrap();
+    let assigned = tempfile::tempdir().unwrap();
+    let (svc, task_manager, conv_repo) = setup_with_factory_and_metadata_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Worktree binding".into(),
+                agents: two_agent_input(),
+                workspace: Some(canonical.path().to_string_lossy().into_owned()),
+            },
+        )
+        .await
+        .unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    let worker = &created.assistants[1];
+
+    svc.send_message_to_agent_in_workspace(
+        "user1",
+        &created.id,
+        &worker.slot_id,
+        "Edit the assigned artifact.",
+        None,
+        Some("artifact-worktree-binding".into()),
+        Some(assigned.path().to_string_lossy().into_owned()),
+    )
+    .await
+    .unwrap();
+
+    let task = task_manager
+        .get_task(&worker.conversation_id)
+        .expect("target Worker runtime should be rebuilt");
+    assert_eq!(std::path::Path::new(task.workspace()), assigned.path());
+    assert_eq!(
+        conv_repo.get_extra(&worker.conversation_id).unwrap()["workspace"],
+        assigned.path().to_string_lossy().as_ref()
+    );
+    std::fs::write(
+        std::path::Path::new(task.workspace()).join("worker-edit.txt"),
+        "assigned\n",
+    )
+    .unwrap();
+    assert!(assigned.path().join("worker-edit.txt").exists());
+    assert!(!canonical.path().join("worker-edit.txt").exists());
 }
 
 #[tokio::test]

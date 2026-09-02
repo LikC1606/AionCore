@@ -400,20 +400,19 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
     };
     match finalize_result {
         Ok(Some(wake_target)) if wake_target != ctx.slot_id => {
-            if !suppress_duplicate_lead_wake {
-                if let Err(error) = ctx
+            if !suppress_duplicate_lead_wake
+                && let Err(error) = ctx
                     .session
                     .enqueue_leader_settle_signal(&wake_target, WorkSource::IdleNotification)
                     .await
-                {
-                    warn!(
-                        team_id = %ctx.team_id,
-                        slot_id = %ctx.slot_id,
-                        wake_target,
-                        error = %error,
-                        "leader settle signal enqueue failed"
-                    );
-                }
+            {
+                warn!(
+                    team_id = %ctx.team_id,
+                    slot_id = %ctx.slot_id,
+                    wake_target,
+                    error = %error,
+                    "leader settle signal enqueue failed"
+                );
             }
         }
         Ok(_) => {}

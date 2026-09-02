@@ -7,7 +7,7 @@ use std::time::Duration;
 use flate2::read::GzDecoder;
 use fs2::FileExt;
 use sha2::{Digest, Sha256};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::cache;
 use crate::http_client;
@@ -107,10 +107,10 @@ pub async fn install_and_validate_with_reporter(
     match validate_managed_runtime(&version_dir, None).await {
         Ok(runtime) => return Ok(runtime),
         Err(error) => {
-            warn!(
+            debug!(
                 error = %error,
                 root = %version_dir.display(),
-                "managed node runtime validation failed before install"
+                "managed node runtime is not ready before install"
             );
         }
     }

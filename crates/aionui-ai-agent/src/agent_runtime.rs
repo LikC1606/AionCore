@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use tokio::sync::broadcast;
+use tokio::task::JoinHandle;
 
 use aionui_api_types::AgentStreamErrorData;
 use aionui_common::{ConversationStatus, TimestampMs, now_ms};
@@ -74,6 +75,20 @@ impl AgentRuntime {
     #[allow(dead_code)]
     pub(crate) fn event_sender(&self) -> broadcast::Sender<AgentStreamEvent> {
         self.event_tx.clone()
+    }
+
+    /// Track activity from producers that must write directly to the raw
+    /// broadcast sender (notably the ACP protocol SDK). The task owns only the
+    /// timestamp and a receiver, so it cannot keep the channel alive after the
+    /// runtime and protocol senders are dropped.
+    pub(crate) fn spawn_event_activity_tracker(&self) -> JoinHandle<()> {
+        let mut event_rx = self.event_tx.subscribe();
+        let last_activity = Arc::clone(&self.last_activity);
+        tokio::spawn(async move {
+            while let Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) = event_rx.recv().await {
+                last_activity.store(now_ms(), Ordering::Relaxed);
+            }
+        })
     }
 
     // ── Write (see target §6.4 SM1 "single-writer" invariant) ───────────
@@ -176,6 +191,29 @@ mod tests {
         rt.bump_activity();
         let after = rt.last_activity_at();
         assert!(after >= before);
+    }
+
+    #[tokio::test]
+    async fn raw_broadcast_event_bumps_activity_when_tracker_is_running() {
+        let rt = runtime();
+        let tracker = rt.spawn_event_activity_tracker();
+        let before = rt.last_activity_at();
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+
+        rt.event_sender()
+            .send(AgentStreamEvent::Start(crate::protocol::events::StartEventData {
+                session_id: None,
+            }))
+            .expect("activity tracker must subscribe to the event channel");
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while rt.last_activity_at() <= before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("raw broadcast activity should advance last_activity");
+        tracker.abort();
     }
 
     #[tokio::test]

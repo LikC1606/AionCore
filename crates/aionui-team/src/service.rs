@@ -24,9 +24,9 @@ use std::time::{Duration, Instant};
 use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, AgentInstance, IWorkerTaskManager, IdleCleanupCoordinator};
 use aionui_api_types::{
     AddAgentRequest, CreateTeamRequest, GetConfigOptionsResponse, TeamAgentResponse, TeamAgentRuntimeStatus,
-    TeamResponse, TeamRunAckResponse, TeamRunStateResponse, TeamSessionBinding, TeamSessionPhase, TeamSessionStatus,
-    TeamSessionStatusPayload, TeamToolCall, TeamToolContextResponse, TeamToolErrorCode, TeamToolErrorPayload,
-    TeamToolTransport, WebSocketMessage,
+    TeamResponse, TeamRunAckResponse, TeamRunStateResponse, TeamSendMessageQueuedResponse, TeamSessionBinding,
+    TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload, TeamToolCall, TeamToolContextResponse,
+    TeamToolErrorCode, TeamToolErrorPayload, TeamToolTransport, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, generate_id, now_ms};
 use aionui_db::models::TeamRow;
@@ -164,35 +164,25 @@ struct MemberRuntimeReconcileWork {
     owner: Option<AttachLease>,
 }
 
-const TEAM_RUNTIME_START_MAX_CONCURRENCY: usize = 3;
-const TEAM_RUNTIME_START_STAGGER_MIN: Duration = Duration::from_millis(500);
-const TEAM_RUNTIME_START_STAGGER_MID: Duration = Duration::from_millis(750);
-const TEAM_RUNTIME_START_STAGGER_MAX: Duration = Duration::from_secs(1);
-
-fn adaptive_team_runtime_start_stagger(parallelism: usize) -> Duration {
-    match parallelism {
-        8.. => TEAM_RUNTIME_START_STAGGER_MIN,
-        4..=7 => TEAM_RUNTIME_START_STAGGER_MID,
-        _ => TEAM_RUNTIME_START_STAGGER_MAX,
-    }
-}
-
-fn host_team_runtime_start_stagger() -> Duration {
-    adaptive_team_runtime_start_stagger(std::thread::available_parallelism().map(usize::from).unwrap_or(1))
+fn host_team_runtime_start_concurrency() -> usize {
+    // Runtime startup is already bounded by the host scheduler and by the
+    // per-team semaphore.  Use the host's actual parallelism instead of a
+    // fixed three-worker ceiling; a multi-worker mathematics run should not
+    // spend several seconds waiting for an artificial admission interval.
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .max(1)
 }
 
 struct TeamRuntimeStartGate {
     semaphore: Arc<Semaphore>,
-    last_started_at: tokio::sync::Mutex<Option<Instant>>,
-    stagger: Duration,
 }
 
 impl TeamRuntimeStartGate {
     fn new() -> Self {
         Self {
-            semaphore: Arc::new(Semaphore::new(TEAM_RUNTIME_START_MAX_CONCURRENCY)),
-            last_started_at: tokio::sync::Mutex::new(None),
-            stagger: host_team_runtime_start_stagger(),
+            semaphore: Arc::new(Semaphore::new(host_team_runtime_start_concurrency())),
         }
     }
 
@@ -203,14 +193,6 @@ impl TeamRuntimeStartGate {
             .acquire_owned()
             .await
             .map_err(|_| TeamError::InvalidRequest("team runtime start gate closed".to_owned()))?;
-        let mut last_started_at = self.last_started_at.lock().await;
-        if let Some(previous) = *last_started_at {
-            let remaining = self.stagger.saturating_sub(previous.elapsed());
-            if !remaining.is_zero() {
-                tokio::time::sleep(remaining).await;
-            }
-        }
-        *last_started_at = Some(Instant::now());
         Ok(permit)
     }
 }
@@ -426,12 +408,10 @@ impl TeamSessionService {
             .entry(team_id.to_owned())
             .or_insert_with(|| Arc::new(TeamRuntimeStartGate::new()))
             .clone();
-        let stagger_ms = gate.stagger.as_millis();
         let permit = gate.acquire().await?;
         debug!(
             team_id,
-            stagger_ms,
-            max_concurrency = TEAM_RUNTIME_START_MAX_CONCURRENCY,
+            max_concurrency = host_team_runtime_start_concurrency(),
             "team runtime start admitted"
         );
         Ok(permit)
@@ -1726,8 +1706,22 @@ impl TeamSessionService {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
-                let snapshot = session.work_coordinator().snapshot();
+                let snapshot = session.work_snapshot().await;
                 session.team_run_manager().publish_snapshot_update(&snapshot);
+                // Slow notifications are independent per Worker.  Handle them
+                // together so one slow mailbox/database operation cannot delay
+                // notifications for every other slot in the same minute tick.
+                futures_util::future::join_all(snapshot.slots.iter().map(|slot| async {
+                    if let Err(error) = session.notify_leader_slow_turn(slot).await {
+                        warn!(
+                            team_id = %session.team_id(),
+                            slot_id = %slot.slot_id,
+                            error = %error,
+                            "slow Worker turn notification failed"
+                        );
+                    }
+                }))
+                .await;
             }
         })
     }
@@ -1788,7 +1782,6 @@ impl TeamSessionService {
         let provisioner = self.provisioner();
         let task_manager = self.task_manager.clone();
         let started_at = Instant::now();
-        let start_stagger = host_team_runtime_start_stagger();
         let mut rebuild_jobs: Vec<TeamAgent> = agents.to_vec();
         rebuild_jobs.sort_by_key(|agent| match agent.role {
             TeammateRole::Lead => 0,
@@ -1798,51 +1791,15 @@ impl TeamSessionService {
         info!(
             team_id,
             agent_count = agents.len(),
-            max_concurrency = TEAM_RUNTIME_START_MAX_CONCURRENCY,
-            start_stagger_ms = start_stagger.as_millis(),
+            max_concurrency = host_team_runtime_start_concurrency(),
+            start_stagger_ms = 0u128,
             "team agent rebuild started"
         );
 
         let mut outcomes = Vec::new();
         let mut jobs = JoinSet::new();
-        let mut failed = false;
 
-        for (launched_count, agent) in rebuild_jobs.into_iter().enumerate() {
-            while jobs.len() >= TEAM_RUNTIME_START_MAX_CONCURRENCY {
-                if let Some(outcome) = join_next_rebuild_outcome(&mut jobs).await? {
-                    failed = outcome.result.is_err();
-                    outcomes.push(outcome);
-                }
-                if failed {
-                    break;
-                }
-            }
-            if failed {
-                break;
-            }
-
-            if launched_count > 0 {
-                let stagger = tokio::time::sleep(start_stagger);
-                tokio::pin!(stagger);
-                loop {
-                    tokio::select! {
-                        _ = &mut stagger => break,
-                        outcome = join_next_rebuild_outcome(&mut jobs), if !jobs.is_empty() => {
-                            if let Some(outcome) = outcome? {
-                                failed = outcome.result.is_err();
-                                outcomes.push(outcome);
-                            }
-                            if failed {
-                                break;
-                            }
-                        }
-                    }
-                }
-                if failed {
-                    break;
-                }
-            }
-
+        for agent in rebuild_jobs {
             let cfg = session.mcp_stdio_config(&agent.slot_id);
             self.broadcast_agent_runtime_status(team_id, &agent, TeamAgentRuntimeStatus::Pending, None);
             spawn_rebuild_agent_process(
@@ -1874,8 +1831,8 @@ impl TeamSessionService {
             success_count,
             failure_count = failures.len(),
             duration_ms = started_at.elapsed().as_millis(),
-            max_concurrency = TEAM_RUNTIME_START_MAX_CONCURRENCY,
-            start_stagger_ms = start_stagger.as_millis(),
+            max_concurrency = host_team_runtime_start_concurrency(),
+            start_stagger_ms = 0u128,
             "team agent rebuild completed"
         );
 
@@ -2117,7 +2074,7 @@ impl TeamSessionService {
                 slot_work: Vec::new(),
             });
         };
-        let snapshot = session.work_coordinator().snapshot();
+        let snapshot = session.work_snapshot().await;
         let active_run = session.team_run_manager().current_payload(&snapshot).filter(|run| {
             matches!(
                 run.status,
@@ -2535,9 +2492,25 @@ impl TeamSessionService {
         files: Option<Vec<String>>,
         idempotency_key: Option<String>,
     ) -> Result<TeamRunAckResponse, TeamError> {
+        self.send_message_to_agent_in_workspace(user_id, team_id, slot_id, content, files, idempotency_key, None)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_message_to_agent_in_workspace(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        slot_id: &str,
+        content: &str,
+        files: Option<Vec<String>>,
+        idempotency_key: Option<String>,
+        workspace: Option<String>,
+    ) -> Result<TeamRunAckResponse, TeamError> {
         let lifecycle_lock = self.lifecycle_lock(team_id);
         let _lifecycle_guard = lifecycle_lock.read().await;
         self.load_owned_team(user_id, team_id).await?;
+        let workspace = workspace.as_deref().map(validate_create_workspace_path).transpose()?;
         let idempotency_key = Self::normalize_idempotency_key(idempotency_key.as_deref())?;
         let gate = self
             .idempotency_gate(team_id, slot_id, idempotency_key.as_deref(), content, files.as_ref())
@@ -2556,6 +2529,8 @@ impl TeamSessionService {
                         .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
                     Arc::clone(&entry.session)
                 };
+                self.bind_idle_agent_workspace(user_id, team_id, slot_id, &session, workspace.as_deref())
+                    .await?;
                 session
                     .send_message_to_agent(slot_id, content, files, idempotency_key.as_deref())
                     .await
@@ -2586,10 +2561,91 @@ impl TeamSessionService {
                     .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
                 Arc::clone(&entry.session)
             };
+            self.bind_idle_agent_workspace(user_id, team_id, slot_id, &session, workspace.as_deref())
+                .await?;
             session
                 .send_message_to_agent(slot_id, content, files, idempotency_key.as_deref())
                 .await
         }
+    }
+
+    /// Persist a provenance-preserving Worker delivery to this Team's Lead.
+    /// Unlike a user-authored Agent message, this path records the active
+    /// Worker turn's successful Lead delivery so finalization does not enqueue
+    /// a redundant idle notification.
+    pub async fn send_agent_delivery_to_lead(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        source_slot_id: &str,
+        content: &str,
+        files: Option<Vec<String>>,
+        idempotency_key: Option<String>,
+    ) -> Result<TeamSendMessageQueuedResponse, TeamError> {
+        let lifecycle_lock = self.lifecycle_lock(team_id);
+        let _lifecycle_guard = lifecycle_lock.read().await;
+        self.load_owned_team(user_id, team_id).await?;
+        let idempotency_key = Self::normalize_idempotency_key(idempotency_key.as_deref())?;
+        self.ensure_session_inner_unlocked(team_id).await?;
+        let session = {
+            let entry = self
+                .sessions
+                .get(team_id)
+                .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
+            Arc::clone(&entry.session)
+        };
+        let lead_slot_id = session
+            .scheduler()
+            .find_lead_slot_id()
+            .await
+            .ok_or_else(|| TeamError::AgentNotFound("no lead agent in team".into()))?;
+        let result = session
+            .send_agent_message_from_agent_with_idempotency(
+                source_slot_id,
+                &lead_slot_id,
+                content,
+                files,
+                idempotency_key.as_deref(),
+            )
+            .await?;
+        Ok(TeamSendMessageQueuedResponse {
+            team_run_id: result.team_run_id,
+            target: result.target,
+        })
+    }
+
+    async fn bind_idle_agent_workspace(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        slot_id: &str,
+        session: &TeamSession,
+        workspace: Option<&str>,
+    ) -> Result<(), TeamError> {
+        let Some(workspace) = workspace else {
+            return Ok(());
+        };
+        let agent = session.scheduler().get_agent(slot_id).await?;
+        let status = session.scheduler().get_status(slot_id).await?;
+        if !crate::scheduler::is_settled(status) {
+            return Err(TeamError::InvalidRequest(format!(
+                "cannot change workspace for active Team agent {slot_id}"
+            )));
+        }
+        if self
+            .conversation_port
+            .conversation_workspace(&agent.conversation_id)
+            .await?
+            .as_deref()
+            == Some(workspace)
+        {
+            return Ok(());
+        }
+        self.conversation_port
+            .patch_runtime_config(&agent.conversation_id, serde_json::json!({ "workspace": workspace }))
+            .await?;
+        self.rebuild_agent_processes(team_id, session, user_id, std::slice::from_ref(&agent))
+            .await
     }
 
     /// Best-effort runtime wake for mailbox rows already committed by the
@@ -2876,19 +2932,8 @@ mod tests {
     };
 
     #[test]
-    fn team_runtime_start_stagger_stays_within_adaptive_half_to_one_second_window() {
-        assert_eq!(
-            super::adaptive_team_runtime_start_stagger(16),
-            std::time::Duration::from_millis(500)
-        );
-        assert_eq!(
-            super::adaptive_team_runtime_start_stagger(6),
-            std::time::Duration::from_millis(750)
-        );
-        assert_eq!(
-            super::adaptive_team_runtime_start_stagger(2),
-            std::time::Duration::from_secs(1)
-        );
+    fn team_runtime_start_concurrency_follows_host_parallelism() {
+        assert!(super::host_team_runtime_start_concurrency() >= 1);
     }
 
     #[test]
@@ -2905,7 +2950,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn team_runtime_start_gate_applies_the_adaptive_interval_without_three_second_delay() {
+    async fn team_runtime_start_gate_has_no_artificial_admission_interval() {
         let gate = TeamRuntimeStartGate::new();
         let first = gate.acquire().await.unwrap();
         drop(first);
@@ -2916,12 +2961,8 @@ mod tests {
         drop(second);
 
         assert!(
-            elapsed >= gate.stagger.saturating_sub(std::time::Duration::from_millis(40)),
-            "runtime starts must preserve the adaptive admission interval: {elapsed:?}"
-        );
-        assert!(
-            elapsed < std::time::Duration::from_secs(2),
-            "runtime admission must not regress to the old fixed three-second delay: {elapsed:?}"
+            elapsed < std::time::Duration::from_millis(100),
+            "runtime admission must not wait on a fixed stagger: {elapsed:?}"
         );
     }
 

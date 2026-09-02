@@ -234,6 +234,7 @@ pub(crate) async fn run_server(
     info!(elapsed_ms = boot.elapsed().as_millis(), "Server listening on {addr}");
 
     let runtime_prepare_service = RuntimePrepareService::new(services.event_bus.clone());
+    let runtime_agent_registry = services.agent_registry.clone();
     tokio::spawn(async move {
         let scope = RuntimeStatusScope {
             kind: RuntimeStatusScopeKind::CustomAgent,
@@ -254,10 +255,17 @@ pub(crate) async fn run_server(
         .await;
 
         match result {
-            Ok(()) => info!(
-                prepare_elapsed_ms = prepare_started.elapsed().as_millis(),
-                "startup: managed runtime background preparation completed"
-            ),
+            Ok(()) => {
+                // The initial registry hydration can run before bundled ACP
+                // tools have been materialized into the managed runtime. Make
+                // those newly available commands visible without requiring a
+                // process restart.
+                runtime_agent_registry.refresh_availability().await;
+                info!(
+                    prepare_elapsed_ms = prepare_started.elapsed().as_millis(),
+                    "startup: managed runtime background preparation completed"
+                );
+            }
             Err(error) => warn!(
                 code = "BOOTSTRAP_DEGRADED_MANAGED_RUNTIME_PREPARE",
                 stage = "runtime.prepare",

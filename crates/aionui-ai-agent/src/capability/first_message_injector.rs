@@ -61,6 +61,11 @@ mod tests {
         AcpSkillManager::new(paths)
     }
 
+    fn builtin_skills_env_test_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
     /// Point the embedded corpus at an empty dir so tests don't pick up
     /// real auto-inject builtin skills.
     struct EmptyBuiltinGuard;
@@ -121,6 +126,7 @@ mod tests {
 
     #[tokio::test]
     async fn heavy_mode_no_skills_no_context_passes_through() {
+        let _lock = builtin_skills_env_test_lock().lock().await;
         let tmp = TempDir::new().unwrap();
         let _guard = EmptyBuiltinGuard::new(tmp.path());
         let mgr = test_mgr(tmp.path());
@@ -140,6 +146,7 @@ mod tests {
 
     #[tokio::test]
     async fn heavy_mode_with_preset_context_no_skills() {
+        let _lock = builtin_skills_env_test_lock().lock().await;
         let tmp = TempDir::new().unwrap();
         let _guard = EmptyBuiltinGuard::new(tmp.path());
         let mgr = test_mgr(tmp.path());
@@ -162,6 +169,7 @@ mod tests {
 
     #[tokio::test]
     async fn heavy_mode_with_resolved_skills_injects_index() {
+        let _lock = builtin_skills_env_test_lock().lock().await;
         // Set up a builtin skills dir with two skills; pass only one in `skills`.
         let tmp = TempDir::new().unwrap();
         let auto = tmp.path().join("auto-inject");
@@ -197,6 +205,7 @@ mod tests {
 
     #[tokio::test]
     async fn native_support_uses_light_mode_even_with_skills() {
+        let _lock = builtin_skills_env_test_lock().lock().await;
         let tmp = TempDir::new().unwrap();
         let _guard = EmptyBuiltinGuard::new(tmp.path());
         let mgr = test_mgr(tmp.path());

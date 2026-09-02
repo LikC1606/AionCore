@@ -271,6 +271,12 @@ pub struct SendAgentMessageRequest {
     pub files: Option<Vec<String>>,
     #[serde(default)]
     pub idempotency_key: Option<String>,
+    /// Optional absolute workspace override for this target agent. The Team
+    /// service persists it and rebuilds the idle runtime before enqueueing the
+    /// message, so native tools resolve relative paths in the assigned Git
+    /// worktree rather than the shared Team root.
+    #[serde(default)]
+    pub workspace: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -994,10 +1000,15 @@ mod tests {
 
     #[test]
     fn deserialize_send_agent_message_request() {
-        let raw = json!({ "content": "Do this task", "idempotency_key": "terminal:turn-1" });
+        let raw = json!({
+            "content": "Do this task",
+            "idempotency_key": "terminal:turn-1",
+            "workspace": "/tmp/team-worker-worktree"
+        });
         let req: SendAgentMessageRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.content, "Do this task");
         assert_eq!(req.idempotency_key.as_deref(), Some("terminal:turn-1"));
+        assert_eq!(req.workspace.as_deref(), Some("/tmp/team-worker-worktree"));
     }
 
     #[test]

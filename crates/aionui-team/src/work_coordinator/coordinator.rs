@@ -870,6 +870,18 @@ impl SlotWorkCoordinator {
         Self::slot_snapshot_locked(&self.lock_state(), slot_id)
     }
 
+    /// Returns true when a mailbox row already has a live coordinator intent.
+    /// Recovery and idempotent wake paths can observe the same row more than
+    /// once; enqueueing another intent would make one Lead message execute
+    /// repeatedly after a transient wake failure.
+    pub(crate) fn has_active_mailbox_intent(&self, slot_id: &str, mailbox_message_id: &str) -> bool {
+        self.lock_state().intents.values().any(|intent| {
+            intent.slot_id == slot_id
+                && intent.mailbox_message_id.as_deref() == Some(mailbox_message_id)
+                && !intent.state.is_terminal()
+        })
+    }
+
     pub(crate) fn snapshot(&self) -> CoordinatorSnapshot {
         let state = self.lock_state();
         let slots = state

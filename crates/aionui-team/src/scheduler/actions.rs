@@ -2,7 +2,7 @@ use tracing::debug;
 
 use super::TeammateManager;
 use crate::error::TeamError;
-use crate::types::{MailboxMessage, MailboxMessageType, TeammateRole};
+use crate::types::{MailboxMessage, MailboxMessageType, TeammateRole, TeammateStatus};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SchedulerAction {
@@ -65,7 +65,20 @@ impl TeammateManager {
     }
 
     pub async fn finalize_turn(&self, slot_id: &str, actions: &[SchedulerAction]) -> Result<Option<String>, TeamError> {
-        self.finalize_turn_with_lead_notification(slot_id, actions, true).await
+        self.finalize_turn_with_status(slot_id, actions, true, TeammateStatus::Idle)
+            .await
+    }
+
+    /// Finalize a turn that ended with a runtime error.  Error is a settled
+    /// state for Team coordination, but must remain observable instead of
+    /// being overwritten by the normal Idle transition.
+    pub async fn finalize_turn_as_error(
+        &self,
+        slot_id: &str,
+        actions: &[SchedulerAction],
+    ) -> Result<Option<String>, TeamError> {
+        self.finalize_turn_with_status(slot_id, actions, true, TeammateStatus::Error)
+            .await
     }
 
     /// Finalize a Worker turn without adding a synthetic Lead notification
@@ -75,14 +88,16 @@ impl TeammateManager {
         slot_id: &str,
         actions: &[SchedulerAction],
     ) -> Result<Option<String>, TeamError> {
-        self.finalize_turn_with_lead_notification(slot_id, actions, false).await
+        self.finalize_turn_with_status(slot_id, actions, false, TeammateStatus::Idle)
+            .await
     }
 
-    async fn finalize_turn_with_lead_notification(
+    async fn finalize_turn_with_status(
         &self,
         slot_id: &str,
         actions: &[SchedulerAction],
         notify_lead: bool,
+        final_status: TeammateStatus,
     ) -> Result<Option<String>, TeamError> {
         let mut summary: Option<String> = None;
         for action in actions {
@@ -95,7 +110,7 @@ impl TeammateManager {
             self.execute_action(slot_id, action).await?;
         }
 
-        self.mark_idle_with_lead_notification(slot_id, summary.as_deref(), notify_lead)
+        self.mark_settled_with_lead_notification(slot_id, summary.as_deref(), notify_lead, final_status)
             .await
     }
 

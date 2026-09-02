@@ -138,9 +138,12 @@ async fn load_full_shell_env() -> Vec<(OsString, OsString)> {
         return Vec::new();
     }
 
-    let result = tokio::time::timeout(Duration::from_secs(5), async {
+    // Shell startup files are optional enrichment.  They must never delay the
+    // first Team turn: a broken prompt/plugin can otherwise burn five seconds
+    // on every cold Core process before the inherited environment is usable.
+    let result = tokio::time::timeout(Duration::from_millis(1_000), async {
         let mut builder = Builder::clean_cli(&shell);
-        builder.args(["-i", "-l", "-c", "env"]);
+        builder.args(["-l", "-c", "env"]);
         builder.output().await
     })
     .await;
@@ -152,7 +155,7 @@ async fn load_full_shell_env() -> Vec<(OsString, OsString)> {
             return Vec::new();
         }
         Err(_) => {
-            tracing::warn!("full shell env probe timed out after 5s");
+            tracing::warn!("full shell env probe timed out after 1s; using inherited environment");
             return Vec::new();
         }
     };

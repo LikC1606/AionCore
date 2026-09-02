@@ -163,6 +163,7 @@ pub(crate) struct SlotWorkSnapshot {
     pub(crate) active_batch: Option<WorkBatch>,
     pub(crate) active_turn_id: Option<String>,
     pub(crate) active_turn_started_at_ms: Option<TimestampMs>,
+    pub(crate) active_turn_last_activity_at_ms: Option<TimestampMs>,
     pub(crate) runtime_constraint: RuntimeConstraint,
     pub(crate) team_run_id: Option<String>,
 }

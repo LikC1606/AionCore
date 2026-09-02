@@ -147,6 +147,7 @@ pub fn team_routes(state: TeamRouterState) -> Router {
         )
         .route("/api/teams/{id}/messages", post(send_message))
         .route("/api/teams/{id}/agents/{slot_id}/messages", post(send_message_to_agent))
+        .route("/api/teams/{id}/agents/{slot_id}/deliveries", post(send_agent_delivery))
         .route(
             "/api/teams/{id}/conversations/{conversation_id}/config-options",
             get(get_conversation_config_options),
@@ -340,7 +341,29 @@ async fn send_message_to_agent(
     let Json(req) = body.map_err(ApiError::from)?;
     let ack = state
         .service
-        .send_message_to_agent(
+        .send_message_to_agent_in_workspace(
+            &user.id,
+            &params.id,
+            &params.slot_id,
+            &req.content,
+            req.files,
+            req.idempotency_key,
+            req.workspace,
+        )
+        .await?;
+    Ok(Json(ApiResponse::ok(ack)))
+}
+
+async fn send_agent_delivery(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(params): Path<AgentPathParams>,
+    body: Result<Json<SendTeamMessageRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<aionui_api_types::TeamSendMessageQueuedResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let ack = state
+        .service
+        .send_agent_delivery_to_lead(
             &user.id,
             &params.id,
             &params.slot_id,

@@ -17,7 +17,7 @@ use crate::work_coordinator::{
     RuntimeConstraint, SlotPhase, SlotWorkSnapshot,
 };
 
-const ACTIVE_TURN_SLOW_THRESHOLD_MS: u64 = 10 * 60 * 1000;
+pub(crate) const ACTIVE_TURN_SLOW_THRESHOLD_MS: u64 = 10 * 60 * 1000;
 
 #[derive(Clone)]
 struct TeamRunRecord {
@@ -273,6 +273,9 @@ impl TeamRunManager {
         let active_turn_elapsed_ms = slot
             .active_turn_started_at_ms
             .map(|started_at| now_ms().saturating_sub(started_at).max(0) as u64);
+        let active_turn_inactive_ms = slot
+            .active_turn_last_activity_at_ms
+            .map(|last_activity_at| now_ms().saturating_sub(last_activity_at).max(0) as u64);
         TeamSlotWorkPayload {
             slot_id: slot.slot_id.clone(),
             role: slot.role.clone(),
@@ -289,7 +292,7 @@ impl TeamRunManager {
             active_turn_id: slot.active_turn_id.clone(),
             active_turn_started_at_ms: slot.active_turn_started_at_ms,
             active_turn_elapsed_ms,
-            active_turn_slow: active_turn_elapsed_ms.map(|elapsed| elapsed >= ACTIVE_TURN_SLOW_THRESHOLD_MS),
+            active_turn_slow: active_turn_inactive_ms.map(|elapsed| elapsed >= ACTIVE_TURN_SLOW_THRESHOLD_MS),
             active_turn_slow_threshold_ms: slot.active_turn_id.as_ref().map(|_| ACTIVE_TURN_SLOW_THRESHOLD_MS),
             blocked_reason: match slot.runtime_constraint {
                 RuntimeConstraint::Ready => None,

@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
@@ -8,9 +9,10 @@ use aionui_api_types::{
     TeamAgentRuntimeStatus, TeamChildTurnPayload, TeamMessageEnqueueStatus, TeamRunAckResponse, TeamRunStatus,
     TeamRunTargetRole, TeamSlotWorkPayload, TeamToolTransport,
 };
-use aionui_common::{AgentKillReason, generate_id};
+use aionui_common::{AgentKillReason, TimestampMs, generate_id, now_ms};
 use aionui_db::ITeamRepository;
 use aionui_realtime::EventBroadcaster;
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, info, warn};
 
 use crate::error::TeamError;
@@ -31,12 +33,12 @@ use crate::prompts::{build_lead_prompt_for_transport, build_teammate_prompt_for_
 use crate::provisioning::PersistSpawnedAgentRequest;
 use crate::scheduler::{TeammateManager, normalize_name};
 use crate::service::TeamSessionService;
-use crate::team_run::{TeamRunManager, target_role_for};
+use crate::team_run::{ACTIVE_TURN_SLOW_THRESHOLD_MS, TeamRunManager, target_role_for};
 use crate::tool_executor::TeamToolContext;
 use crate::types::{MailboxMessageType, Team, TeamAgent, TeammateRole, TeammateStatus};
 use crate::work_coordinator::{
-    CausalBinding, CommitResult, EnqueueCommit, EnqueueDisposition, EnqueueLease, EnqueueRequest, ReconcileDecision,
-    RuntimeConstraint, SlotWorkCoordinator, WorkBatch,
+    CausalBinding, CommitResult, CoordinatorSnapshot, EnqueueCommit, EnqueueDisposition, EnqueueLease, EnqueueRequest,
+    ReconcileDecision, RuntimeConstraint, SlotPhase, SlotWorkCoordinator, SlotWorkSnapshot, WorkBatch,
 };
 use crate::work_source::WorkSource;
 
@@ -119,6 +121,10 @@ pub struct TeamSession {
     /// Reset only by constructing a fresh `TeamSession` during a new restore,
     /// reconnect, or explicit re-ensure lifecycle.
     recovery_scan_completed: AtomicBool,
+    /// Slow-turn notifications are keyed by slot and turn so the one-minute
+    /// Core monitor cannot enqueue duplicate Lead wakes for the same Worker
+    /// episode. A new turn on the same slot gets a fresh notification.
+    slow_turn_notices: AsyncMutex<HashSet<String>>,
 }
 
 impl TeamSession {
@@ -222,6 +228,7 @@ impl TeamSession {
             member_runtimes,
             prompt_dump,
             recovery_scan_completed: AtomicBool::new(false),
+            slow_turn_notices: AsyncMutex::new(HashSet::new()),
         })
     }
 
@@ -267,6 +274,110 @@ impl TeamSession {
 
     pub(crate) fn work_coordinator(&self) -> &Arc<SlotWorkCoordinator> {
         &self.work_coordinator
+    }
+
+    /// Combine coordinator-owned turn timing with the live ACP runtime's
+    /// model/tool activity timestamp.
+    pub(crate) async fn work_snapshot(&self) -> CoordinatorSnapshot {
+        let mut snapshot = self.work_coordinator.snapshot();
+        let activity_by_slot = self
+            .scheduler
+            .list_agents()
+            .await
+            .into_iter()
+            .filter_map(|agent| {
+                self.task_manager
+                    .get_task(&agent.conversation_id)
+                    .map(|task| (agent.slot_id, task.last_activity_at()))
+            })
+            .collect::<HashMap<String, TimestampMs>>();
+        let hydrate = |slot: &mut SlotWorkSnapshot| {
+            slot.active_turn_last_activity_at_ms = slot.active_turn_started_at_ms.map(|started_at| {
+                activity_by_slot
+                    .get(&slot.slot_id)
+                    .copied()
+                    .unwrap_or(started_at)
+                    .max(started_at)
+            });
+        };
+        snapshot.slots.iter_mut().for_each(&hydrate);
+        if let Some(summary) = snapshot.active_run_summary.as_mut() {
+            summary.slots.iter_mut().for_each(hydrate);
+        }
+        snapshot
+    }
+
+    /// Wake the Lead once when a Worker turn has no model/tool activity for
+    /// Core's slow threshold.
+    /// This is deliberately a notification, not a cancellation or retry: the
+    /// Lead can dispatch an independent bottleneck lane while the original
+    /// Worker continues, preserving useful partial progress.
+    pub(crate) async fn notify_leader_slow_turn(&self, slot: &SlotWorkSnapshot) -> Result<bool, TeamError> {
+        if slot.role != TeamRunTargetRole::Teammate || slot.state != SlotPhase::Running {
+            return Ok(false);
+        }
+        let Some(turn_id) = slot.active_turn_id.as_deref() else {
+            return Ok(false);
+        };
+        let Some(last_activity_at_ms) = slot.active_turn_last_activity_at_ms else {
+            return Ok(false);
+        };
+        let inactive_ms = now_ms().saturating_sub(last_activity_at_ms).max(0) as u64;
+        if inactive_ms < ACTIVE_TURN_SLOW_THRESHOLD_MS {
+            return Ok(false);
+        }
+        let key = format!("{}:{turn_id}", slot.slot_id);
+        {
+            let mut notices = self.slow_turn_notices.lock().await;
+            if notices.contains(&key) {
+                return Ok(false);
+            }
+            let prefix = format!("{}:", slot.slot_id);
+            notices.retain(|existing| !existing.starts_with(&prefix));
+            notices.insert(key.clone());
+        }
+
+        let Some(lead_slot_id) = self.scheduler.find_lead_slot_id().await else {
+            self.slow_turn_notices.lock().await.remove(&key);
+            return Err(TeamError::AgentNotFound("lead".into()));
+        };
+        if lead_slot_id == slot.slot_id {
+            self.slow_turn_notices.lock().await.remove(&key);
+            return Ok(false);
+        }
+        // Keep the body stable so a retry after a lost wake replays the same
+        // idempotent mailbox row instead of conflicting on a changed elapsed
+        // time or creating another Lead message.
+        let content = format!(
+            "Worker {} turn {} produced no model or tool activity for Core's slow-turn threshold. Dispatch an independent dependency-ready lane or structurally distinct repair if useful, and keep verified partial work.",
+            slot.slot_id, turn_id
+        );
+        if let Err(error) = self
+            .mailbox
+            .write_with_files_idempotent(
+                &self.team.id,
+                &lead_slot_id,
+                &slot.slot_id,
+                MailboxMessageType::IdleNotification,
+                &content,
+                Some("Worker turn crossed the Core slow threshold"),
+                None,
+                "team.slow_turn_notification",
+                &key,
+            )
+            .await
+        {
+            self.slow_turn_notices.lock().await.remove(&key);
+            return Err(error);
+        }
+        if let Err(error) = self
+            .wake_leader_after_recovery_message(&slot.slot_id, WorkSource::IdleNotification)
+            .await
+        {
+            self.slow_turn_notices.lock().await.remove(&key);
+            return Err(error);
+        }
+        Ok(true)
     }
 
     pub fn mcp_stdio_config(&self, slot_id: &str) -> TeamMcpStdioConfig {
@@ -449,7 +560,9 @@ impl TeamSession {
     /// `finalize_turn` with no parsed actions (phase1 does not parse the
     /// trailing message for scheduler directives). Returns the leader slot_id
     /// that the caller should re-wake, if any; D7b wires that return value
-    /// into the wake path. `is_error` is reserved for future status handling.
+    /// into the wake path. Error finishes preserve the terminal Error status
+    /// while still notifying the Lead and participating in settled-worker
+    /// coordination.
     pub async fn on_agent_finish(&self, conversation_id: &str, is_error: bool) -> Result<Option<String>, TeamError> {
         // Dedup: skip if another finish event already claimed this conversation
         // within the 5-second window (W4-D19a).
@@ -470,20 +583,17 @@ impl TeamSession {
         // `on_agent_finish` remains callable for aionrs resume and test scenarios.
         // `begin_finalize` dedup prevents double finalization.
 
-        if is_error {
-            self.scheduler.set_status(&slot_id, TeammateStatus::Error).await?;
-        }
-
-        let wake_target = self.scheduler.finalize_turn(&slot_id, &[]).await?;
-
-        // Clear the dedup window unconditionally once finalize has run.
-        self.scheduler.clear_finalized_turn(conversation_id);
+        let wake_target = if is_error {
+            self.scheduler.finalize_turn_as_error(&slot_id, &[]).await?
+        } else {
+            self.scheduler.finalize_turn(&slot_id, &[]).await?
+        };
 
         // Re-wake self if there are still unread messages in mailbox.
         // This handles the case where messages arrived while the agent was
         // working (e.g. shutdown_request). Mirrors Claude's useMailboxBridge:
         // when isLoading becomes false, poll mailbox and submit if non-empty.
-        if wake_target.as_deref() != Some(&slot_id) {
+        if !is_error && wake_target.as_deref() != Some(&slot_id) {
             let has_unread = self.mailbox.has_unread(&self.team.id, &slot_id).await.unwrap_or(false);
             if has_unread {
                 return Ok(Some(slot_id));
@@ -647,7 +757,7 @@ impl TeamSession {
             "user message mailbox enqueue resolved"
         );
         self.event_loops.notify(slot_id);
-        let snapshot = self.work_coordinator.snapshot();
+        let snapshot = self.work_snapshot().await;
         let run = self
             .team_run_manager
             .current_payload(&snapshot)
@@ -908,6 +1018,17 @@ impl TeamSession {
     ) -> Result<Option<String>, TeamError> {
         let agent = self.scheduler.get_agent(slot_id).await?;
         self.publish_runtime_constraint(slot_id).await?;
+        if !matches!(source, WorkSource::RecoveryDrain)
+            && let Some(message_id) = mailbox_message_id.as_deref()
+            && self.work_coordinator.has_active_mailbox_intent(slot_id, message_id)
+        {
+            // A retry after a successful mailbox write or a lost wake must not
+            // turn one durable message into multiple executions.
+            return Ok(self
+                .work_coordinator
+                .slot_snapshot(slot_id)
+                .and_then(|slot| slot.team_run_id));
+        }
         let lease = self.work_coordinator.acquire_enqueue(EnqueueRequest {
             slot_id: slot_id.to_owned(),
             role: target_role_for(agent.role),
@@ -984,6 +1105,28 @@ impl TeamSession {
                 .into_iter()
                 .any(|message| message.from_agent_id != agent.slot_id);
             if !has_recoverable_unread {
+                continue;
+            }
+            // Reconciliation is a recovery path, not a second scheduler.  An
+            // unread row is already owned by the normal wake path whenever a
+            // wake lock, active/queued coordinator work, or a non-idle agent
+            // status exists.  Re-notifying in those states creates a fresh
+            // event-loop wake every scan and was the source of minute-by-
+            // minute duplicate Lead notifications.
+            if self.scheduler.is_wake_active(&agent.slot_id)
+                || self.scheduler.get_status(&agent.slot_id).await? != TeammateStatus::Idle
+            {
+                continue;
+            }
+            if let Some(work) = self.work_coordinator.slot_snapshot(&agent.slot_id)
+                && matches!(
+                    work.state,
+                    SlotPhase::Starting | SlotPhase::Running | SlotPhase::Paused | SlotPhase::Blocked
+                )
+            {
+                // A queued intent with an idle scheduler is intentionally
+                // re-notified: this is the retry queue after a pre-start
+                // failure, and no event-loop wake remains in flight.
                 continue;
             }
             if !self.event_loops.has(&agent.slot_id) {
@@ -2372,6 +2515,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn slow_turn_notification_is_idempotent_per_worker_turn() {
+        let session = start_session().await;
+        let slot = SlotWorkSnapshot {
+            slot_id: "worker-1".into(),
+            role: TeamRunTargetRole::Teammate,
+            state: SlotPhase::Running,
+            queued_foreground_count: 0,
+            queued_background_count: 0,
+            active_batch: None,
+            active_turn_id: Some("turn-1".into()),
+            active_turn_started_at_ms: Some(now_ms() - ACTIVE_TURN_SLOW_THRESHOLD_MS as i64 - 1),
+            active_turn_last_activity_at_ms: Some(now_ms() - ACTIVE_TURN_SLOW_THRESHOLD_MS as i64 - 1),
+            runtime_constraint: RuntimeConstraint::Ready,
+            team_run_id: None,
+        };
+
+        assert!(session.notify_leader_slow_turn(&slot).await.unwrap());
+        assert!(!session.notify_leader_slow_turn(&slot).await.unwrap());
+        let history = session.mailbox().get_history("t1", "lead-1", None).await.unwrap();
+        assert_eq!(
+            history
+                .iter()
+                .filter(|message| message.from_agent_id == "worker-1")
+                .count(),
+            1,
+            "repeated monitor ticks must not duplicate the same slow-turn wake"
+        );
+
+        let recently_active = SlotWorkSnapshot {
+            active_turn_id: Some("turn-active".into()),
+            active_turn_last_activity_at_ms: Some(now_ms()),
+            ..slot.clone()
+        };
+        assert!(!session.notify_leader_slow_turn(&recently_active).await.unwrap());
+
+        let next_turn = SlotWorkSnapshot {
+            active_turn_id: Some("turn-2".into()),
+            active_turn_started_at_ms: Some(now_ms() - ACTIVE_TURN_SLOW_THRESHOLD_MS as i64 - 1),
+            active_turn_last_activity_at_ms: Some(now_ms() - ACTIVE_TURN_SLOW_THRESHOLD_MS as i64 - 1),
+            ..slot
+        };
+        assert!(session.notify_leader_slow_turn(&next_turn).await.unwrap());
+        let history = session.mailbox().get_history("t1", "lead-1", None).await.unwrap();
+        assert_eq!(
+            history
+                .iter()
+                .filter(|message| message.from_agent_id == "worker-1")
+                .count(),
+            2,
+            "a new Worker turn must receive a fresh slow-turn wake"
+        );
+        session.stop();
+    }
+
+    #[tokio::test]
     async fn mcp_stdio_config_for_agent() {
         let session = start_session().await;
         let lead_config = session.mcp_stdio_config("lead-1");
@@ -2452,6 +2650,46 @@ mod tests {
         assert_eq!(state.messages.len(), 1);
         assert_eq!(state.messages[0].to_agent_id, "worker-1");
         assert_eq!(state.messages[0].content, "Do this task");
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn agent_delivery_to_lead_records_the_active_worker_turn() {
+        let repo = Arc::new(MockTeamRepo::new());
+        let repo_dyn: Arc<dyn ITeamRepository> = repo.clone();
+        let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
+        let session = TeamSession::start(
+            make_team(),
+            repo_dyn,
+            broadcaster,
+            backend_path(),
+            empty_task_manager(),
+            noop_turn_port(),
+            noop_cancellation_port(),
+            noop_projection_store(),
+            "user-test".into(),
+            Weak::<TeamSessionService>::new(),
+        )
+        .await
+        .unwrap();
+        session.scheduler.begin_turn("worker-1");
+
+        session
+            .send_agent_message_from_agent_with_idempotency(
+                "worker-1",
+                "lead-1",
+                "proof route",
+                None,
+                Some("delivery-1"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(session.scheduler.take_lead_delivery("worker-1"), Some(true));
+        let state = repo.state.lock().unwrap();
+        assert_eq!(state.messages.len(), 1);
+        assert_eq!(state.messages[0].from_agent_id, "worker-1");
+        assert_eq!(state.messages[0].to_agent_id, "lead-1");
         session.stop();
     }
 

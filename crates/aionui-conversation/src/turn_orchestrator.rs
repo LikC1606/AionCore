@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
 use aionui_ai_agent::{AgentError, AgentInstance, AgentSendError, AgentSessionKind, IWorkerTaskManager};
@@ -12,8 +12,8 @@ use crate::agent_health_policy::{AgentHealthAction, AgentHealthPolicy};
 use crate::runtime_state::RuntimeLifecycleState;
 use crate::runtime_state::TurnClaim;
 use crate::service::{
-    ConversationAgentTurnStarted, ConversationAgentTurnStartedCallback, ConversationService,
-    MAX_SYSTEM_RESPONSE_CONTINUATIONS_PER_TURN, agent_error_top_level_code, persist_session_key,
+    ConversationAgentTurnStartedCallback, ConversationService, MAX_SYSTEM_RESPONSE_CONTINUATIONS_PER_TURN,
+    agent_error_top_level_code, persist_session_key,
 };
 use crate::stream_relay::{RelayOutcome, StreamRelay, TurnAttemptSummary};
 use crate::turn_continuation_policy::{ContinuationDecision, TurnContinuationPolicy};
@@ -36,9 +36,10 @@ pub(crate) struct TurnStartInput {
     pub stored_workspace: String,
     pub turn_id: String,
     pub turn_claim: TurnClaim,
-    /// Fires exactly once after the first prompt has been accepted by the
-    /// Agent task. Task-option resolution, task build, workspace persistence,
-    /// runtime-mode setup, and `send_message` failures are all pre-acceptance.
+    /// Fires exactly once when the first stream event establishes that the
+    /// Agent task has started the prompt. Task-option resolution, task build,
+    /// workspace persistence, runtime-mode setup, and failures before a stream
+    /// event are all pre-acceptance.
     pub on_started: Option<ConversationAgentTurnStartedCallback>,
 }
 
@@ -221,7 +222,8 @@ impl ConversationTurnOrchestrator {
             .with_runtime_state(Arc::clone(&runtime_state))
             .with_persistence(persistence.clone())
             .with_turn_completion(false)
-            .with_defer_clean_terminal_errors(defer_clean_terminal_errors);
+            .with_defer_clean_terminal_errors(defer_clean_terminal_errors)
+            .with_started_callback(input.on_started.clone(), Arc::clone(&input.prompt_accepted));
 
             let rx = agent.subscribe();
             if let Some(mode) = input
@@ -271,22 +273,10 @@ impl ConversationTurnOrchestrator {
             let feedback_service = self.service.clone();
             let feedback_agent_id = availability_agent_id.clone();
             let (send_error_tx, send_error_rx) = oneshot::channel();
-            let on_started = input.on_started.clone();
-            let prompt_accepted = Arc::clone(&input.prompt_accepted);
 
             let send_task = tokio::spawn(async move {
                 match send_agent.send_message(current_send).await {
-                    Ok(()) => {
-                        if !prompt_accepted.swap(true, Ordering::SeqCst)
-                            && let Some(on_started) = on_started
-                        {
-                            on_started(ConversationAgentTurnStarted {
-                                conversation_id: conv_id_send,
-                                turn_id: turn_id_for_send,
-                            })
-                            .await;
-                        }
-                    }
+                    Ok(()) => {}
                     Err(e) => {
                         let failure_message = send_error_display_message(&e);
                         record_agent_session_failure(

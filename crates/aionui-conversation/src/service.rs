@@ -374,8 +374,9 @@ pub struct ConversationAgentTurnRequest {
     pub required_runtime_mode: Option<String>,
     pub persist_user_message: bool,
     pub user_message_hidden: bool,
-    /// Called exactly once after the Agent task accepts the first prompt.
-    /// Failures before that boundary must not be treated as delivered work.
+    /// Called exactly once when the first stream event establishes that the
+    /// Agent task has started the prompt. Failures before that boundary must
+    /// not be treated as delivered work.
     pub on_started: Option<ConversationAgentTurnStartedCallback>,
 }
 
