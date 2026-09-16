@@ -44,7 +44,9 @@ pub use repository::oauth_token::UpsertOAuthTokenParams;
 pub use repository::provider::{CreateProviderParams, UpdateProviderParams};
 pub use repository::remote_agent::{CreateRemoteAgentParams, UpdateRemoteAgentParams};
 pub use repository::skill::{CreateSkillImportRecordParams, UpsertSkillParams};
-pub use repository::team::{MailboxIdempotencyParams, MailboxWriteResult, UpdateTeamParams};
+pub use repository::team::{
+    MailboxIdempotencyParams, MailboxWriteResult, TeamCoordinationMigrationRow, UpdateTeamParams,
+};
 pub use repository::{
     CommitTeamCommandParams, CreateAcpSessionParams, FeedbackDiagnosticsDbContext, FeedbackDiagnosticsProfile,
     FeedbackDiagnosticsProfileResult, FeedbackDiagnosticsRequest, FeedbackDiagnosticsResult, IAcpSessionRepository,

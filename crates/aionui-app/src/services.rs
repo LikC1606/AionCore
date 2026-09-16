@@ -56,6 +56,7 @@ pub struct AppServices {
     pub skill_repo: Arc<dyn ISkillRepository>,
     runtime_helper_bin: String,
     runtime_base_url: String,
+    math_budget_host_secret: Option<String>,
 }
 
 impl AppServices {
@@ -85,11 +86,20 @@ impl AppServices {
             runtime_helper_bin: self.runtime_helper_bin.clone(),
             runtime_base_url: self.runtime_base_url.clone(),
             runtime_token_service: self.runtime_token_service.clone(),
+            math_budget_host_secret: self.math_budget_host_secret.clone(),
         });
         self
     }
 
     pub async fn from_config(database: Database, config: &AppConfig) -> anyhow::Result<Self> {
+        let math_budget_host_secret = std::env::var("DEEPSCIENTIST_MATH_BUDGET_HOST_SECRET").ok();
+        anyhow::ensure!(
+            math_budget_host_secret
+                .as_ref()
+                .is_none_or(|value| value.len() == 64
+                    && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))),
+            "invalid DEEPSCIENTIST_MATH_BUDGET_HOST_SECRET"
+        );
         let data_dir = config.data_dir.clone();
         let work_dir = config.work_dir.clone();
         let local = config.local;
@@ -204,6 +214,7 @@ impl AppServices {
             runtime_helper_bin: runtime_helper_bin.clone(),
             runtime_base_url: runtime_base_url.clone(),
             runtime_token_service: runtime_token_service.clone(),
+            math_budget_host_secret: math_budget_host_secret.clone(),
         });
 
         Ok(Self {
@@ -233,6 +244,7 @@ impl AppServices {
             skill_repo,
             runtime_helper_bin,
             runtime_base_url,
+            math_budget_host_secret,
         })
     }
 }
@@ -250,6 +262,7 @@ struct ConversationServiceDeps<'a> {
     runtime_helper_bin: String,
     runtime_base_url: String,
     runtime_token_service: Arc<RuntimeTokenService>,
+    math_budget_host_secret: Option<String>,
 }
 
 fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> ConversationService {
@@ -269,6 +282,9 @@ fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> Conversation
     .with_runtime_state(deps.conversation_runtime_state)
     .with_runtime_helper_context(deps.runtime_helper_bin, deps.runtime_base_url)
     .with_runtime_token_service(deps.runtime_token_service);
+    let service = service
+        .with_math_budget_host_secret(deps.math_budget_host_secret)
+        .expect("invalid DEEPSCIENTIST_MATH_BUDGET_HOST_SECRET");
     service.with_mcp_server_repo(Arc::new(SqliteMcpServerRepository::new(deps.database.pool().clone())));
     service.with_team_repo(Arc::new(SqliteTeamRepository::new(deps.database.pool().clone())));
     service.with_assistant_definition_repo(Arc::new(SqliteAssistantDefinitionRepository::new(

@@ -3,7 +3,6 @@ use crate::error::AgentError;
 use crate::protocol::acp::{PermissionDecision, PermissionRequest};
 use crate::protocol::events::{AgentStreamEvent, permission_request_to_event_data};
 use agent_client_protocol::schema::{PermissionOptionKind as SdkPermissionOptionKind, ToolKind as SdkToolKind};
-use aionui_api_types::TEAM_MCP_SERVER_NAME;
 use aionui_common::Confirmation;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,7 +19,16 @@ const BENCHMARK_CONTAINER_MCP_TOOLS: &[&str] = &[
     "benchmark_list",
     "benchmark_stat",
 ];
-const AUTO_APPROVE_MCP_SERVERS: &[&str] = &[TEAM_MCP_SERVER_NAME];
+
+/// A factory-verified MCP capability that may proceed without an interactive
+/// confirmation. `None` means every action; an empty list means no actions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustedMcpToolPolicy {
+    pub server_name: String,
+    pub tool_name: String,
+    pub allowed_actions: Option<Vec<String>>,
+    pub denied_actions: Option<Vec<String>>,
+}
 
 struct PendingPermission {
     responder: oneshot::Sender<PermissionDecision>,
@@ -40,6 +48,7 @@ pub struct PermissionRouter {
     /// Whether a graceful shutdown is in progress.
     closing: AtomicBool,
     benchmark_container_isolation: bool,
+    auto_approve_mcp_tools: Vec<TrustedMcpToolPolicy>,
 }
 
 impl PermissionRouter {
@@ -55,11 +64,22 @@ impl PermissionRouter {
         permission_rx: mpsc::Receiver<PermissionRequest>,
         benchmark_container_isolation: bool,
     ) -> Self {
+        Self::with_auto_approve_policy(permission_rx, benchmark_container_isolation, Vec::new())
+    }
+
+    /// Construct a router with an immutable list of MCP server identities that
+    /// the runtime factory verified before the Agent process was launched.
+    pub fn with_auto_approve_policy(
+        permission_rx: mpsc::Receiver<PermissionRequest>,
+        benchmark_container_isolation: bool,
+        auto_approve_mcp_tools: Vec<TrustedMcpToolPolicy>,
+    ) -> Self {
         Self {
             permission_rx: Mutex::new(permission_rx),
             pending_permissions: StdMutex::new(HashMap::new()),
             closing: AtomicBool::new(false),
             benchmark_container_isolation,
+            auto_approve_mcp_tools,
         }
     }
 
@@ -84,15 +104,19 @@ impl PermissionRouter {
                 let call_id = perm_req.request.tool_call.tool_call_id.to_string();
 
                 // Auto-approve team MCP tools without user interaction.
-                if let Some(option_id) =
-                    auto_approve_option_id_with_benchmark(&perm_req.request, this.benchmark_container_isolation)
-                {
+                if let Some(option_id) = auto_approve_option_id_with_policy(
+                    &perm_req.request,
+                    this.benchmark_container_isolation,
+                    &this.auto_approve_mcp_tools,
+                ) {
                     info!(
                         conversation_id = %runtime.conversation_id(),
                         call_id,
                         option_id = %option_id,
                         server_name = ?extract_mcp_server_name(&perm_req.request),
-                        "ACP team MCP permission auto-approved"
+                        tool_name = ?extract_mcp_tool_name(&perm_req.request),
+                        action = ?extract_mcp_action(&perm_req.request),
+                        "ACP trusted MCP permission auto-approved"
                     );
                     let _ = perm_req.response_tx.send(PermissionDecision::Selected { option_id });
                     continue;
@@ -201,21 +225,86 @@ fn is_auto_approve_tool(request: &agent_client_protocol::schema::RequestPermissi
 
 #[cfg(test)]
 fn auto_approve_option_id(request: &agent_client_protocol::schema::RequestPermissionRequest) -> Option<String> {
-    auto_approve_option_id_with_benchmark(request, false)
+    auto_approve_option_id_with_policy(
+        request,
+        false,
+        &[TrustedMcpToolPolicy {
+            server_name: "aionui-team".to_owned(),
+            tool_name: "*".to_owned(),
+            allowed_actions: None,
+            denied_actions: Some(Vec::new()),
+        }],
+    )
 }
 
+#[cfg(test)]
 fn auto_approve_option_id_with_benchmark(
     request: &agent_client_protocol::schema::RequestPermissionRequest,
     benchmark_container_isolation: bool,
 ) -> Option<String> {
-    let team_server = extract_mcp_server_name(request)
-        .is_some_and(|server_name| AUTO_APPROVE_MCP_SERVERS.contains(&server_name.as_str()));
+    auto_approve_option_id_with_policy(request, benchmark_container_isolation, &[])
+}
+
+fn auto_approve_option_id_with_policy(
+    request: &agent_client_protocol::schema::RequestPermissionRequest,
+    benchmark_container_isolation: bool,
+    auto_approve_mcp_tools: &[TrustedMcpToolPolicy],
+) -> Option<String> {
+    let team_server = is_trusted_mcp_tool_request(request, auto_approve_mcp_tools);
     let benchmark_server = benchmark_container_isolation
         && (is_exact_benchmark_mcp_request(request) || is_correlated_benchmark_mcp_approval(request));
     if !team_server && !benchmark_server {
         return None;
     }
     select_allow_option_id(request)
+}
+
+fn is_trusted_mcp_tool_request(
+    request: &agent_client_protocol::schema::RequestPermissionRequest,
+    policies: &[TrustedMcpToolPolicy],
+) -> bool {
+    let Some(server_name) = extract_mcp_server_name(request) else {
+        return false;
+    };
+    let Some(tool_name) = extract_mcp_tool_name(request) else {
+        return false;
+    };
+    let action = extract_mcp_action(request);
+    let matching: Vec<&TrustedMcpToolPolicy> = policies
+        .iter()
+        .filter(|policy| {
+            policy.server_name == server_name && (policy.tool_name == "*" || tool_name == policy.tool_name)
+        })
+        .collect();
+    if matching.is_empty() {
+        return false;
+    }
+
+    // Deny rules apply across every matching entry. This keeps duplicate
+    // role-policy rows fail-closed instead of allowing an earlier permit to
+    // bypass a later denial for the same server/tool/action.
+    let denied = matching.iter().any(|policy| match policy.denied_actions.as_ref() {
+        None => true,
+        Some(actions) => action
+            .as_ref()
+            .is_some_and(|action| actions.iter().any(|candidate| candidate == action)),
+    });
+    if denied {
+        return false;
+    }
+
+    matching.iter().any(|policy| {
+        if policy.tool_name == "*" && policy.allowed_actions.is_none() {
+            return true;
+        }
+        let Some(action) = action.as_ref() else {
+            return false;
+        };
+        policy
+            .allowed_actions
+            .as_ref()
+            .is_none_or(|actions| actions.iter().any(|candidate| candidate == action))
+    })
 }
 
 fn is_correlated_benchmark_mcp_approval(request: &agent_client_protocol::schema::RequestPermissionRequest) -> bool {
@@ -274,26 +363,75 @@ fn select_allow_option_id(request: &agent_client_protocol::schema::RequestPermis
     request
         .options
         .iter()
-        .find(|option| matches!(option.kind, SdkPermissionOptionKind::AllowAlways))
+        .find(|option| matches!(option.kind, SdkPermissionOptionKind::AllowOnce))
         .or_else(|| {
             request
                 .options
                 .iter()
-                .find(|option| matches!(option.kind, SdkPermissionOptionKind::AllowOnce))
+                .find(|option| matches!(option.kind, SdkPermissionOptionKind::AllowAlways))
         })
         .map(|option| option.option_id.to_string())
 }
 
 fn extract_mcp_server_name(request: &agent_client_protocol::schema::RequestPermissionRequest) -> Option<String> {
-    extract_mcp_server_from_raw_input(request).or_else(|| {
-        request
-            .tool_call
-            .fields
-            .title
-            .as_deref()
-            .and_then(extract_mcp_server_from_prefixed_title)
-            .map(str::to_owned)
-    })
+    let title_server = request.tool_call.fields.title.as_deref().and_then(|title| {
+        extract_mcp_server_from_prefixed_title(title).or_else(|| {
+            title
+                .strip_prefix("mcp.")
+                .and_then(|rest| rest.rsplit_once('.').map(|(server, _)| server))
+        })
+    });
+    let raw_server = extract_mcp_server_from_raw_input(request);
+    match (raw_server, title_server) {
+        (Some(raw), Some(title)) if raw != title => None,
+        (Some(raw), _) => Some(raw),
+        (None, Some(title)) => Some(title.to_owned()),
+        (None, None) => None,
+    }
+}
+
+fn extract_mcp_tool_name(request: &agent_client_protocol::schema::RequestPermissionRequest) -> Option<String> {
+    let fields = &request.tool_call.fields;
+    let raw_tool = fields
+        .raw_input
+        .as_ref()
+        .and_then(|raw_input| raw_input.get("tool"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|tool| !tool.is_empty());
+    let title_tool = fields.title.as_deref().and_then(|title| {
+        if let Some(rest) = title.strip_prefix("mcp.") {
+            return rest
+                .rsplit_once('.')
+                .map(|(_, tool)| tool)
+                .filter(|tool| !tool.is_empty());
+        }
+        title
+            .strip_prefix("mcp__")
+            .and_then(|rest| rest.split_once("__").map(|(_, tool)| tool))
+            .filter(|tool| !tool.is_empty())
+    });
+    match (raw_tool, title_tool) {
+        (Some(raw), Some(title)) if raw != title => None,
+        (Some(raw), _) => Some(raw.to_owned()),
+        (None, Some(title)) => Some(title.to_owned()),
+        (None, None) => None,
+    }
+}
+
+fn extract_mcp_action(request: &agent_client_protocol::schema::RequestPermissionRequest) -> Option<String> {
+    let raw_input = request.tool_call.fields.raw_input.as_ref()?;
+    let arguments = raw_input.get("arguments").unwrap_or(raw_input);
+    arguments
+        .get("action")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            arguments
+                .get("command")
+                .and_then(|command| command.get("action"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .filter(|action| !action.is_empty())
+        .map(str::to_owned)
 }
 
 fn extract_mcp_server_from_raw_input(
@@ -306,6 +444,15 @@ fn extract_mcp_server_from_raw_input(
         .and_then(serde_json::Value::as_str)
         .filter(|server_name| !server_name.is_empty())
     {
+        if let (Some(server), Some(tool), Some(title)) = (
+            raw_input.get("server").and_then(serde_json::Value::as_str),
+            raw_input.get("tool").and_then(serde_json::Value::as_str),
+            fields.title.as_deref(),
+        ) {
+            if title != format!("mcp.{server}.{tool}") || server != server_name {
+                return None;
+            }
+        }
         return Some(server_name.to_owned());
     }
 
@@ -463,6 +610,7 @@ mod tests {
             "Approve MCP tool call",
             Some(json!({
                 "server_name": "aionui-team",
+                "tool": "team_members",
                 "request": {
                     "_meta": {
                         "codex_approval_kind": "mcp_tool_call"
@@ -478,6 +626,17 @@ mod tests {
         );
 
         assert!(is_auto_approve_tool(&request));
+    }
+
+    #[test]
+    fn auto_approve_rejects_mismatched_raw_server_and_explicit_title() {
+        let request = permission_request_with_title_and_raw_input(
+            "mcp.aionui-team.team_members",
+            Some(json!({ "server_name": "aionui-image-generation" })),
+            vec![allow_once_option("approved"), reject_option("cancel")],
+        );
+
+        assert!(!is_auto_approve_tool(&request));
     }
 
     #[test]
@@ -627,7 +786,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_approve_selects_first_codex_allow_always_option() {
+    fn auto_approve_prefers_codex_allow_once_option() {
         let request = permission_request_with_title_and_raw_input(
             "Approve MCP tool call",
             Some(json!({ "server_name": "aionui-team" })),
@@ -639,16 +798,11 @@ mod tests {
             ],
         );
 
-        // `approved-for-session` is selected because it is the first AllowAlways option,
-        // not because the option id has special meaning in AionCore.
-        assert_eq!(
-            auto_approve_option_id(&request).as_deref(),
-            Some("approved-for-session")
-        );
+        assert_eq!(auto_approve_option_id(&request).as_deref(), Some("approved"));
     }
 
     #[test]
-    fn auto_approve_selects_claude_allow_always_by_kind() {
+    fn auto_approve_prefers_claude_allow_once_by_kind() {
         let request = permission_request_with_title_and_raw_input(
             "mcp__aionui-team__team_write_plan",
             None,
@@ -659,9 +813,7 @@ mod tests {
             ],
         );
 
-        // `allow_always` is selected because it is the only AllowAlways option,
-        // not because the option id has special meaning in AionCore.
-        assert_eq!(auto_approve_option_id(&request).as_deref(), Some("allow_always"));
+        assert_eq!(auto_approve_option_id(&request).as_deref(), Some("allow"));
     }
 
     #[test]
@@ -676,7 +828,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_approve_selects_first_available_allow_always_option() {
+    fn auto_approve_selects_first_available_allow_once_option() {
         let request = permission_request_with_title_and_raw_input(
             "Approve MCP tool call",
             Some(json!({ "server_name": "aionui-team" })),
@@ -686,7 +838,90 @@ mod tests {
             ],
         );
 
-        assert_eq!(auto_approve_option_id(&request).as_deref(), Some("custom-allow-always"));
+        assert_eq!(auto_approve_option_id(&request).as_deref(), Some("custom-allow-once"));
+    }
+
+    #[test]
+    fn auto_approve_matches_only_factory_registered_dynamic_team_server() {
+        let request = permission_request_with_title_and_raw_input(
+            "mcp.ds-team-runtime-0.research_team",
+            Some(json!({
+                "arguments": { "action": "describe" },
+                "server": "ds-team-runtime-0",
+                "tool": "research_team"
+            })),
+            vec![allow_once_option("allow"), reject_option("cancel")],
+        );
+        let trusted = [TrustedMcpToolPolicy {
+            server_name: "ds-team-runtime-0".to_owned(),
+            tool_name: "research_team".to_owned(),
+            allowed_actions: Some(vec!["describe".to_owned()]),
+            denied_actions: Some(Vec::new()),
+        }];
+
+        assert_eq!(
+            auto_approve_option_id_with_policy(&request, false, &trusted).as_deref(),
+            Some("allow")
+        );
+        assert_eq!(auto_approve_option_id_with_policy(&request, false, &[]), None);
+    }
+
+    #[test]
+    fn auto_approve_requires_an_allowed_non_denied_action() {
+        let request = permission_request_with_title_and_raw_input(
+            "mcp.ds-team-runtime-1.math_research",
+            Some(json!({
+                "arguments": { "command": { "action": "overview" } },
+                "server": "ds-team-runtime-1",
+                "tool": "math_research"
+            })),
+            vec![allow_once_option("allow"), reject_option("cancel")],
+        );
+        let allowed = [TrustedMcpToolPolicy {
+            server_name: "ds-team-runtime-1".to_owned(),
+            tool_name: "math_research".to_owned(),
+            allowed_actions: Some(vec!["overview".to_owned()]),
+            denied_actions: Some(Vec::new()),
+        }];
+        let denied = [TrustedMcpToolPolicy {
+            denied_actions: Some(vec!["overview".to_owned()]),
+            ..allowed[0].clone()
+        }];
+
+        assert_eq!(
+            auto_approve_option_id_with_policy(&request, false, &allowed).as_deref(),
+            Some("allow")
+        );
+        assert_eq!(auto_approve_option_id_with_policy(&request, false, &denied), None);
+    }
+
+    #[test]
+    fn auto_approve_applies_deny_across_duplicate_policy_entries() {
+        let request = permission_request_with_title_and_raw_input(
+            "mcp.ds-team-runtime-1.math_research",
+            Some(json!({
+                "arguments": { "action": "overview" },
+                "server": "ds-team-runtime-1",
+                "tool": "math_research"
+            })),
+            vec![allow_once_option("allow"), reject_option("cancel")],
+        );
+        let policies = [
+            TrustedMcpToolPolicy {
+                server_name: "ds-team-runtime-1".to_owned(),
+                tool_name: "math_research".to_owned(),
+                allowed_actions: Some(vec!["overview".to_owned()]),
+                denied_actions: Some(Vec::new()),
+            },
+            TrustedMcpToolPolicy {
+                server_name: "ds-team-runtime-1".to_owned(),
+                tool_name: "math_research".to_owned(),
+                allowed_actions: Some(vec!["overview".to_owned()]),
+                denied_actions: Some(vec!["overview".to_owned()]),
+            },
+        ];
+
+        assert_eq!(auto_approve_option_id_with_policy(&request, false, &policies), None);
     }
 
     #[test]
@@ -784,7 +1019,16 @@ mod tests {
     #[tokio::test]
     async fn start_auto_approves_team_mcp_with_existing_option_id() {
         let (permission_tx, permission_rx) = mpsc::channel(1);
-        let router = Arc::new(PermissionRouter::new(permission_rx));
+        let router = Arc::new(PermissionRouter::with_auto_approve_policy(
+            permission_rx,
+            false,
+            vec![TrustedMcpToolPolicy {
+                server_name: "aionui-team".to_owned(),
+                tool_name: "*".to_owned(),
+                allowed_actions: None,
+                denied_actions: Some(Vec::new()),
+            }],
+        ));
         let runtime = AgentRuntime::new("conv-1", "/tmp/workspace", 8);
         router.start(runtime);
 
@@ -811,7 +1055,7 @@ mod tests {
 
         assert!(matches!(
             decision,
-            PermissionDecision::Selected { option_id } if option_id == "approved-for-session"
+            PermissionDecision::Selected { option_id } if option_id == "approved"
         ));
         assert!(router.get_confirmations().is_empty());
     }

@@ -263,6 +263,7 @@ fn team_row() -> TeamRow {
         member("worker", "conv-worker", TeammateRole::Teammate),
     ];
     TeamRow {
+        coordination_protocol: None,
         id: TEAM_ID.into(),
         user_id: USER_ID.into(),
         name: "Delivery Team".into(),

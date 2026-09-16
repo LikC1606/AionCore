@@ -8,6 +8,7 @@ impl TeamSessionService {
         }
 
         Ok(TeamResponse {
+            coordination_protocol: team.coordination_protocol,
             id: team.id.clone(),
             user_id: team.user_id.clone(),
             name: team.name.clone(),

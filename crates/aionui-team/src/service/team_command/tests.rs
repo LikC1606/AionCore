@@ -91,6 +91,7 @@ fn team_row() -> TeamRow {
         member("peer", "conv-peer", TeammateRole::Teammate),
     ];
     TeamRow {
+        coordination_protocol: None,
         id: TEAM_ID.into(),
         user_id: USER_ID.into(),
         name: "Command Team".into(),

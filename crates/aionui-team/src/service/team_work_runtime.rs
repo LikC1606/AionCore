@@ -1068,6 +1068,7 @@ mod tests {
         ];
         team_repo
             .create_team(&TeamRow {
+                coordination_protocol: None,
                 id: "team-1".into(),
                 user_id: "owner".into(),
                 name: "Team".into(),

@@ -6,6 +6,7 @@ use aionui_db::{
 
 fn team(id: &str) -> TeamRow {
     TeamRow {
+        coordination_protocol: None,
         id: id.to_owned(),
         user_id: "owner".into(),
         name: format!("Team {id}"),

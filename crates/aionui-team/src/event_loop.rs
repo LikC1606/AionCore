@@ -18,7 +18,7 @@ use crate::ports::{
 use crate::scheduler::TeammateManager;
 use crate::session::{PrepareBatchResult, TeamSession, WakeInput};
 use crate::team_run::target_role_for;
-use crate::types::TeammateStatus;
+use crate::types::{TeammateRole, TeammateStatus};
 use crate::work_coordinator::{CommitResult, StartCommitResult, WorkBatch};
 use crate::work_source::WorkSource;
 
@@ -301,7 +301,50 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
 
     let outcome = match ctx.turn_port.run_agent_turn(request).await {
         Ok(outcome) => outcome,
-        Err(error) if !prompt_accepted_seen.load(Ordering::SeqCst) && batch.team_run_ids.is_empty() => {
+        Err(AgentTurnExecutionError::Transport { reason }) if input.agent_role == TeammateRole::Lead => {
+            warn!(
+                team_id = %ctx.team_id,
+                slot_id = %ctx.slot_id,
+                batch_id = %batch.batch_id,
+                error = %reason,
+                "Lead agent turn lost its model stream; queuing continuation"
+            );
+            match ctx.session.recover_leader_transport_failure(&batch, &reason).await {
+                Ok(()) => {
+                    ctx.scheduler.clear_turn(&ctx.slot_id);
+                    let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Idle).await;
+                    return ExecuteResult::ContinueDraining;
+                }
+                Err(error) => {
+                    warn!(
+                        team_id = %ctx.team_id,
+                        slot_id = %ctx.slot_id,
+                        batch_id = %batch.batch_id,
+                        error = %error,
+                        "Lead transport recovery failed; settling the original batch as failed"
+                    );
+                    mark_batch_messages_read(
+                        &ctx.mailbox,
+                        &ctx.team_id,
+                        &ctx.slot_id,
+                        &batch,
+                        "transport_recovery_failed",
+                    )
+                    .await;
+                    ctx.session
+                        .work_coordinator()
+                        .fail_batch(&batch, "transport_recovery_failed");
+                    ctx.scheduler.clear_turn(&ctx.slot_id);
+                    let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Error).await;
+                    return ExecuteResult::ContinueDraining;
+                }
+            }
+        }
+        Err(error)
+            if !matches!(error, AgentTurnExecutionError::Rejected { .. })
+                && !prompt_accepted_seen.load(Ordering::SeqCst)
+                && batch.team_run_ids.is_empty() =>
+        {
             warn!(
                 team_id = %ctx.team_id,
                 slot_id = %ctx.slot_id,

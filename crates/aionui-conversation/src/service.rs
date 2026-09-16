@@ -1,4 +1,6 @@
 use std::future::Future;
+mod math_budget;
+pub(crate) mod math_run_inputs;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, Weak};
@@ -349,6 +351,7 @@ pub struct ConversationService {
     runtime_helper_bin: Option<String>,
     runtime_base_url: Option<String>,
     runtime_token_service: Option<Arc<RuntimeTokenService>>,
+    math_budget_host_secret: Option<Arc<str>>,
     /// Short-lived per-request locks close the same-process race between a
     /// receipt lookup and the atomic message insert. Weak entries disappear
     /// after callers finish, so long-running apps do not retain every key.
@@ -395,18 +398,39 @@ pub enum ConversationAgentTurnStatus {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConversationAgentTurnFailureKind {
+    TransportDisconnect,
+    RunInputsIntegrity,
+}
+
 #[derive(Debug, Clone)]
 pub struct ConversationAgentTurnOutcome {
     pub conversation_id: String,
     pub turn_id: String,
     pub status: ConversationAgentTurnStatus,
     pub error_message: Option<String>,
+    pub failure_kind: Option<ConversationAgentTurnFailureKind>,
     pub runtime: ConversationRuntimeSummary,
 }
 
 // ── Construction & Dependency Injection ──────────────────────────────
 
 impl ConversationService {
+    pub fn runtime_capabilities(&self) -> aionui_api_types::ConversationRuntimeCapabilitiesResponse {
+        aionui_api_types::ConversationRuntimeCapabilitiesResponse {
+            math_fair_turn_gate: crate::math_fair_turn_gate::capability(),
+            math_request_gate: aionui_api_types::MathRequestGateCapability {
+                enabled: std::env::var("DEEPSCIENTIST_MATH_REQUEST_GATE_URL").is_ok()
+                    && std::env::var("DEEPSCIENTIST_MATH_REQUEST_GATE_SECRET").is_ok(),
+                scope: "math_run_root".into(),
+                protocol_version: 1,
+            },
+            math_run_inputs: math_run_inputs::capability(),
+            runtime_process_id: std::process::id(),
+        }
+    }
+
     pub fn new(
         workspace_root: PathBuf,
         broadcaster: Arc<dyn EventBroadcaster>,
@@ -434,6 +458,7 @@ impl ConversationService {
             runtime_helper_bin: None,
             runtime_base_url: None,
             runtime_token_service: None,
+            math_budget_host_secret: None,
             send_idempotency_locks: Arc::new(Mutex::new(HashMap::new())),
             update_locks: Arc::new(Mutex::new(HashMap::new())),
 
@@ -781,6 +806,7 @@ impl ConversationService {
         let source = req.source.unwrap_or(ConversationSource::Aionui);
 
         let mut extra = req.extra;
+        math_run_inputs::validate_initialization(&extra)?;
 
         let assistant_id = req
             .assistant
@@ -2088,7 +2114,16 @@ impl ConversationService {
         let merged_extra = if let Some(new_extra) = &req.extra {
             let mut existing_extra: serde_json::Value =
                 serde_json::from_str(&existing.extra).unwrap_or_else(|_| serde_json::json!({}));
+            let previous_extra = existing_extra.clone();
             merge_json(&mut existing_extra, new_extra);
+            let initializes_inputs = math_run_inputs::initializes_inputs(&previous_extra, &existing_extra);
+            let allow_inputs = initializes_inputs
+                && !self.runtime_state.is_claimed(id)
+                && (snapshot_bootstrap
+                    || self
+                        .allows_team_snapshot_bootstrap(user_id, id, &existing, task_manager)
+                        .await?);
+            math_run_inputs::validate_update(&previous_extra, &existing_extra, allow_inputs)?;
             if existing_type == AgentType::Aionrs
                 && let Some(obj) = existing_extra.as_object_mut()
                 && obj.remove("model").is_some()
@@ -2098,7 +2133,9 @@ impl ConversationService {
             if new_extra.get("workspace").is_some() {
                 normalize_workspace_extra(&mut existing_extra)?;
             }
-            if snapshot_bootstrap && let Some(obj) = existing_extra.as_object_mut() {
+            if (snapshot_bootstrap || allow_inputs)
+                && let Some(obj) = existing_extra.as_object_mut()
+            {
                 obj.remove(TEAM_SNAPSHOT_BOOTSTRAP_PENDING_KEY);
             }
             consume_global_memory_prompt(&mut existing_extra, &existing_type)?;
@@ -2203,7 +2240,9 @@ impl ConversationService {
 
         let mut merged: serde_json::Value =
             serde_json::from_str(&existing.extra).unwrap_or_else(|_| serde_json::json!({}));
+        let previous = merged.clone();
         merge_json(&mut merged, &patch);
+        math_run_inputs::validate_update(&previous, &merged, false)?;
         if patch.get("workspace").is_some() {
             normalize_workspace_extra(&mut merged)?;
         }
@@ -3028,6 +3067,9 @@ impl ConversationService {
             });
         }
 
+        // Pair the persisted snapshot with the turn claim under the same lock
+        // as initial math-input installation. Never start from a pre-install row.
+        let input_guard = self.update_lock(&request.conversation_id)?.lock_owned().await;
         let row = self
             .conversation_repo
             .get(&request.conversation_id)
@@ -3041,6 +3083,7 @@ impl ConversationService {
 
         let turn_id = Self::mint_turn_id();
         let turn_claim = self.runtime_state.try_claim_turn(&request.conversation_id, &turn_id)?;
+        drop(input_guard);
         if request.persist_user_message {
             let user_msg_id = Self::mint_msg_id();
             let user_msg = aionui_db::models::MessageRow {
@@ -3092,6 +3135,7 @@ impl ConversationService {
                     turn_id,
                     status: ConversationAgentTurnStatus::Failed,
                     error_message: Some(send_error_display_message(&send_error)),
+                    failure_kind: None,
                     runtime: self.runtime_summary_for(&request.conversation_id).await,
                 });
             }
@@ -3121,6 +3165,14 @@ impl ConversationService {
             })
             .await;
 
+        let failure_kind = result.failure_kind.or_else(|| {
+            (result.status == ConversationTurnStatus::Failed
+                && result
+                    .error_message
+                    .as_deref()
+                    .is_some_and(crate::stream_relay::is_transport_disconnect_message))
+            .then_some(ConversationAgentTurnFailureKind::TransportDisconnect)
+        });
         Ok(ConversationAgentTurnOutcome {
             runtime: self.runtime_summary_for(&conversation_id).await,
             conversation_id,
@@ -3130,6 +3182,7 @@ impl ConversationService {
                 ConversationTurnStatus::Failed => ConversationAgentTurnStatus::Failed,
             },
             error_message: result.error_message,
+            failure_kind,
         })
     }
 

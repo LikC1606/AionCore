@@ -405,6 +405,7 @@ async fn t4_4_team_events_reach_only_the_team_owner() {
     let app = start_app().await;
     SqliteTeamRepository::new(app.services.database.pool().clone())
         .create_team(&TeamRow {
+            coordination_protocol: None,
             id: "private-team".into(),
             user_id: "owner-user".into(),
             name: "Private Team".into(),
@@ -597,4 +598,72 @@ async fn t7_2_blacklisted_token_rejected() {
 
     let code = read_close(&mut rx).await;
     assert_eq!(code, Some(1008));
+}
+#[tokio::test]
+async fn runtime_disconnect_closes_real_socket_without_waiting_for_heartbeat() {
+    let app = start_app().await;
+    let token = sign_token(&app, "user1");
+    let (_tx, mut rx) = connect_bearer(app.addr, &token).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    ws_manager(&app).disconnect_all();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match rx.next().await {
+                None | Some(Err(_)) | Some(Ok(tungstenite::Message::Close(_))) => break,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("server-side removal must tear down the actual transport");
+    assert_eq!(ws_manager(&app).client_count(), 0);
+}
+
+#[tokio::test]
+async fn runtime_subscription_ready_precedes_a_subsequent_authorized_event() {
+    let app = start_app().await;
+    let token = sign_token(&app, "user1");
+    let (mut tx, mut rx) = connect_bearer(app.addr, &token).await;
+    tx.send(send_json(r#"{"name":"runtime.subscribe","data":{}}"#))
+        .await
+        .unwrap();
+    assert_eq!(
+        read_text(&mut rx).await,
+        json!({"name":"runtime.subscriptionReady","data":{"protocolVersion":1}})
+    );
+    ws_manager(&app).broadcast_all(WebSocketMessage::new(
+        "runtime.eventGap",
+        json!({"skipped":1,"observedAt":1}),
+    ));
+    assert_eq!(read_text(&mut rx).await["name"], "runtime.eventGap");
+}
+
+#[tokio::test]
+async fn runtime_subscription_rejects_undeclared_identity_fields() {
+    let app = start_app().await;
+    let token = sign_token(&app, "user1");
+    let (mut tx, mut rx) = connect_bearer(app.addr, &token).await;
+    tx.send(send_json(r#"{"name":"runtime.subscribe","data":{"userId":"other"}}"#))
+        .await
+        .unwrap();
+    assert_eq!(read_text(&mut rx).await["data"]["code"], "REALTIME_INVALID_MESSAGE");
+}
+
+#[tokio::test]
+async fn dropped_team_event_invalidates_without_disclosing_its_payload() {
+    let app = start_app().await;
+    let token = sign_token(&app, "user1");
+    let (mut tx, mut rx) = connect_bearer(app.addr, &token).await;
+    tx.send(send_json(r#"{"name":"runtime.subscribe","data":{}}"#))
+        .await
+        .unwrap();
+    assert_eq!(read_text(&mut rx).await["name"], "runtime.subscriptionReady");
+    app.services.event_bus.broadcast(WebSocketMessage::new(
+        "team.runCompleted",
+        json!({"private_payload":"must-not-leak"}),
+    ));
+    let gap = read_text(&mut rx).await;
+    assert_eq!(gap["name"], "runtime.eventGap");
+    assert_eq!(gap["data"].as_object().unwrap().len(), 2);
+    assert!(!gap.to_string().contains("must-not-leak"));
 }

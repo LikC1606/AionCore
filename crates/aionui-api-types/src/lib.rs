@@ -12,6 +12,7 @@ mod channel;
 mod confirmation;
 mod connection_test;
 mod conversation;
+pub use conversation::{MathBudgetBindingRequest, MathBudgetBindingResponse};
 mod cron;
 mod custom_agent;
 mod extension;
@@ -27,6 +28,7 @@ mod shell;
 mod skill;
 mod system;
 mod team;
+mod team_coordination;
 mod team_mcp;
 mod team_tools;
 mod team_work_command;
@@ -80,10 +82,11 @@ pub use conversation::{
     CancelConversationRequest, CancelConversationResponse, CloneConversationRequest, ConversationArtifactKind,
     ConversationArtifactListResponse, ConversationArtifactResponse, ConversationArtifactStatus,
     ConversationAssistantIdentityResponse, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
-    ConversationResponse, ConversationRuntimeStateKind, ConversationRuntimeSummary, CreateConversationRequest,
-    EnsureConversationRuntimeResponse, ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse,
-    MessageSearchItem, MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
-    UpdateConversationArtifactRequest, UpdateConversationRequest,
+    ConversationResponse, ConversationRuntimeCapabilitiesResponse, ConversationRuntimeStateKind,
+    ConversationRuntimeSummary, CreateConversationRequest, EnsureConversationRuntimeResponse, ListConversationsQuery,
+    ListMessagesQuery, MathFairTurnGateCapability, MathRequestGateCapability, MathRunInputsCapability,
+    MessageListResponse, MessageResponse, MessageSearchItem, MessageSearchResponse, SearchMessagesQuery,
+    SendMessageRequest, SendMessageResponse, UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
 pub use cron::{
     CreateConversationCronRequest, CreateConversationCronResponse, CreateCronJobRequest, CronAgentConfigReadDto,
@@ -171,12 +174,15 @@ pub use team::{
     RenameAgentRequest, RenameTeamRequest, SendAgentMessageRequest, SendTeamMessageRequest, TeamAgentInput,
     TeamAgentRemovedPayload, TeamAgentRenamedPayload, TeamAgentResponse, TeamAgentRuntimeStatus,
     TeamAgentRuntimeStatusPayload, TeamAgentSpawnedPayload, TeamAgentStatusPayload, TeamChildTurnPayload,
-    TeamGitDeliveryResponse, TeamGitWorkAssignmentResponse, TeamListResponse, TeamMcpRuntimeConfig,
-    TeamMessageEnqueueStatus, TeamResponse, TeamRunAckResponse, TeamRunPayload, TeamRunSource, TeamRunStateResponse,
-    TeamRunStatus, TeamRunTargetRole, TeamRuntimeSeed, TeamSendMessageQueuedResponse, TeamSessionBinding,
-    TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload, TeamSlotBlockedReason, TeamSlotWorkPayload,
-    TeamSlotWorkState, TeamWorkEventResponse, TeamWorkItemResponse, TeamWorkItemSnapshotResponse,
-    TeamWorkSubmissionResponse, TeammateMessagePayload,
+    TeamCoordinationProtocol, TeamGitDeliveryResponse, TeamGitWorkAssignmentResponse, TeamListResponse,
+    TeamManagedTool, TeamMcpRuntimeConfig, TeamMessageEnqueueStatus, TeamResponse, TeamRunAckResponse, TeamRunPayload,
+    TeamRunSource, TeamRunStateResponse, TeamRunStatus, TeamRunTargetRole, TeamRuntimeSeed,
+    TeamSendMessageQueuedResponse, TeamSessionBinding, TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload,
+    TeamSlotBlockedReason, TeamSlotWorkPayload, TeamSlotWorkState, TeamWorkEventResponse, TeamWorkItemResponse,
+    TeamWorkItemSnapshotResponse, TeamWorkSubmissionResponse, TeammateMessagePayload,
+};
+pub use team_coordination::{
+    TeamCoordinationMigrationRequest, TeamCoordinationMigrationResponse, TeamCoordinationMigrationSnapshot,
 };
 pub use team_mcp::{TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig};
 pub use team_tools::{
@@ -191,7 +197,7 @@ pub use team_work_command::{
     ReviewTeamWorkRequest, TeamWorkChangedPayload, TeamWorkCommandDeliveryResponse, TeamWorkCommandResponse,
     TeamWorkDeliveryRequirement, TeamWorkReviewDecision,
 };
-pub use websocket::WebSocketMessage;
+pub use websocket::{RuntimeEventGap, RuntimeSubscriptionReady, RuntimeSubscriptionRequest, WebSocketMessage};
 
 #[cfg(test)]
 mod public_contract_tests {

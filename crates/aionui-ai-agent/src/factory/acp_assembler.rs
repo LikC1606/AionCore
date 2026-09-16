@@ -1,3 +1,4 @@
+use crate::manager::acp::TrustedMcpToolPolicy;
 use crate::shared_kernel::PersistedSessionState;
 use agent_client_protocol::schema::{EnvVariable, McpServer, McpServerStdio, NewSessionRequest};
 use aionui_api_types::AgentMetadata;
@@ -27,6 +28,10 @@ pub struct AcpSessionParams {
     pub command_spec: CommandSpec,
     pub config: AcpBuildExtra,
     pub mcp_servers: Vec<McpServer>,
+    /// Exact MCP tool/action capabilities whose approvals may be handled
+    /// without an interactive user prompt. The factory derives this list from
+    /// operator-owned runtime bindings; model output never populates it.
+    pub auto_approve_mcp_tools: Vec<TrustedMcpToolPolicy>,
     pub preset_context: Option<String>,
     pub session_snapshot: Option<PersistedSessionState>,
     /// Backend data directory (`AppConfig.data_dir`) used for process
@@ -105,6 +110,7 @@ pub async fn assemble_acp_params(
         command_spec,
         config,
         mcp_servers,
+        auto_approve_mcp_tools: Vec::new(),
         preset_context,
         session_snapshot,
         data_dir,

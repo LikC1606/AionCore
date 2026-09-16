@@ -74,6 +74,18 @@ fn clean_agent_env(env: &mut BTreeMap<OsString, OsString>) {
         remove_env_key(env, key);
     }
     env.retain(|key, _| !env_key_starts_with(key, "npm_"));
+    // Budget identity is assigned per session after this ambient environment is
+    // cleaned. Never inherit another actor's binding from Core or a login shell.
+    env.retain(|key, _| !is_math_budget_env(key));
+    remove_env_key(env, "DEEPSCIENTIST_MATH_REQUEST_GROUP");
+    remove_env_key(env, "DEEPSCIENTIST_MATH_REQUEST_GATE_SECRET");
+    remove_env_key(env, "DEEPSCIENTIST_MATH_REQUEST_GATE_URL");
+}
+
+fn is_math_budget_env(key: &std::ffi::OsStr) -> bool {
+    key.to_string_lossy()
+        .to_ascii_uppercase()
+        .starts_with("DEEPSCIENTIST_MATH_BUDGET_")
 }
 
 fn get_env_value<'a>(env: &'a [(OsString, OsString)], key: &str) -> Option<&'a OsString> {
@@ -143,6 +155,9 @@ async fn load_full_shell_env() -> Vec<(OsString, OsString)> {
     // on every cold Core process before the inherited environment is usable.
     let result = tokio::time::timeout(Duration::from_millis(1_000), async {
         let mut builder = Builder::clean_cli(&shell);
+        for (key, _) in std::env::vars_os().filter(|(key, _)| is_math_budget_env(key)) {
+            builder.env_remove(key);
+        }
         builder.args(["-l", "-c", "env"]);
         builder.output().await
     })
@@ -231,6 +246,36 @@ mod tests {
 
     const CHILD_MARKER: &str = "AIONUI_RUNTIME_AGENT_ENV_TEST_CHILD";
 
+    #[test]
+    fn ambient_budget_bindings_are_removed_from_core_and_shell_environments() {
+        let current = vec![
+            ("DEEPSCIENTIST_MATH_BUDGET_SECRET".into(), "core-secret".into()),
+            ("DEEPSCIENTIST_MATH_BUDGET_MAX_OUTPUT_TOKENS".into(), "1024".into()),
+            ("DEEPSCIENTIST_MATH_REQUEST_GATE_SECRET".into(), "gate-secret".into()),
+            (
+                "DEEPSCIENTIST_MATH_REQUEST_GATE_URL".into(),
+                "http://127.0.0.1:1234".into(),
+            ),
+            ("WESTLAKEHPC_API_KEY".into(), "provider-fixture".into()),
+        ];
+        let shell = vec![
+            ("DEEPSCIENTIST_MATH_BUDGET_SOCKET".into(), "/private/stale.sock".into()),
+            ("deepscientist_math_budget_future".into(), "stale".into()),
+            ("DEEPSCIENTIST_MATH_REQUEST_GROUP".into(), "/stale/run".into()),
+            ("UNRELATED".into(), "kept".into()),
+        ];
+        assert_eq!(
+            build_agent_process_env(current, shell),
+            vec![
+                (OsString::from("UNRELATED"), OsString::from("kept")),
+                (
+                    OsString::from("WESTLAKEHPC_API_KEY"),
+                    OsString::from("provider-fixture")
+                ),
+            ]
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn agent_process_env_merges_full_shell_env_and_cleans_pollution() {
@@ -240,6 +285,7 @@ mod tests {
             write_fake_shell(
                 &shell,
                 r#"#!/bin/sh
+printf 'AIONUI_BUDGET_PROBE=%s\n' "${DEEPSCIENTIST_MATH_BUDGET_SECRET:-unset}"
 printf '%s\n' \
   'AIONUI_SHELL_ONLY=from-shell' \
   'AIONUI_OVERLAY=from-shell' \
@@ -262,6 +308,7 @@ printf '%s\n' \
                 .env("NODE_OPTIONS", "--require parent")
                 .env("CLAUDECODE", "1")
                 .env("npm_config_cache", "/tmp/parent-cache")
+                .env("DEEPSCIENTIST_MATH_BUDGET_SECRET", "ambient-fixture")
                 .output()
                 .unwrap();
             assert!(
@@ -281,6 +328,7 @@ printf '%s\n' \
         };
 
         assert_eq!(value("AIONUI_CURRENT_ONLY").as_deref(), Some("from-current"));
+        assert_eq!(value("AIONUI_BUDGET_PROBE").as_deref(), Some("unset"));
         assert_eq!(value("AIONUI_SHELL_ONLY").as_deref(), Some("from-shell"));
         assert_eq!(value("AIONUI_OVERLAY").as_deref(), Some("from-current"));
         assert_eq!(value("NODE_OPTIONS"), None);

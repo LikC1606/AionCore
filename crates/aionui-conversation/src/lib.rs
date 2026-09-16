@@ -5,6 +5,7 @@ mod acp_error_recovery;
 mod agent_health_policy;
 mod convert;
 pub mod error;
+mod math_fair_turn_gate;
 pub(crate) mod message_cursor;
 mod message_persistence;
 pub mod response_middleware;
@@ -32,8 +33,9 @@ pub use response_middleware::{MessageMiddleware, MiddlewareResult, strip_think_t
 pub use routes::conversation_routes;
 pub use routes_aux::conversation_ops_routes;
 pub use service::{
-    ConversationAgentTurnOutcome, ConversationAgentTurnRequest, ConversationAgentTurnStarted,
-    ConversationAgentTurnStartedCallback, ConversationAgentTurnStatus, ConversationService,
+    ConversationAgentTurnFailureKind, ConversationAgentTurnOutcome, ConversationAgentTurnRequest,
+    ConversationAgentTurnStarted, ConversationAgentTurnStartedCallback, ConversationAgentTurnStatus,
+    ConversationService,
 };
 pub use state::ConversationRouterState;
 

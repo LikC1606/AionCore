@@ -65,12 +65,79 @@ impl<'de> Deserialize<'de> for TeamAgentInput {
     }
 }
 
+/// Immutable Team coordination authority, independent of the agent transport.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TeamCoordinationProtocol {
+    CoreNative {},
+    ManagedMcp {
+        #[serde(rename = "logicalTool")]
+        logical_tool: TeamManagedTool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamManagedTool {
+    ResearchTeam,
+}
+
+impl TeamCoordinationProtocol {
+    pub fn is_managed(self) -> bool {
+        matches!(self, Self::ManagedMcp { .. })
+    }
+}
+
+impl Default for TeamCoordinationProtocol {
+    fn default() -> Self {
+        Self::CoreNative {}
+    }
+}
+
+#[cfg(test)]
+mod coordination_protocol_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn managed_protocol_round_trips_without_losing_the_tool() {
+        let wire = json!({"kind":"managed_mcp", "logicalTool":"research_team"});
+        let protocol: TeamCoordinationProtocol = serde_json::from_value(wire.clone()).unwrap();
+        assert!(protocol.is_managed());
+        assert_eq!(serde_json::to_value(protocol).unwrap(), wire);
+    }
+
+    #[test]
+    fn legacy_create_request_defaults_to_native() {
+        let request: CreateTeamRequest = serde_json::from_value(json!({"name":"ordinary", "agents":[]})).unwrap();
+        assert_eq!(request.coordination_protocol, TeamCoordinationProtocol::CoreNative {});
+    }
+
+    #[test]
+    fn unknown_or_malformed_protocols_never_fall_back_to_native() {
+        for wire in [
+            json!(null),
+            json!({"kind":"unknown"}),
+            json!({"kind":"managed_mcp"}),
+            json!({"kind":"managed_mcp", "logicalTool":"other"}),
+            json!({"kind":"managed_mcp", "logicalTool":"research_team", "unexpected":true}),
+            json!({"kind":"core_native", "logicalTool":"research_team"}),
+            json!({"kind":"legacy_managed_migration_required"}),
+        ] {
+            assert!(
+                serde_json::from_value::<TeamCoordinationProtocol>(wire.clone()).is_err(),
+                "{wire}"
+            );
+        }
+    }
+}
+
 /// Request body for `POST /api/teams`.
-///
-/// Creates a team with the given name and agent list.
 /// Exactly one agent with role `lead` or `leader` is designated as the lead.
 #[derive(Debug, Deserialize)]
 pub struct CreateTeamRequest {
+    #[serde(default, alias = "coordinationProtocol")]
+    pub coordination_protocol: TeamCoordinationProtocol,
     pub name: String,
     #[serde(alias = "assistants")]
     pub agents: Vec<TeamAgentInput>,
@@ -456,6 +523,8 @@ pub struct TeamAgentResponse {
 /// Corresponds to the `TTeam` shared type in the API Spec.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TeamResponse {
+    #[serde(default)]
+    pub coordination_protocol: TeamCoordinationProtocol,
     pub id: String,
     #[serde(default)]
     pub user_id: String,
@@ -1077,6 +1146,7 @@ mod tests {
     #[test]
     fn serialize_team_response_snake_case() {
         let team = TeamResponse {
+            coordination_protocol: Default::default(),
             id: "team-1".into(),
             user_id: "user-1".into(),
             name: "Alpha".into(),
@@ -1118,6 +1188,7 @@ mod tests {
     #[test]
     fn serialize_team_response_no_lead() {
         let team = TeamResponse {
+            coordination_protocol: Default::default(),
             id: "team-2".into(),
             user_id: "user-1".into(),
             name: "Beta".into(),
@@ -1226,6 +1297,7 @@ mod tests {
     #[test]
     fn team_response_roundtrip() {
         let team = TeamResponse {
+            coordination_protocol: Default::default(),
             id: "team-1".into(),
             user_id: "user-1".into(),
             name: "Alpha".into(),

@@ -34,6 +34,7 @@ async fn seed_command_team(services: &aionui_app::AppServices, team_id: &str, us
     ]);
     SqliteTeamRepository::new(services.database.pool().clone())
         .create_team(&TeamRow {
+            coordination_protocol: None,
             id: team_id.to_owned(),
             user_id: user_id.to_owned(),
             name: "Command Team".into(),

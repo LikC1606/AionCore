@@ -80,12 +80,32 @@ impl<'a> SessionContextBuilder<'a> {
         let agent_type: AgentType = string_to_enum(&row.r#type)?;
         reject_deprecated_runtime_kind(row, &agent_type)?;
         let extra = parse_extra(row)?;
+        let budget_required = extra.pointer("/mathematics_runtime/budget_required");
+        if budget_required.is_some_and(|value| !value.is_boolean()) {
+            return Err(ConversationError::bad_request("math_budget_required_invalid"));
+        }
+        let budget_required = budget_required.and_then(serde_json::Value::as_bool).unwrap_or(false);
         let workspace = self.resolve_workspace(row, &agent_type, &extra, workspace_override)?;
         let model = provider_model_from_conversation_row(row);
         let skills = parse_string_array(extra.get("skills").cloned()).unwrap_or_default();
         let team = TeamSessionBinding::from_extra_value(&extra).map_err(|e| ConversationError::BadRequest {
             reason: format!("Invalid Team runtime context: {e}"),
         })?;
+        let mut runtime_env = if budget_required {
+            vec![("DEEPSCIENTIST_MATH_BUDGET_REQUIRED".into(), "1".into())]
+        } else {
+            Vec::new()
+        };
+        if let Some(inputs) = crate::service::math_run_inputs::from_persisted_extra(&row.extra)
+            .map_err(|_| ConversationError::bad_request(crate::service::math_run_inputs::INTEGRITY_MESSAGE))?
+        {
+            // Turn orchestration verifies the frozen bytes before construction and
+            // before dispatch, preserving its structured integrity failure outcome.
+            runtime_env.push((
+                "DEEPSCIENTIST_MATH_REQUEST_GROUP".into(),
+                inputs.root.to_string_lossy().into_owned(),
+            ));
+        }
         let kind = self.build_kind(row, &agent_type, extra, team.clone(), seed).await?;
 
         Ok(AgentSessionContext {
@@ -98,7 +118,7 @@ impl<'a> SessionContextBuilder<'a> {
             workspace,
             model,
             skills,
-            runtime_env: Vec::new(),
+            runtime_env,
             team,
             kind,
         })
@@ -460,7 +480,28 @@ fn apply_team_seed_to_aionrs_config(team: &Option<TeamSessionBinding>, config: &
 }
 
 fn parse_extra(row: &ConversationRow) -> Result<serde_json::Value, ConversationError> {
-    serde_json::from_str(&row.extra).map_err(|e| ConversationError::internal(format!("Invalid extra JSON: {e}")))
+    let extra: serde_json::Value = serde_json::from_str(&row.extra)
+        .map_err(|e| ConversationError::internal(format!("Invalid extra JSON: {e}")))?;
+    reject_persisted_budget_environment(&extra)?;
+    Ok(extra)
+}
+
+fn reject_persisted_budget_environment(extra: &serde_json::Value) -> Result<(), ConversationError> {
+    let Some(entries) = extra.get("runtime_env").and_then(serde_json::Value::as_array) else {
+        return Ok(());
+    };
+    if entries.iter().any(|entry| {
+        entry
+            .as_array()
+            .and_then(|pair| pair.first())
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|name| name.to_ascii_uppercase().starts_with("DEEPSCIENTIST_MATH_BUDGET_"))
+    }) {
+        return Err(ConversationError::BadRequest {
+            reason: "math_budget_environment_must_not_be_persisted".into(),
+        });
+    }
+    Ok(())
 }
 
 fn reject_deprecated_runtime_kind(row: &ConversationRow, agent_type: &AgentType) -> Result<(), ConversationError> {
@@ -779,6 +820,38 @@ mod tests {
 
         let err = repos.builder().build(&row).await.unwrap_err();
         assert!(err.to_string().contains("requires agent_id"));
+    }
+
+    #[test]
+    fn persisted_budget_environment_is_rejected_without_echoing_secret() {
+        let extra = serde_json::json!({
+            "runtime_env": [["DEEPSCIENTIST_MATH_BUDGET_SECRET", "fixture-secret"]]
+        });
+        let error = reject_persisted_budget_environment(&extra).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("math_budget_environment_must_not_be_persisted")
+        );
+        assert!(!error.to_string().contains("fixture-secret"));
+    }
+
+    #[tokio::test]
+    async fn math_budget_required_survives_context_reconstruction_without_secrets() {
+        let repos = setup().await;
+        upsert_builtin(&repos, "builtin-codex-test", "codex").await;
+        let row = row(
+            "acp",
+            serde_json::json!({
+                "backend": "codex", "mathematics_runtime": { "budget_required": true }
+            }),
+            None,
+        );
+        let context = repos.builder().build(&row).await.unwrap();
+        assert_eq!(
+            context.runtime_env,
+            vec![("DEEPSCIENTIST_MATH_BUDGET_REQUIRED".into(), "1".into())]
+        );
     }
 
     #[tokio::test]

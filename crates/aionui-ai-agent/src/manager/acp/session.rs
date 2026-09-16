@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use agent_client_protocol::schema::{
-    AgentCapabilities, AuthMethod, AvailableCommand, SessionConfigKind, SessionConfigOption,
+    AgentCapabilities, AuthMethod, AvailableCommand, ModelInfo, SessionConfigKind, SessionConfigOption,
     SessionConfigOptionCategory, SessionConfigSelectOptions, SessionModeState, SessionModelState, UsageUpdate,
 };
 
@@ -731,7 +731,12 @@ impl AcpSession {
         {
             return SessionModelState::new(desired_model_id.to_owned(), models.available_models.clone());
         }
-        models
+        // Keep an explicitly requested runtime model even when the ACP
+        // adapter's advertised catalog is stale or incomplete. Dropping it
+        // silently causes a fallback to the default model.
+        let mut available = models.available_models.clone();
+        available.push(ModelInfo::new(desired_model_id.to_owned(), desired_model_id.to_owned()));
+        SessionModelState::new(desired_model_id.to_owned(), available)
     }
 
     pub fn apply_advertised_config_options(&mut self, options: Vec<SessionConfigOption>) {

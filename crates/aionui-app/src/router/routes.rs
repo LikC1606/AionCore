@@ -87,7 +87,7 @@ pub async fn create_router_with_runtime(services: &AppServices) -> Result<(Route
         };
         let resolve_user = move |token: &str| jwt_service.verify(token).ok().map(|claims| claims.user_id);
 
-        while let Ok(event) = event_rx.recv().await {
+        while let Some(event) = ws_manager.receive_event(&mut event_rx).await {
             if !event.name.starts_with("team.") {
                 ws_manager.broadcast_all(event);
                 continue;
@@ -95,6 +95,7 @@ pub async fn create_router_with_runtime(services: &AppServices) -> Result<(Route
 
             let Some(team_id) = event.data.get("team_id").and_then(serde_json::Value::as_str) else {
                 tracing::warn!(event_name = %event.name, "Team WebSocket event without team_id was dropped");
+                ws_manager.report_event_gap(1);
                 continue;
             };
             let owner_user_id = match team_repo.get_team(team_id).await {
@@ -119,6 +120,7 @@ pub async fn create_router_with_runtime(services: &AppServices) -> Result<(Route
                     team_id,
                     "Team WebSocket event has no authorized owner mapping and was dropped"
                 );
+                ws_manager.report_event_gap(1);
                 continue;
             };
 

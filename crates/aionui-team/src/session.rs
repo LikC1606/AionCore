@@ -31,7 +31,7 @@ use crate::ports::{AgentTurnCancellationPort, AgentTurnExecutionPort};
 use crate::prompt_dump::{TeamPromptDumpConfig, TeamWakePromptDump, dump_team_wake_prompt};
 use crate::prompts::{build_lead_prompt_for_transport, build_teammate_prompt_for_transport, build_wake_payload};
 use crate::provisioning::PersistSpawnedAgentRequest;
-use crate::scheduler::{TeammateManager, normalize_name};
+use crate::scheduler::{TeammateManager, is_settled, normalize_name};
 use crate::service::TeamSessionService;
 use crate::team_run::{ACTIVE_TURN_SLOW_THRESHOLD_MS, TeamRunManager, target_role_for};
 use crate::tool_executor::TeamToolContext;
@@ -183,12 +183,10 @@ impl TeamSession {
             team_run_manager.clone(),
         ));
 
-        let scheduler = Arc::new(TeammateManager::new(
-            team.id.clone(),
-            &team.agents,
-            mailbox.clone(),
-            broadcaster.clone(),
-        ));
+        let scheduler = Arc::new(
+            TeammateManager::new(team.id.clone(), &team.agents, mailbox.clone(), broadcaster.clone())
+                .with_coordination_protocol(team.coordination_protocol),
+        );
 
         let auth_token = aionui_common::generate_id();
         let mcp_server = TeamMcpServer::start_with_prompt_dump(
@@ -206,6 +204,7 @@ impl TeamSession {
         info!(
             team_id = %team.id,
             port = mcp_server.port(),
+            coordination_protocol = ?team.coordination_protocol,
             "TeamSession started"
         );
 
@@ -455,7 +454,9 @@ impl TeamSession {
                     .into_iter()
                     .filter(|message| claimed_ids.contains(message.id.as_str()))
                     .collect::<Vec<_>>();
-                let work_summary = if let Some(service) = self.service.upgrade() {
+                let work_summary = if self.team.coordination_protocol.is_managed() {
+                    Some(String::new())
+                } else if let Some(service) = self.service.upgrade() {
                     let context = TeamToolContext {
                         team_id: self.team.id.clone(),
                         caller_slot_id: agent.slot_id.clone(),
@@ -481,7 +482,7 @@ impl TeamSession {
                 };
                 let wake_body = build_wake_payload(&agent, &claimed_unread, work_summary.as_deref());
                 let needs_role_prompt = self.scheduler.take_needs_role_prompt(slot_id).await;
-                let first_message = if needs_role_prompt {
+                let first_message = if needs_role_prompt && !self.team.coordination_protocol.is_managed() {
                     let tool_transport = self.team_tool_transport_for_agent(&agent).await?;
                     let role_prompt = match agent.role {
                         TeammateRole::Lead => build_lead_prompt_for_transport(
@@ -1113,9 +1114,8 @@ impl TeamSession {
             // status exists.  Re-notifying in those states creates a fresh
             // event-loop wake every scan and was the source of minute-by-
             // minute duplicate Lead notifications.
-            if self.scheduler.is_wake_active(&agent.slot_id)
-                || self.scheduler.get_status(&agent.slot_id).await? != TeammateStatus::Idle
-            {
+            let status = self.scheduler.get_status(&agent.slot_id).await?;
+            if self.scheduler.is_wake_active(&agent.slot_id) || !is_settled(status) {
                 continue;
             }
             if let Some(work) = self.work_coordinator.slot_snapshot(&agent.slot_id)
@@ -1465,6 +1465,61 @@ impl TeamSession {
             .await?;
         self.wake_leader_after_recovery_message(failed_slot_id, WorkSource::SpawnAttachFailure)
             .await
+    }
+
+    /// Recover a Lead turn whose ACP stream disconnected after it already
+    /// performed Team side effects. The original batch is replaced atomically
+    /// by a single continuation intent; no Worker is dispatched again.
+    pub(crate) async fn recover_leader_transport_failure(
+        &self,
+        batch: &WorkBatch,
+        reason: &str,
+    ) -> Result<(), TeamError> {
+        let lead_slot_id = self
+            .scheduler
+            .find_lead_slot_id()
+            .await
+            .ok_or_else(|| TeamError::AgentNotFound("lead".into()))?;
+        if batch.slot_id != lead_slot_id {
+            return Err(TeamError::InvalidRequest(
+                "transport recovery is only supported for the Lead slot".into(),
+            ));
+        }
+
+        let content = leader_transport_recovery_prompt(self.scheduler.coordination_protocol, reason);
+        let recovery = self
+            .mailbox
+            .write_with_files_idempotent(
+                &self.team.id,
+                &lead_slot_id,
+                "system",
+                MailboxMessageType::IdleNotification,
+                &content,
+                Some("Lead transport recovery"),
+                None,
+                "team_lead_transport_recovery",
+                &format!("{}:{}", self.team.id, batch.batch_id),
+            )
+            .await?;
+        let recovery_message_id = recovery.message.id.clone();
+        match self
+            .work_coordinator
+            .recover_transport_batch(batch, recovery_message_id)
+        {
+            CommitResult::Committed => {
+                if !batch.mailbox_message_ids.is_empty() {
+                    self.mailbox.mark_read_batch(&batch.mailbox_message_ids).await?;
+                }
+                self.event_loops.notify(&lead_slot_id);
+                Ok(())
+            }
+            CommitResult::StaleOwner => Err(TeamError::InvalidRequest(
+                "Lead transport recovery lost ownership of the failed batch".into(),
+            )),
+            CommitResult::Rejected => Err(TeamError::InvalidRequest(
+                "Lead transport recovery continuation was rejected".into(),
+            )),
+        }
     }
 
     pub(crate) async fn wake_leader_after_recovery_message(
@@ -1837,10 +1892,11 @@ impl TeamSession {
         mcp_stdio_cfg: crate::mcp::TeamMcpStdioConfig,
         user_id: &str,
         task_manager: &Arc<dyn IWorkerTaskManager>,
+        coordination_protocol: aionui_api_types::TeamCoordinationProtocol,
     ) -> Result<(), TeamError> {
         service
             .provisioner()
-            .attach_agent_process(user_id, agent, mcp_stdio_cfg, task_manager)
+            .attach_agent_process(user_id, agent, mcp_stdio_cfg, task_manager, coordination_protocol)
             .await
     }
 
@@ -1954,6 +2010,7 @@ pub(crate) async fn attach_member_runtime(
                 session.mcp_stdio_config(&agent.slot_id),
                 &user_id,
                 &task_manager,
+                session.team.coordination_protocol,
             )
             .await
         }
@@ -2152,6 +2209,17 @@ async fn cleanup_stale_attach(
     );
 }
 
+fn leader_transport_recovery_prompt(protocol: aionui_api_types::TeamCoordinationProtocol, reason: &str) -> String {
+    let completion = if protocol.is_managed() {
+        "Resume only unfinished work and follow the managed tool's durable completion contract. A text marker does not establish completion."
+    } else {
+        "Resume only unfinished work, then submit DEEPSCIENTIST_SOLUTION_READY yourself when the solution is complete."
+    };
+    format!(
+        "The Lead model stream disconnected before completing this turn. Continue from the current Team state. Preserve all existing Worker deliveries, workspace changes, and integrated commits; do not repeat completed assignments or dispatch the same Worker again. {completion} Transport detail: {reason}"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2165,6 +2233,24 @@ mod tests {
     use aionui_api_types::WebSocketMessage;
     use aionui_common::{AgentKillReason, TimestampMs};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn managed_transport_recovery_does_not_restore_native_completion_protocol() {
+        let protocol = aionui_api_types::TeamCoordinationProtocol::ManagedMcp {
+            logical_tool: aionui_api_types::TeamManagedTool::ResearchTeam,
+        };
+        let prompt = leader_transport_recovery_prompt(protocol, "stream closed");
+        assert!(prompt.contains("managed tool's durable completion contract"));
+        assert!(!prompt.contains("DEEPSCIENTIST_SOLUTION_READY"));
+        assert!(!prompt.contains("team_inspect"));
+    }
+
+    #[test]
+    fn native_transport_recovery_preserves_existing_completion_contract() {
+        let prompt = leader_transport_recovery_prompt(Default::default(), "stream closed");
+        assert!(prompt.contains("submit DEEPSCIENTIST_SOLUTION_READY"));
+        assert!(prompt.contains("do not repeat completed assignments"));
+    }
 
     struct NullBroadcaster;
     impl EventBroadcaster for NullBroadcaster {
@@ -2399,6 +2485,7 @@ mod tests {
 
     fn make_team() -> Team {
         Team {
+            coordination_protocol: Default::default(),
             id: "t1".into(),
             user_id: "user-test".into(),
             name: "Test Team".into(),

@@ -151,6 +151,7 @@ printf '%s\n' \
   'AIONUI_OVERLAY=from-shell' \
   'PATH=/shell/bin:/bin:/usr/bin' \
   'NODE_OPTIONS=--inspect' \
+  'DEEPSCIENTIST_MATH_BUDGET_SOCKET=/private/stale.sock' \
   'npm_lifecycle_event=start'
 "#,
             );
@@ -166,6 +167,8 @@ printf '%s\n' \
                 .env("PATH", "/bin:/usr/bin")
                 .env("NODE_OPTIONS", "--require parent")
                 .env("npm_config_cache", "/tmp/parent-cache")
+                .env("DEEPSCIENTIST_MATH_BUDGET_SECRET", "ambient-fixture")
+                .env("DEEPSCIENTIST_MATH_BUDGET_MAX_OUTPUT_TOKENS", "9999")
                 .output()
                 .unwrap();
             assert!(
@@ -178,12 +181,15 @@ printf '%s\n' \
         }
 
         let mut config = simple_script_config(
-            "printf 'shell=%s\nconfig=%s\noverlay=%s\nnpm=%s\nnode=%s\n' \
+            "printf 'shell=%s\nconfig=%s\noverlay=%s\nnpm=%s\nnode=%s\nbudget_socket=%s\nbudget_secret=%s\nbudget_output=%s\n' \
              \"${AIONUI_SHELL_ONLY:-unset}\" \
              \"${AIONUI_CONFIG_ONLY:-unset}\" \
              \"${AIONUI_OVERLAY:-unset}\" \
              \"${npm_lifecycle_event:-unset}\" \
-             \"${NODE_OPTIONS:-unset}\"",
+             \"${NODE_OPTIONS:-unset}\" \
+             \"${DEEPSCIENTIST_MATH_BUDGET_SOCKET:-unset}\" \
+             \"${DEEPSCIENTIST_MATH_BUDGET_SECRET:-unset}\" \
+             \"${DEEPSCIENTIST_MATH_BUDGET_MAX_OUTPUT_TOKENS:-unset}\"",
         );
         config.env.push(EnvVar {
             name: "AIONUI_CONFIG_ONLY".into(),
@@ -192,6 +198,10 @@ printf '%s\n' \
         config.env.push(EnvVar {
             name: "AIONUI_OVERLAY".into(),
             value: "from-config".into(),
+        });
+        config.env.push(EnvVar {
+            name: "DEEPSCIENTIST_MATH_BUDGET_MAX_OUTPUT_TOKENS".into(),
+            value: "1024".into(),
         });
 
         let proc = CliAgentProcess::spawn_for_sdk(config).await.unwrap();
@@ -205,6 +215,9 @@ printf '%s\n' \
         assert!(output.contains("overlay=from-config"), "{output}");
         assert!(output.contains("npm=unset"), "{output}");
         assert!(output.contains("node=unset"), "{output}");
+        assert!(output.contains("budget_socket=unset"), "{output}");
+        assert!(output.contains("budget_secret=unset"), "{output}");
+        assert!(output.contains("budget_output=1024"), "{output}");
     }
 
     #[cfg(unix)]

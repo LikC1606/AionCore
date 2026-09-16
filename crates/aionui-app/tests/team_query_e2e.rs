@@ -10,6 +10,7 @@ use common::{body_json, build_app, get_request, get_with_token, setup_and_login}
 async fn seed_team(services: &aionui_app::AppServices, id: &str, user_id: &str) {
     SqliteTeamRepository::new(services.database.pool().clone())
         .create_team(&TeamRow {
+            coordination_protocol: None,
             id: id.to_owned(),
             user_id: user_id.to_owned(),
             name: format!("Team {id}"),

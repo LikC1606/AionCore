@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 /// The `agents` column stores a JSON array of `TeamAgent` objects.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct TeamRow {
+    /// Immutable JSON protocol. NULL denotes a legacy ordinary Team.
+    #[serde(default)]
+    pub coordination_protocol: Option<String>,
     pub id: String,
     pub user_id: String,
     pub name: String,
@@ -48,6 +51,7 @@ mod tests {
     #[test]
     fn team_row_default_agents_is_empty_json_array() {
         let row = TeamRow {
+            coordination_protocol: None,
             id: "t1".into(),
             user_id: "system_default_user".into(),
             name: "Team".into(),

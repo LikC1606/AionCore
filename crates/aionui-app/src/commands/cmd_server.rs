@@ -19,6 +19,11 @@ use crate::bootstrap::{BootstrapError, BootstrapErrorCode, ParentExitSignal, Ser
 
 const LISTENING_EVENT_PREFIX: &str = "AIONCORE_LISTENING";
 const DYNAMIC_BACKEND_BIND_MAX_ATTEMPTS: usize = 50;
+/// Port selected for a dynamic listener is part of the durable local-server
+/// identity.  Headless Team runners persist the Core URL alongside the Team
+/// id, so choosing a new ephemeral port after a Core restart would make an
+/// otherwise recoverable Team look like it belongs to another instance.
+const PERSISTED_DYNAMIC_PORT_FILE: &str = ".aioncore-listen-port";
 const WORKER_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const TEAM_MAILBOX_RECOVERY_INTERVAL: Duration = Duration::from_secs(60);
 const TEAM_GIT_INTEGRATION_RECOVERY_INTERVAL: Duration = Duration::from_secs(60);
@@ -38,8 +43,11 @@ pub(crate) struct BoundHttpListener {
 }
 
 /// Bind the main HTTP listener before constructing services that may start
-/// their own local listeners. When `config.port == 0`, the OS-selected port is
-/// written back to the config before downstream services are built.
+/// their own local listeners. When `config.port == 0`, reuse the port selected
+/// by the previous process for this data directory; the first successful
+/// dynamic bind is persisted before downstream services are built. This keeps
+/// a run's loopback URL stable across a Core restart without changing the
+/// explicit `--port` contract.
 pub(crate) async fn bind_http_listener(config: &mut AppConfig) -> Result<BoundHttpListener, BootstrapError> {
     if config.port != 0 && is_fetch_forbidden_backend_port(config.port) {
         return Err(BootstrapError::new(
@@ -51,7 +59,12 @@ pub(crate) async fn bind_http_listener(config: &mut AppConfig) -> Result<BoundHt
     }
 
     let dynamic_port = config.port == 0;
-    let max_attempts = if dynamic_port {
+    let persisted_port = dynamic_port.then(|| read_persisted_dynamic_port(config)).flatten();
+    if let Some(port) = persisted_port {
+        info!(port, path = %persisted_dynamic_port_path(config).display(), "startup: reusing persisted dynamic backend port");
+        config.port = port;
+    }
+    let max_attempts = if dynamic_port && persisted_port.is_none() {
         DYNAMIC_BACKEND_BIND_MAX_ATTEMPTS
     } else {
         1
@@ -87,6 +100,9 @@ pub(crate) async fn bind_http_listener(config: &mut AppConfig) -> Result<BoundHt
         }
 
         config.port = local_addr.port();
+        if dynamic_port {
+            persist_dynamic_port(config, local_addr.port())?;
+        }
         info!(address = %local_addr, "startup: socket bind completed");
         emit_listening_event(local_addr);
 
@@ -101,6 +117,83 @@ pub(crate) async fn bind_http_listener(config: &mut AppConfig) -> Result<BoundHt
         "bind.dynamic_port",
         "failed to bind HTTP listener",
     ))
+}
+
+fn persisted_dynamic_port_path(config: &AppConfig) -> std::path::PathBuf {
+    config.data_dir.join(PERSISTED_DYNAMIC_PORT_FILE)
+}
+
+fn read_persisted_dynamic_port(config: &AppConfig) -> Option<u16> {
+    let path = persisted_dynamic_port_path(config);
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            warn!(path = %path.display(), error = %error, "startup: could not read persisted dynamic backend port; selecting a new port");
+            return None;
+        }
+    };
+    let port = match raw.trim().parse::<u16>() {
+        Ok(port) if port != 0 && !is_fetch_forbidden_backend_port(port) => port,
+        _ => {
+            warn!(path = %path.display(), "startup: ignoring invalid persisted dynamic backend port");
+            return None;
+        }
+    };
+    Some(port)
+}
+
+fn persist_dynamic_port(config: &AppConfig, port: u16) -> Result<(), BootstrapError> {
+    let path = persisted_dynamic_port_path(config);
+    let temporary = path.with_file_name(format!(".{}.tmp-{}", PERSISTED_DYNAMIC_PORT_FILE, std::process::id()));
+    std::fs::create_dir_all(&config.data_dir).map_err(|error| {
+        BootstrapError::new(
+            BootstrapErrorCode::BindFailed,
+            "bind.dynamic_port_persist",
+            "failed to persist dynamic HTTP listener port",
+        )
+        .with_source(error)
+    })?;
+    std::fs::write(&temporary, format!("{port}\n")).map_err(|error| {
+        BootstrapError::new(
+            BootstrapErrorCode::BindFailed,
+            "bind.dynamic_port_persist",
+            "failed to persist dynamic HTTP listener port",
+        )
+        .with_source(error)
+    })?;
+    if let Err(error) = std::fs::rename(&temporary, &path) {
+        // Windows does not replace an existing destination with rename. The
+        // target is only a small derived metadata file, so remove it and
+        // complete the atomic temp-file handoff on that platform.
+        if cfg!(windows) {
+            std::fs::remove_file(&path).map_err(|remove_error| {
+                BootstrapError::new(
+                    BootstrapErrorCode::BindFailed,
+                    "bind.dynamic_port_persist",
+                    "failed to replace persisted dynamic HTTP listener port",
+                )
+                .with_source(remove_error)
+            })?;
+            std::fs::rename(&temporary, &path).map_err(|rename_error| {
+                BootstrapError::new(
+                    BootstrapErrorCode::BindFailed,
+                    "bind.dynamic_port_persist",
+                    "failed to persist dynamic HTTP listener port",
+                )
+                .with_source(rename_error)
+            })?;
+        } else {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(BootstrapError::new(
+                BootstrapErrorCode::BindFailed,
+                "bind.dynamic_port_persist",
+                "failed to persist dynamic HTTP listener port",
+            )
+            .with_source(error));
+        }
+    }
+    Ok(())
 }
 
 fn is_fetch_forbidden_backend_port(port: u16) -> bool {
@@ -481,8 +574,10 @@ mod tests {
 
     #[tokio::test]
     async fn bind_http_listener_updates_dynamic_port_config() {
+        let data_dir = tempfile::tempdir().expect("temporary data dir");
         let mut config = AppConfig {
             port: 0,
+            data_dir: data_dir.path().to_path_buf(),
             ..AppConfig::default()
         };
 
@@ -490,6 +585,55 @@ mod tests {
 
         assert!(config.port > 0);
         assert_eq!(config.port, bound.addr.port());
+        assert_eq!(
+            std::fs::read_to_string(persisted_dynamic_port_path(&config)).unwrap(),
+            format!("{}\n", config.port)
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_listener_reuses_port_after_core_restart() {
+        let data_dir = tempfile::tempdir().expect("temporary data dir");
+        let mut first = AppConfig {
+            port: 0,
+            data_dir: data_dir.path().to_path_buf(),
+            ..AppConfig::default()
+        };
+        let first_bound = bind_http_listener(&mut first).await.expect("first bind should succeed");
+        let first_port = first_bound.addr.port();
+        drop(first_bound);
+
+        let mut restarted = AppConfig {
+            port: 0,
+            data_dir: data_dir.path().to_path_buf(),
+            ..AppConfig::default()
+        };
+        let restarted_bound = bind_http_listener(&mut restarted)
+            .await
+            .expect("restart should reuse the persisted port");
+
+        assert_eq!(restarted.port, first_port);
+        assert_eq!(restarted_bound.addr.port(), first_port);
+    }
+
+    #[tokio::test]
+    async fn invalid_persisted_dynamic_port_is_replaced() {
+        let data_dir = tempfile::tempdir().expect("temporary data dir");
+        std::fs::write(data_dir.path().join(PERSISTED_DYNAMIC_PORT_FILE), "not-a-port\n")
+            .expect("write invalid metadata");
+        let mut config = AppConfig {
+            port: 0,
+            data_dir: data_dir.path().to_path_buf(),
+            ..AppConfig::default()
+        };
+
+        let bound = bind_http_listener(&mut config).await.expect("bind should succeed");
+
+        assert!(config.port > 0);
+        assert_eq!(
+            std::fs::read_to_string(persisted_dynamic_port_path(&config)).unwrap(),
+            format!("{}\n", bound.addr.port())
+        );
     }
 
     #[tokio::test]

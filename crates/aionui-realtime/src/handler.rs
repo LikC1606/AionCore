@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use aionui_api_types::WebSocketMessage;
+use aionui_api_types::{RuntimeSubscriptionReady, RuntimeSubscriptionRequest, WebSocketMessage};
 use axum::extract::WebSocketUpgrade;
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use axum::http::HeaderMap;
@@ -76,17 +76,18 @@ async fn handle_socket(socket: WebSocket, token: Option<String>, state: WsHandle
     }
 
     let (tx, rx) = mpsc::channel::<WsOutbound>(PER_CONNECTION_BUFFER);
-    let conn_id = state.manager.add_client(token, tx);
+    let (conn_id, forced_close) = state.manager.add_client_with_close(token, tx);
 
     info!(%conn_id, "websocket connection established");
 
     let (ws_sender, ws_receiver) = socket.split();
 
-    let send_handle = tokio::spawn(send_loop(conn_id, rx, ws_sender));
-    recv_loop(conn_id, ws_receiver, &state).await;
-
-    // Recv loop exited — client disconnected or errored.
-    send_handle.abort();
+    // Dropping both halves tears down a stuck socket even when its send queue is full.
+    tokio::select! {
+        _ = forced_close => {},
+        _ = send_loop(conn_id, rx, ws_sender) => {},
+        _ = recv_loop(conn_id, ws_receiver, &state) => {},
+    }
     state.manager.remove_client(conn_id);
     info!(%conn_id, "websocket connection closed");
 }
@@ -191,6 +192,20 @@ fn handle_text_message(conn_id: ConnectionId, text: &str, state: &WsHandlerState
     }
 
     match msg.name.as_str() {
+        "runtime.subscribe" => {
+            if serde_json::from_value::<RuntimeSubscriptionRequest>(msg.data).is_err() {
+                send_error_response(state, conn_id);
+                return;
+            }
+            // Registration and authentication have completed before acknowledging readiness.
+            state.manager.send_to(
+                conn_id,
+                WebSocketMessage::new(
+                    "runtime.subscriptionReady",
+                    json!(RuntimeSubscriptionReady { protocol_version: 1 }),
+                ),
+            );
+        }
         "pong" => {
             state.manager.update_last_ping(conn_id);
         }

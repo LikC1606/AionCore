@@ -6,6 +6,59 @@ use serde::{Deserialize, Serialize};
 
 use crate::acp::AcpConfigOptionDto;
 
+/// Host-only launch credentials. Never persisted or returned in an API response.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MathBudgetBindingRequest {
+    pub run_id: String,
+    pub input_digest: String,
+    pub actor_id: String,
+    pub socket_path: String,
+    pub secret: String,
+    pub output_tokens: u32,
+    pub provider: String,
+    pub model: String,
+}
+
+#[derive(Serialize)]
+pub struct MathBudgetBindingResponse {
+    pub ok: bool,
+}
+
+/// Runtime implementation capabilities, not echoed conversation metadata.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConversationRuntimeCapabilitiesResponse {
+    pub math_fair_turn_gate: MathFairTurnGateCapability,
+    pub math_request_gate: MathRequestGateCapability,
+    pub math_run_inputs: MathRunInputsCapability,
+    /// Allows a local runner to verify the actual executable against its frozen build manifest.
+    pub runtime_process_id: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MathRequestGateCapability {
+    pub enabled: bool,
+    pub scope: String,
+    #[serde(rename = "protocolVersion")]
+    pub protocol_version: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MathFairTurnGateCapability {
+    pub enabled: bool,
+    pub concurrency: usize,
+    pub scope: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MathRunInputsCapability {
+    /// Version 1 pins task/environment identity in persistence, verifies before
+    /// agent construction and prompt handoff, and rejects without automatic replay.
+    /// Version 2 additionally pins retrieval corpus identity and its environment references.
+    /// An empty list means this platform cannot enforce the contract.
+    pub supported_versions: Vec<u32>,
+}
+
 /// Per-MCP snapshot status stored in `conversation.extra`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

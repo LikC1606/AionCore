@@ -375,8 +375,12 @@ pub struct AgentTurnOutcome {
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentTurnExecutionError {
+    #[error("agent turn permanently rejected: {reason}")]
+    Rejected { reason: String },
     #[error("agent turn skipped: {reason}")]
     Skipped { reason: String },
+    #[error("agent turn transport failed: {reason}")]
+    Transport { reason: String },
     #[error("agent turn failed: {reason}")]
     Failed { reason: String },
 }

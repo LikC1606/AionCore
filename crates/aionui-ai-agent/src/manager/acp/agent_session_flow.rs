@@ -305,7 +305,14 @@ impl AcpAgentManager {
             }
         };
 
-        let empty_turn = is_empty_turn(&mut probe_rx);
+        let turn_output = probe_turn_output(&mut probe_rx);
+        if let Some(error) = visible_turn_terminal_error(&turn_output) {
+            return Ok(PromptOutcome::TerminalError {
+                session_id: sid.to_owned(),
+                error,
+            });
+        }
+        let empty_turn = turn_output.empty;
         if empty_turn && let Some(error) = self.empty_turn_terminal_error().await {
             return Ok(PromptOutcome::TerminalError {
                 session_id: sid.to_owned(),
@@ -421,19 +428,56 @@ fn classify_prompt_attempt_failure(
 /// `Lagged` is treated as non-empty: the broadcast buffer overflowed,
 /// meaning many events flew by — definitely not an empty turn.
 fn is_empty_turn(rx: &mut tokio::sync::broadcast::Receiver<AgentStreamEvent>) -> bool {
+    probe_turn_output(rx).empty
+}
+
+#[derive(Debug, Default)]
+struct TurnOutputProbe {
+    empty: bool,
+    text: String,
+    saw_non_text_output: bool,
+}
+
+fn probe_turn_output(rx: &mut tokio::sync::broadcast::Receiver<AgentStreamEvent>) -> TurnOutputProbe {
+    let mut output = TurnOutputProbe {
+        empty: true,
+        ..TurnOutputProbe::default()
+    };
     loop {
         match rx.try_recv() {
             Ok(event) => {
                 if event_is_user_visible_output(&event) {
-                    return false;
+                    output.empty = false;
+                    match event {
+                        AgentStreamEvent::Text(data) => output.text.push_str(&data.content),
+                        _ => output.saw_non_text_output = true,
+                    }
                 }
             }
-            Err(TryRecvError::Empty) => return true,
-            Err(TryRecvError::Closed) => return true,
+            Err(TryRecvError::Empty | TryRecvError::Closed) => return output,
             // Buffer overflow: many events occurred — turn was clearly not empty.
-            Err(TryRecvError::Lagged(_)) => return false,
+            Err(TryRecvError::Lagged(_)) => {
+                output.empty = false;
+                output.saw_non_text_output = true;
+            }
         }
     }
+}
+
+fn visible_turn_terminal_error(output: &TurnOutputProbe) -> Option<ErrorEventData> {
+    if output.empty || output.saw_non_text_output {
+        return None;
+    }
+    let normalized = output.text.to_ascii_lowercase();
+    if normalized.contains("exceeded retry limit")
+        && normalized.contains("429")
+        && normalized.contains("too many requests")
+    {
+        return Some(classify_empty_turn_stderr_error(
+            "Provider rate limited after retry limit: HTTP 429 Too Many Requests",
+        ));
+    }
+    None
 }
 
 /// Whether a stream event represents user-visible output produced by the
@@ -832,6 +876,53 @@ mod tests {
         .unwrap();
 
         assert!(!super::is_empty_turn(&mut rx));
+    }
+
+    #[tokio::test]
+    async fn retry_exhausted_429_text_is_classified_as_terminal_provider_error() {
+        let (tx, _) = broadcast::channel::<AgentStreamEvent>(8);
+        let mut rx = tx.subscribe();
+        tx.send(AgentStreamEvent::Start(StartEventData::default())).unwrap();
+        tx.send(AgentStreamEvent::Text(TextEventData {
+            content: "Warning: model metadata unavailable.\nexceeded retry limit, last status: 429 Too Many Requests"
+                .into(),
+        }))
+        .unwrap();
+
+        let output = super::probe_turn_output(&mut rx);
+        let error = super::visible_turn_terminal_error(&output).expect("429 should be terminal");
+        assert_eq!(error.code, Some(AgentErrorCode::UserLlmProviderRateLimited));
+        assert_eq!(error.retryable, Some(true));
+        assert!(error.message.to_ascii_lowercase().contains("rate limit"));
+        assert!(
+            error
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("429 Too Many Requests"))
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_model_text_or_tool_activity_is_not_a_provider_error() {
+        let (tx, _) = broadcast::channel::<AgentStreamEvent>(8);
+        let mut rx = tx.subscribe();
+        tx.send(AgentStreamEvent::Text(TextEventData {
+            content: "The source mentions HTTP 429 Too Many Requests and an exceeded retry limit.".into(),
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+            call_id: "c1".into(),
+            name: "read_file".into(),
+            args: serde_json::json!({}),
+            status: ToolCallStatus::Running,
+            input: None,
+            output: None,
+            description: None,
+        }))
+        .unwrap();
+
+        let output = super::probe_turn_output(&mut rx);
+        assert!(super::visible_turn_terminal_error(&output).is_none());
     }
 
     #[test]

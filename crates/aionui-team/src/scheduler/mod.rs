@@ -112,6 +112,7 @@ pub(crate) struct AgentSlot {
 // ---------------------------------------------------------------------------
 
 pub struct TeammateManager {
+    pub(crate) coordination_protocol: aionui_api_types::TeamCoordinationProtocol,
     pub(crate) team_id: String,
     pub(crate) slots: Mutex<HashMap<String, AgentSlot>>,
     pub(crate) mailbox: Arc<Mailbox>,
@@ -150,6 +151,7 @@ impl TeammateManager {
         }
         let events = TeamEventEmitter::new(team_id.clone(), broadcaster);
         Self {
+            coordination_protocol: Default::default(),
             team_id,
             slots: Mutex::new(slots),
             mailbox,
@@ -167,6 +169,11 @@ impl TeammateManager {
             .get(slot_id)
             .ok_or_else(|| TeamError::AgentNotFound(slot_id.to_owned()))?;
         Ok(slot.agent.clone())
+    }
+
+    pub(crate) fn with_coordination_protocol(mut self, protocol: aionui_api_types::TeamCoordinationProtocol) -> Self {
+        self.coordination_protocol = protocol;
+        self
     }
 
     pub async fn list_agents(&self) -> Vec<TeamAgent> {

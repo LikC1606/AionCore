@@ -144,6 +144,8 @@ impl TeamAgent {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Team {
+    #[serde(default)]
+    pub coordination_protocol: aionui_api_types::TeamCoordinationProtocol,
     pub id: String,
     pub user_id: String,
     pub name: String,
@@ -222,6 +224,12 @@ impl Team {
     pub fn from_row(row: &TeamRow) -> Result<Self, serde_json::Error> {
         let agents: Vec<TeamAgent> = serde_json::from_str(&row.agents)?;
         Ok(Self {
+            coordination_protocol: row
+                .coordination_protocol
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()?
+                .unwrap_or_default(),
             id: row.id.clone(),
             user_id: row.user_id.clone(),
             name: row.name.clone(),
@@ -237,6 +245,7 @@ impl Team {
 
     pub fn to_response(&self) -> TeamResponse {
         TeamResponse {
+            coordination_protocol: self.coordination_protocol,
             id: self.id.clone(),
             user_id: self.user_id.clone(),
             name: self.name.clone(),
@@ -529,6 +538,7 @@ mod tests {
         }])
         .unwrap();
         let row = TeamRow {
+            coordination_protocol: None,
             id: "t1".into(),
             user_id: "system_default_user".into(),
             name: "Alpha".into(),
@@ -554,6 +564,7 @@ mod tests {
     #[test]
     fn team_to_response() {
         let team = Team {
+            coordination_protocol: Default::default(),
             id: "t1".into(),
             user_id: "u1".into(),
             name: "Alpha".into(),
@@ -592,6 +603,7 @@ mod tests {
     #[test]
     fn team_from_row_invalid_json() {
         let row = TeamRow {
+            coordination_protocol: None,
             id: "t1".into(),
             user_id: "system_default_user".into(),
             name: "Bad".into(),

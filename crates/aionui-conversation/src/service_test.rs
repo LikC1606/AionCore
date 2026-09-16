@@ -1,4 +1,7 @@
 use std::collections::VecDeque;
+#[cfg(unix)]
+#[path = "service_test/math_run_inputs_test.rs"]
+mod math_run_inputs_test;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
@@ -3216,6 +3219,7 @@ impl IWorkerTaskManager for MockTaskManagerWithWorkspace {
 
 struct ScriptedAgent {
     conversation_id: String,
+    workspace_override: Option<String>,
     agent_type: AgentType,
     status: Option<ConversationStatus>,
     event_tx: broadcast::Sender<AgentStreamEvent>,
@@ -3229,6 +3233,7 @@ impl ScriptedAgent {
         let (event_tx, _) = broadcast::channel(64);
         Self {
             conversation_id: conversation_id.to_owned(),
+            workspace_override: None,
             agent_type: AgentType::Acp,
             status: Some(ConversationStatus::Finished),
             event_tx,
@@ -3269,7 +3274,7 @@ impl IAgentTask for ScriptedAgent {
     }
 
     fn workspace(&self) -> &str {
-        "/tmp/test"
+        self.workspace_override.as_deref().unwrap_or("/tmp/test")
     }
 
     fn status(&self) -> Option<ConversationStatus> {
@@ -7308,6 +7313,7 @@ async fn make_core_bound_team_conversation() -> (
     let conversation = svc.create("u", req).await.unwrap();
     team_repo
         .create_team(&TeamRow {
+            coordination_protocol: None,
             id: "team-bootstrap-1".into(),
             user_id: "u".into(),
             name: "Bootstrap Team".into(),
