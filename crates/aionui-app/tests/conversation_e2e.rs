@@ -61,6 +61,16 @@ async fn runtime_capabilities_reports_platform_support_without_creating_conversa
     assert_eq!(
         body_json(resp).await,
         json!({ "success": true, "data": {
+        "math_fair_turn_gate": {
+            "enabled": false,
+            "concurrency": 0,
+            "scope": "math_run_root"
+        },
+        "math_request_gate": {
+            "enabled": false,
+            "scope": "math_run_root",
+            "protocolVersion": 1
+        },
         "math_run_inputs": { "supported_versions": versions },
         "runtime_process_id": std::process::id()
     } })
