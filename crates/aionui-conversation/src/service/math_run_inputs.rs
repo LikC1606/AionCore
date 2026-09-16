@@ -33,7 +33,7 @@ struct FileIdentity {
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct MathRunInputs {
-    root: PathBuf,
+    pub(crate) root: PathBuf,
     task: FileIdentity,
     environment: FileIdentity,
     #[serde(default)]

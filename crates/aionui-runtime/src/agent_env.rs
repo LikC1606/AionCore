@@ -77,6 +77,9 @@ fn clean_agent_env(env: &mut BTreeMap<OsString, OsString>) {
     // Budget identity is assigned per session after this ambient environment is
     // cleaned. Never inherit another actor's binding from Core or a login shell.
     env.retain(|key, _| !is_math_budget_env(key));
+    remove_env_key(env, "DEEPSCIENTIST_MATH_REQUEST_GROUP");
+    remove_env_key(env, "DEEPSCIENTIST_MATH_REQUEST_GATE_SECRET");
+    remove_env_key(env, "DEEPSCIENTIST_MATH_REQUEST_GATE_URL");
 }
 
 fn is_math_budget_env(key: &std::ffi::OsStr) -> bool {
@@ -248,11 +251,17 @@ mod tests {
         let current = vec![
             ("DEEPSCIENTIST_MATH_BUDGET_SECRET".into(), "core-secret".into()),
             ("DEEPSCIENTIST_MATH_BUDGET_MAX_OUTPUT_TOKENS".into(), "1024".into()),
+            ("DEEPSCIENTIST_MATH_REQUEST_GATE_SECRET".into(), "gate-secret".into()),
+            (
+                "DEEPSCIENTIST_MATH_REQUEST_GATE_URL".into(),
+                "http://127.0.0.1:1234".into(),
+            ),
             ("WESTLAKEHPC_API_KEY".into(), "provider-fixture".into()),
         ];
         let shell = vec![
             ("DEEPSCIENTIST_MATH_BUDGET_SOCKET".into(), "/private/stale.sock".into()),
             ("deepscientist_math_budget_future".into(), "stale".into()),
+            ("DEEPSCIENTIST_MATH_REQUEST_GROUP".into(), "/stale/run".into()),
             ("UNRELATED".into(), "kept".into()),
         ];
         assert_eq!(

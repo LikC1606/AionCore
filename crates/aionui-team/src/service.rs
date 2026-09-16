@@ -2871,6 +2871,47 @@ impl TeamSessionService {
             .await
     }
 
+    /// Runtime-authenticated Lead dispatch. The caller slot is derived from
+    /// the signed conversation binding, then the session's agent-to-agent
+    /// enqueue path preserves `McpSendMessage` provenance for the active run.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_agent_message_from_runtime_with_idempotency(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        from_slot_id: &str,
+        to_slot_id: &str,
+        content: &str,
+        files: Option<Vec<String>>,
+        idempotency_key: Option<String>,
+        workspace: Option<String>,
+    ) -> Result<AgentMessageQueueResult, TeamError> {
+        let lifecycle_lock = self.lifecycle_lock(team_id);
+        let _lifecycle_guard = lifecycle_lock.read().await;
+        self.load_owned_team(user_id, team_id).await?;
+        let workspace = workspace.as_deref().map(validate_create_workspace_path).transpose()?;
+        let idempotency_key = Self::normalize_idempotency_key(idempotency_key.as_deref())?;
+        self.ensure_session_inner_unlocked(team_id).await?;
+        let session = {
+            let entry = self
+                .sessions
+                .get(team_id)
+                .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
+            Arc::clone(&entry.session)
+        };
+        self.bind_idle_agent_workspace(user_id, team_id, to_slot_id, &session, workspace.as_deref())
+            .await?;
+        session
+            .send_agent_message_from_agent_with_idempotency(
+                from_slot_id,
+                to_slot_id,
+                content,
+                files,
+                idempotency_key.as_deref(),
+            )
+            .await
+    }
+
     pub async fn shutdown_agent_in_session(
         &self,
         team_id: &str,

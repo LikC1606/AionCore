@@ -22,6 +22,7 @@
 //! both requests are just `send_request` / `send_notification` calls on the
 //! shared connection, each awaited in its own caller task.
 
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -29,8 +30,8 @@ use agent_client_protocol::schema::{
     AGENT_METHOD_NAMES, AuthenticateResponse, ClientNotification, ClientRequest, CloseSessionResponse, ExtResponse,
     ForkSessionResponse, Implementation, InitializeRequest, LoadSessionResponse, PromptResponse, ProtocolVersion,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, ResumeSessionResponse,
-    SelectedPermissionOutcome, SessionNotification, SetSessionConfigOptionResponse, SetSessionModeResponse,
-    SetSessionModelResponse,
+    SelectedPermissionOutcome, SessionNotification, SessionUpdate, SetSessionConfigOptionResponse,
+    SetSessionModeResponse, SetSessionModelResponse,
 };
 use agent_client_protocol::{
     Agent, ByteStreams, Client, ConnectionTo, Responder, on_receive_notification, on_receive_request,
@@ -57,6 +58,95 @@ const INIT_TIMEOUT_SECS: u64 = 30;
 /// Timeout for the short config/mode/model RPCs (seconds). Intentionally
 /// shorter than INIT_TIMEOUT_SECS; a dropped/absent response self-heals via retry.
 const CONFIG_RPC_TIMEOUT_SECS: u64 = 10;
+const MCP_TOOL_CALL_CORRELATION_LIMIT: usize = 256;
+
+#[derive(Debug, Clone)]
+struct CorrelatedMcpToolCall {
+    title: String,
+    raw_input: serde_json::Value,
+}
+
+#[derive(Default)]
+struct McpToolCallCorrelationCache {
+    entries: HashMap<(String, String), CorrelatedMcpToolCall>,
+    insertion_order: VecDeque<(String, String)>,
+}
+
+impl McpToolCallCorrelationCache {
+    fn observe(&mut self, notification: &SessionNotification) {
+        let (tool_call_id, title, raw_input) = match &notification.update {
+            SessionUpdate::ToolCall(tool_call) => (
+                tool_call.tool_call_id.to_string(),
+                Some(tool_call.title.as_str()),
+                tool_call.raw_input.as_ref(),
+            ),
+            SessionUpdate::ToolCallUpdate(tool_call) => (
+                tool_call.tool_call_id.to_string(),
+                tool_call.fields.title.as_deref(),
+                tool_call.fields.raw_input.as_ref(),
+            ),
+            _ => return,
+        };
+        let (Some(title), Some(raw_input)) = (title, raw_input) else {
+            return;
+        };
+        if !is_exact_dotted_mcp_tool_call(title, raw_input) {
+            return;
+        }
+
+        let key = (notification.session_id.to_string(), tool_call_id);
+        self.insertion_order.retain(|candidate| candidate != &key);
+        self.insertion_order.push_back(key.clone());
+        self.entries.insert(
+            key,
+            CorrelatedMcpToolCall {
+                title: title.to_owned(),
+                raw_input: raw_input.clone(),
+            },
+        );
+        while self.entries.len() > MCP_TOOL_CALL_CORRELATION_LIMIT {
+            if let Some(oldest) = self.insertion_order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+    }
+
+    fn enrich_permission_request(&mut self, request: &mut RequestPermissionRequest) {
+        let is_correlated_mcp_approval = request
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("is_mcp_tool_approval"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+            && request.tool_call.fields.title.is_none()
+            && request.tool_call.fields.raw_input.is_none()
+            && !request.tool_call.tool_call_id.to_string().starts_with("elicitation-");
+        if !is_correlated_mcp_approval {
+            return;
+        }
+
+        let key = (
+            request.session_id.to_string(),
+            request.tool_call.tool_call_id.to_string(),
+        );
+        let Some(tool_call) = self.entries.remove(&key) else {
+            return;
+        };
+        self.insertion_order.retain(|candidate| candidate != &key);
+        request.tool_call.fields.title = Some(tool_call.title);
+        request.tool_call.fields.raw_input = Some(tool_call.raw_input);
+    }
+}
+
+fn is_exact_dotted_mcp_tool_call(title: &str, raw_input: &serde_json::Value) -> bool {
+    let Some(server) = raw_input.get("server").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let Some(tool) = raw_input.get("tool").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    !server.is_empty() && !tool.is_empty() && title == format!("mcp.{server}.{tool}")
+}
 
 /// Client identity reported in the ACP `initialize` handshake (`clientInfo`).
 ///
@@ -523,6 +613,7 @@ async fn run_sdk_background(
     let mut shutdown_rx = Some(shutdown_rx);
     let phase = Arc::new(Mutex::new(AcpConnectionPhase::Starting));
     let phase_for_main = Arc::clone(&phase);
+    let mcp_tool_calls = Arc::new(Mutex::new(McpToolCallCorrelationCache::default()));
 
     let result = Client
         .builder()
@@ -531,7 +622,9 @@ async fn run_sdk_background(
                 let event_tx = event_tx.clone();
                 let notification_tx = notification_tx.clone();
                 let replay_suppression = Arc::clone(&replay_suppression);
+                let mcp_tool_calls = Arc::clone(&mcp_tool_calls);
                 async move |notification: SessionNotification, _cx: ConnectionTo<Agent>| {
+                    mcp_tool_calls.lock().unwrap().observe(&notification);
                     // Fan out the raw SDK notification to the manager's apply-loop
                     // FIRST, so session state is consistent by the time the UI
                     // event hits the broadcast channel. Swallow send errors — if
@@ -555,7 +648,9 @@ async fn run_sdk_background(
         )
         .on_receive_request(
             {
-                async move |request: RequestPermissionRequest, responder, _cx| {
+                let mcp_tool_calls = Arc::clone(&mcp_tool_calls);
+                async move |mut request: RequestPermissionRequest, responder, _cx| {
+                    mcp_tool_calls.lock().unwrap().enrich_permission_request(&mut request);
                     handle_permission_request(request, responder, &permission_tx).await;
                     Ok(())
                 }
@@ -940,6 +1035,87 @@ mod tests {
         }
 
         assert!(!flag.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn correlated_mcp_permission_recovers_exact_prior_tool_identity_once() {
+        use agent_client_protocol::schema::{
+            RequestPermissionRequest, SessionUpdate, ToolCall, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+        };
+        use serde_json::json;
+
+        let mut cache = McpToolCallCorrelationCache::default();
+        cache.observe(&SessionNotification::new(
+            "session-1",
+            SessionUpdate::ToolCall(
+                ToolCall::new("call-1", "mcp.ds-team-runtime-0.research_team")
+                    .kind(ToolKind::Execute)
+                    .raw_input(json!({
+                        "arguments": { "action": "describe" },
+                        "server": "ds-team-runtime-0",
+                        "tool": "research_team"
+                    })),
+            ),
+        ));
+        let mut request = RequestPermissionRequest::new(
+            "session-1",
+            ToolCallUpdate::new("call-1", ToolCallUpdateFields::new().kind(ToolKind::Execute)),
+            Vec::new(),
+        );
+        request.meta = Some(serde_json::from_value(json!({ "is_mcp_tool_approval": true })).unwrap());
+
+        cache.enrich_permission_request(&mut request);
+        assert_eq!(
+            request.tool_call.fields.title.as_deref(),
+            Some("mcp.ds-team-runtime-0.research_team")
+        );
+        assert_eq!(
+            request
+                .tool_call
+                .fields
+                .raw_input
+                .as_ref()
+                .and_then(|raw| raw.get("server")),
+            Some(&json!("ds-team-runtime-0"))
+        );
+
+        let mut replay = RequestPermissionRequest::new(
+            "session-1",
+            ToolCallUpdate::new("call-1", ToolCallUpdateFields::new().kind(ToolKind::Execute)),
+            Vec::new(),
+        );
+        replay.meta = Some(serde_json::from_value(json!({ "is_mcp_tool_approval": true })).unwrap());
+        cache.enrich_permission_request(&mut replay);
+        assert!(replay.tool_call.fields.title.is_none());
+        assert!(replay.tool_call.fields.raw_input.is_none());
+    }
+
+    #[test]
+    fn correlated_mcp_permission_does_not_cross_sessions_or_trust_mismatched_titles() {
+        use agent_client_protocol::schema::{
+            RequestPermissionRequest, SessionUpdate, ToolCall, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+        };
+        use serde_json::json;
+
+        let mut cache = McpToolCallCorrelationCache::default();
+        cache.observe(&SessionNotification::new(
+            "session-1",
+            SessionUpdate::ToolCall(
+                ToolCall::new("call-1", "shell")
+                    .kind(ToolKind::Execute)
+                    .raw_input(json!({ "server": "ds-team-runtime-0", "tool": "research_team" })),
+            ),
+        ));
+        let mut request = RequestPermissionRequest::new(
+            "session-2",
+            ToolCallUpdate::new("call-1", ToolCallUpdateFields::new().kind(ToolKind::Execute)),
+            Vec::new(),
+        );
+        request.meta = Some(serde_json::from_value(json!({ "is_mcp_tool_approval": true })).unwrap());
+
+        cache.enrich_permission_request(&mut request);
+        assert!(request.tool_call.fields.title.is_none());
+        assert!(request.tool_call.fields.raw_input.is_none());
     }
 
     #[test]

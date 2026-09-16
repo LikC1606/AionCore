@@ -298,6 +298,17 @@ impl ConversationTurnOrchestrator {
                     )));
                     return true;
                 }
+                let _fair_permit = match send_inputs.as_ref() {
+                    Some(inputs) => crate::math_fair_turn_gate::acquire(&inputs.root).await,
+                    None => None,
+                };
+                // Inputs may change while this prompt waits for its fair turn.
+                if math_run_inputs::verify_optional(send_inputs.as_ref()).is_err() {
+                    let _ = send_error_tx.send(AgentSendError::from_agent_error(AgentError::bad_request(
+                        math_run_inputs::INTEGRITY_MESSAGE,
+                    )));
+                    return true;
+                }
                 match send_agent.send_message(current_send).await {
                     Ok(()) => {}
                     Err(e) => {

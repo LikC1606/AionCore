@@ -31,6 +31,23 @@ pub(super) fn apply_acp_launch_policy(
         return Err("math_budget_launch_env_invalid: budget binding must come from session runtime".to_owned());
     }
     validate_math_budget_backend(input.metadata.backend.as_deref(), input.runtime_env)?;
+    if command_spec.env.iter().any(|entry| {
+        entry
+            .name
+            .to_ascii_uppercase()
+            .starts_with("DEEPSCIENTIST_MATH_REQUEST_")
+    }) {
+        return Err("Math request routing must come from session runtime".into());
+    }
+    if std::env::var("DEEPSCIENTIST_MATH_REQUEST_GATE_URL").is_ok()
+        && input
+            .runtime_env
+            .iter()
+            .any(|(name, _)| name == "DEEPSCIENTIST_MATH_REQUEST_GROUP")
+        && input.metadata.backend.as_deref() != Some("codex")
+    {
+        return Err("Math request gateway is restricted to Codex ACP".into());
+    }
     let initial_mode = initial_mode_from_build_context(input.metadata, input.config, input.session_snapshot);
     apply_codex_runtime_config_args(command_spec, input.metadata, initial_mode.as_deref());
     append_runtime_env(command_spec, input.runtime_env);
@@ -163,22 +180,64 @@ fn append_codex_config_env(
         // deliveries queue behind it in Core's event loop.
         features.insert("multi_agent".to_owned(), json!(false));
     }
-    let config = json!({
+    let mut config = json!({
         "allow_login_shell": false,
         "shell_environment_policy": {
             "inherit": "all",
             "experimental_use_profile": false,
             "include_only": [],
-            "exclude": ["DEEPSEEK_API_KEY", "DEEPSCIENTIST_MATH_BUDGET_*"],
+            "exclude": ["DEEPSEEK_API_KEY", "DEEPSCIENTIST_MATH_BUDGET_*", "DEEPSCIENTIST_MATH_REQUEST_GATE_SECRET"],
             "set": {},
         },
         "features": features,
         "sandbox_mode": sandbox_mode,
     });
+    append_math_request_gateway_config(
+        &mut config,
+        runtime_env,
+        std::env::var("DEEPSCIENTIST_MATH_REQUEST_GATE_URL").ok().as_deref(),
+        std::env::var("DEEPSCIENTIST_MATH_REQUEST_GATE_SECRET").ok().as_deref(),
+    )?;
+    if config.get("model_providers.WestlakeHPC.base_url").is_some() {
+        command_spec.env.push(aionui_common::EnvVar {
+            name: "DEEPSCIENTIST_MATH_REQUEST_GATE_SECRET".into(),
+            value: std::env::var("DEEPSCIENTIST_MATH_REQUEST_GATE_SECRET")
+                .map_err(|_| "Math request gateway secret unavailable")?,
+        });
+    }
     command_spec.env.push(aionui_common::EnvVar {
         name: CODEX_CONFIG_ENV.to_owned(),
         value: config.to_string(),
     });
+    Ok(())
+}
+
+fn append_math_request_gateway_config(
+    config: &mut serde_json::Value,
+    runtime_env: &[(String, String)],
+    gateway_url: Option<&str>,
+    secret: Option<&str>,
+) -> Result<(), String> {
+    if !runtime_env
+        .iter()
+        .any(|(name, _)| name == "DEEPSCIENTIST_MATH_REQUEST_GROUP")
+    {
+        return Ok(());
+    }
+    if let Some(url) = gateway_url {
+        let valid_local = url
+            .strip_prefix("http://127.0.0.1:")
+            .and_then(|port| port.parse::<u16>().ok())
+            .is_some_and(|port| port > 0);
+        if !valid_local || secret.is_none_or(str::is_empty) {
+            return Err("Math request gateway requires a local URL and secret".into());
+        }
+        config["model_providers.WestlakeHPC.base_url"] = json!(url);
+        config["model_providers.WestlakeHPC.env_http_headers"] = json!({
+            "x-deepscientist-gate-secret": "DEEPSCIENTIST_MATH_REQUEST_GATE_SECRET",
+            "x-deepscientist-run-root": "DEEPSCIENTIST_MATH_REQUEST_GROUP",
+        });
+    }
     Ok(())
 }
 
@@ -190,6 +249,7 @@ fn push_codex_config_arg(command_spec: &mut CommandSpec, value: &str) {
 fn codex_sandbox_mode_for_requested_mode(mode: Option<&str>) -> &'static str {
     match mode.map(str::trim) {
         Some("agent-full-access" | "full-access" | "yoloNoSandbox") => "danger-full-access",
+        Some("read-only") => "read-only",
         _ => "workspace-write",
     }
 }
@@ -197,6 +257,42 @@ fn codex_sandbox_mode_for_requested_mode(mode: Option<&str>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn math_gateway_overrides_only_bound_sessions_and_keeps_secret_out_of_config() {
+        let binding = [("DEEPSCIENTIST_MATH_REQUEST_GROUP".into(), "/run/a".into())];
+        let mut config = json!({});
+        append_math_request_gateway_config(&mut config, &[], Some("http://127.0.0.1:1234"), Some("private-value"))
+            .unwrap();
+        assert_eq!(config, json!({}));
+        append_math_request_gateway_config(
+            &mut config,
+            &binding,
+            Some("http://127.0.0.1:1234"),
+            Some("private-value"),
+        )
+        .unwrap();
+        assert_eq!(config["model_providers.WestlakeHPC.base_url"], "http://127.0.0.1:1234");
+        assert_eq!(
+            config["model_providers.WestlakeHPC.env_http_headers"]["x-deepscientist-run-root"],
+            "DEEPSCIENTIST_MATH_REQUEST_GROUP"
+        );
+        assert!(!config.to_string().contains("private-value"));
+        for url in [
+            "http://127.0.0.1:1234@evil.test",
+            "https://example.com",
+            "http://127.0.0.1:0",
+        ] {
+            assert!(
+                append_math_request_gateway_config(&mut config, &binding, Some(url), Some("secret"))
+                    .unwrap_err()
+                    .contains("local URL")
+            );
+        }
+        assert!(
+            append_math_request_gateway_config(&mut config, &binding, Some("http://127.0.0.1:1234"), None).is_err()
+        );
+    }
 
     fn agent_metadata_with_backend(backend: Option<&str>) -> AgentMetadata {
         AgentMetadata {
@@ -319,6 +415,46 @@ mod tests {
                 .iter()
                 .any(|arg| arg == CODEX_WINDOWS_UNELEVATED_SANDBOX)
         );
+    }
+
+    #[test]
+    fn apply_acp_launch_policy_keeps_codex_read_only_at_process_boundary() {
+        let mut command_spec = CommandSpec {
+            command: "node".into(),
+            args: vec!["codex-acp.js".into()],
+            env: vec![],
+            cwd: None,
+        };
+        let metadata = agent_metadata_with_backend(Some("codex"));
+        let config = AcpBuildExtra {
+            session_mode: Some("read-only".into()),
+            ..Default::default()
+        };
+
+        apply_acp_launch_policy(
+            &mut command_spec,
+            AcpLaunchPolicyInput {
+                metadata: &metadata,
+                config: &config,
+                session_snapshot: None,
+                runtime_env: &[],
+                belongs_to_team: true,
+            },
+        )
+        .expect("Codex read-only launch policy should materialize process isolation");
+
+        assert_eq!(
+            command_spec.args,
+            vec!["codex-acp.js", "-c", "sandbox_mode=\"read-only\""]
+        );
+        let config = command_spec
+            .env
+            .iter()
+            .find(|entry| entry.name == CODEX_CONFIG_ENV)
+            .expect("Codex launch must inject CODEX_CONFIG");
+        let value: serde_json::Value = serde_json::from_str(&config.value).expect("valid CODEX_CONFIG JSON");
+        assert_eq!(value["sandbox_mode"], "read-only");
+        assert_eq!(value["features"]["multi_agent"], false);
     }
 
     #[test]

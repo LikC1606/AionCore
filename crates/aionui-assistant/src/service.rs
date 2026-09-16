@@ -2480,15 +2480,21 @@ fn assistant_projection_for_definition(
 
     AssistantRuntimeProjection {
         agent_id,
-        agent,
+        agent: agent.clone(),
         agent_status,
         agent_status_message,
         team_selectable: enabled
             && agent_row.is_some_and(|row| {
-                matches!(
+                // Managed Codex ACP can be healthy even when its startup
+                // availability snapshot is stale (for example after a
+                // runtime upgrade). Team creation must be allowed to perform
+                // the authoritative ACP handshake instead of being blocked
+                // by that cached probe result.
+                (matches!(
                     row.status,
                     AgentManagementStatus::Online | AgentManagementStatus::Unchecked
-                ) && row.team_capable
+                ) || agent.as_ref().and_then(|a| a.acp_backend.as_deref()) == Some("codex"))
+                    && row.team_capable
             }),
         team_block_reason,
         deletable: matches!(source, AssistantSource::User),

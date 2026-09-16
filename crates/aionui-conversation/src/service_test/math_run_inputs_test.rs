@@ -83,6 +83,40 @@ async fn math_inputs_are_persisted_and_rechecked_by_a_reconstructed_service() {
 }
 
 #[tokio::test]
+async fn math_request_group_is_bound_to_frozen_inputs_instead_of_caller_runtime_env() {
+    let fixture = Fixture::new();
+    let agent = scripted_agent("gateway-session");
+    let tasks = Arc::new(RebuildingScriptedTaskManager::new(vec![AgentInstance::Mock(agent)]));
+    let (service, _repo) = sqlite_service(tasks.clone()).await;
+    let mut request = create_request(&fixture);
+    request.extra["runtime_env"] = serde_json::json!([["DEEPSCIENTIST_MATH_REQUEST_GROUP", "/other/run"]]);
+    let conversation = service.create(OWNER, request).await.unwrap();
+    let (_, callback) = prompt_acceptance_counter();
+    let result = service
+        .run_agent_turn(turn_request(&conversation.id, callback))
+        .await
+        .unwrap();
+    assert_eq!(result.status, ConversationAgentTurnStatus::Completed);
+    let options = tasks.captured_options();
+    let root = fixture.extra["mathematics_runtime"]["run_inputs"]["root"]
+        .as_str()
+        .unwrap();
+    assert!(
+        options[0]
+            .context
+            .runtime_env
+            .contains(&("DEEPSCIENTIST_MATH_REQUEST_GROUP".into(), root.into()))
+    );
+    assert!(
+        !options[0]
+            .context
+            .runtime_env
+            .iter()
+            .any(|(_, value)| value == "/other/run")
+    );
+}
+
+#[tokio::test]
 async fn math_inputs_reject_changes_before_task_construction() {
     let fixture = Fixture::new();
     let tasks = Arc::new(RebuildingScriptedTaskManager::new(vec![]));

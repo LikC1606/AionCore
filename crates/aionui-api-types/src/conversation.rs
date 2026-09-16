@@ -28,9 +28,26 @@ pub struct MathBudgetBindingResponse {
 /// Runtime implementation capabilities, not echoed conversation metadata.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConversationRuntimeCapabilitiesResponse {
+    pub math_fair_turn_gate: MathFairTurnGateCapability,
+    pub math_request_gate: MathRequestGateCapability,
     pub math_run_inputs: MathRunInputsCapability,
     /// Allows a local runner to verify the actual executable against its frozen build manifest.
     pub runtime_process_id: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MathRequestGateCapability {
+    pub enabled: bool,
+    pub scope: String,
+    #[serde(rename = "protocolVersion")]
+    pub protocol_version: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MathFairTurnGateCapability {
+    pub enabled: bool,
+    pub concurrency: usize,
+    pub scope: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

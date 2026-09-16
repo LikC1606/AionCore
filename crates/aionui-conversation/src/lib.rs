@@ -5,6 +5,7 @@ mod acp_error_recovery;
 mod agent_health_policy;
 mod convert;
 pub mod error;
+mod math_fair_turn_gate;
 pub(crate) mod message_cursor;
 mod message_persistence;
 pub mod response_middleware;

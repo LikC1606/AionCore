@@ -485,16 +485,8 @@ impl TeamAgentProvisioner {
         agent: &TeamAgent,
         mcp_stdio_cfg: TeamMcpStdioConfig,
     ) -> Result<(), TeamError> {
-        let acp_metadata = acp_backend_metadata(&self.agent_metadata_repo, &agent.backend).await?;
-        let agent_type = if acp_metadata.is_some() {
-            AgentType::Acp
-        } else {
-            parse_agent_type(&agent.backend)?
-        };
-        let session_mode = session_mode_for_backend(&agent.backend, agent_type, acp_metadata.as_ref());
         let patch = serde_json::json!({
             "team_mcp_stdio_config": mcp_stdio_cfg,
-            "session_mode": session_mode,
         });
         self.conversation_port
             .patch_runtime_config(&agent.conversation_id, patch)
@@ -508,16 +500,8 @@ impl TeamAgentProvisioner {
     }
 
     pub(crate) async fn write_team_runtime_config_without_mcp(&self, agent: &TeamAgent) -> Result<(), TeamError> {
-        let acp_metadata = acp_backend_metadata(&self.agent_metadata_repo, &agent.backend).await?;
-        let agent_type = if acp_metadata.is_some() {
-            AgentType::Acp
-        } else {
-            parse_agent_type(&agent.backend)?
-        };
-        let session_mode = session_mode_for_backend(&agent.backend, agent_type, acp_metadata.as_ref());
         let patch = serde_json::json!({
             "team_mcp_stdio_config": null,
-            "session_mode": session_mode,
         });
         self.conversation_port
             .patch_runtime_config(&agent.conversation_id, patch)
@@ -1056,6 +1040,23 @@ mod tests {
 
         let patches = patches.lock().unwrap();
         assert_eq!(patches[0]["team_mcp_stdio_config"], serde_json::Value::Null);
+        assert!(!patches[0].as_object().unwrap().contains_key("session_mode"));
+    }
+
+    #[tokio::test]
+    async fn mcp_runtime_config_does_not_replace_session_mode() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let patches = Arc::new(Mutex::new(Vec::new()));
+        let provisioner = test_provisioner_with_patches(events, Arc::clone(&patches));
+
+        provisioner
+            .write_team_mcp_runtime_config(&test_agent(), test_mcp_config())
+            .await
+            .unwrap();
+
+        let patches = patches.lock().unwrap();
+        assert!(patches[0]["team_mcp_stdio_config"].is_object());
+        assert!(!patches[0].as_object().unwrap().contains_key("session_mode"));
     }
 
     #[tokio::test]
@@ -1097,5 +1098,6 @@ mod tests {
         );
         let patches = patches.lock().unwrap();
         assert!(patches[0]["team_mcp_stdio_config"].is_object());
+        assert!(!patches[0].as_object().unwrap().contains_key("session_mode"));
     }
 }

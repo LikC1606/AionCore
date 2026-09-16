@@ -91,6 +91,21 @@ impl<'a> SessionContextBuilder<'a> {
         let team = TeamSessionBinding::from_extra_value(&extra).map_err(|e| ConversationError::BadRequest {
             reason: format!("Invalid Team runtime context: {e}"),
         })?;
+        let mut runtime_env = if budget_required {
+            vec![("DEEPSCIENTIST_MATH_BUDGET_REQUIRED".into(), "1".into())]
+        } else {
+            Vec::new()
+        };
+        if let Some(inputs) = crate::service::math_run_inputs::from_persisted_extra(&row.extra)
+            .map_err(|_| ConversationError::bad_request(crate::service::math_run_inputs::INTEGRITY_MESSAGE))?
+        {
+            // Turn orchestration verifies the frozen bytes before construction and
+            // before dispatch, preserving its structured integrity failure outcome.
+            runtime_env.push((
+                "DEEPSCIENTIST_MATH_REQUEST_GROUP".into(),
+                inputs.root.to_string_lossy().into_owned(),
+            ));
+        }
         let kind = self.build_kind(row, &agent_type, extra, team.clone(), seed).await?;
 
         Ok(AgentSessionContext {
@@ -103,11 +118,7 @@ impl<'a> SessionContextBuilder<'a> {
             workspace,
             model,
             skills,
-            runtime_env: if budget_required {
-                vec![("DEEPSCIENTIST_MATH_BUDGET_REQUIRED".into(), "1".into())]
-            } else {
-                Vec::new()
-            },
+            runtime_env,
             team,
             kind,
         })

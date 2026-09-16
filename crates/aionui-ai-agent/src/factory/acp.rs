@@ -7,11 +7,11 @@ use crate::factory::acp_assembler::{WorkspaceInfo, assemble_acp_params};
 use crate::factory::acp_launch_policy::{AcpLaunchPolicyInput, apply_acp_launch_policy};
 use crate::factory::context::FactoryContext;
 use crate::factory::mcp_stdio_policy::{BENCHMARK_CONTAINER_MCP_NAME, validate_deepscientist_stdio_reference};
-use crate::manager::acp::{AcpAgentManager, CatalogForwarder};
+use crate::manager::acp::{AcpAgentManager, CatalogForwarder, TrustedMcpToolPolicy};
 use crate::session_context::AcpSessionBuildContext;
 use crate::types::{AIONUI_BASE_URL_ENV, AIONUI_CONVERSATION_ID_ENV, AIONUI_RUNTIME_TOKEN_ENV, AIONUI_USER_ID_ENV};
 use agent_client_protocol::schema::{EnvVariable, HttpHeader, McpServer, McpServerHttp, McpServerSse, McpServerStdio};
-use aionui_api_types::{SessionMcpServer, SessionMcpTransport};
+use aionui_api_types::{SessionMcpServer, SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamSessionBinding};
 use aionui_common::CommandSpec;
 use aionui_db::IMcpServerRepository;
 use aionui_db::models::McpServerRow;
@@ -20,6 +20,7 @@ use aionui_runtime::{
     ManagedAcpToolId, ensure_managed_acp_tool_with_reporter, ensure_node_runtime_with_reporter, ensure_runtime_command,
     ensure_runtime_command_with_reporter, resolve_command_path,
 };
+use serde::Deserialize;
 use tracing::{info, warn};
 
 use crate::runtime_status::{conversation_acp_tool_runtime_reporter, conversation_runtime_reporter};
@@ -30,6 +31,7 @@ pub(super) async fn build(
     ctx: FactoryContext,
 ) -> Result<AgentInstance, AgentError> {
     let belongs_to_team = build_context.belongs_to_team;
+    let team_binding = build_context.team.clone();
     let mut config = build_context.config;
 
     // Resolve the catalog row — prefer explicit agent_id, fall
@@ -128,24 +130,30 @@ pub(super) async fn build(
         }
     }
     bind_managed_team_mcp_runtime_env(&mut session_mcp_servers, &ctx.runtime_env);
-
-    let params = Arc::new(
-        assemble_acp_params(
-            ctx.conversation_id.clone(),
-            WorkspaceInfo {
-                path: ctx.workspace,
-                is_custom: ctx.is_custom_workspace,
-            },
-            meta,
-            command_spec,
-            config,
-            session_mcp_servers,
-            session_snapshot,
-            deps.data_dir.clone(),
-            deps.dump_prompts,
-        )
-        .await,
+    let auto_approve_mcp_tools = managed_team_auto_approve_policies(
+        &session_mcp_servers,
+        team_binding.as_ref(),
+        config.team_mcp_stdio_config.as_ref(),
+        &ctx.conversation_id,
     );
+
+    let mut params = assemble_acp_params(
+        ctx.conversation_id.clone(),
+        WorkspaceInfo {
+            path: ctx.workspace,
+            is_custom: ctx.is_custom_workspace,
+        },
+        meta,
+        command_spec,
+        config,
+        session_mcp_servers,
+        session_snapshot,
+        deps.data_dir.clone(),
+        deps.dump_prompts,
+    )
+    .await;
+    params.auto_approve_mcp_tools = auto_approve_mcp_tools;
+    let params = Arc::new(params);
 
     let skill_mgr = deps.skill_manager.clone();
     let catalog_tx = deps.agent_registry.catalog_sender();
@@ -186,6 +194,34 @@ pub(super) async fn build(
 }
 
 const MANAGED_TEAM_MCP_PREFIX: &str = "ds-team-";
+const RESEARCH_TEAM_MCP_SCRIPT: &str = "builtin-mcp-research-team.js";
+const SCIENCE_ARTIFACT_MCP_SCRIPT: &str = "builtin-mcp-science-artifact.js";
+const RESEARCH_EVIDENCE_MCP_SCRIPT: &str = "builtin-mcp-research-evidence.js";
+const RESEARCH_TEAM_CAPABILITY_SCHEMA_ENV: &str = "DEEPSCIENTIST_RESEARCH_TEAM_CAPABILITY_SCHEMA";
+const RESEARCH_TEAM_CAPABILITY_SCHEMA: &str = "deepscientist.research-team.mcp-capability.v1";
+const RESEARCH_TEAM_ID_ENV: &str = "DEEPSCIENTIST_RESEARCH_TEAM_ID";
+const RESEARCH_TEAM_SLOT_ID_ENV: &str = "DEEPSCIENTIST_RESEARCH_TEAM_SLOT_ID";
+const RESEARCH_TEAM_ACTIONS_ENV: &str = "DEEPSCIENTIST_RESEARCH_TEAM_ACTIONS";
+const RESEARCH_TEAM_TOOL_POLICY_SCHEMA_ENV: &str = "DEEPSCIENTIST_RESEARCH_TEAM_TOOL_POLICY_SCHEMA";
+const RESEARCH_TEAM_TOOL_POLICY_SCHEMA: &str = "deepscientist.research-team.tool-policy.v1";
+const RESEARCH_TEAM_TOOL_POLICY_ALLOWED_ENV: &str = "DEEPSCIENTIST_RESEARCH_TEAM_TOOL_POLICY_ALLOWED";
+const RESEARCH_TEAM_TOOL_POLICY_DENIED_ENV: &str = "DEEPSCIENTIST_RESEARCH_TEAM_TOOL_POLICY_DENIED";
+const RESEARCH_TEAM_ROLE_KIND_ENV: &str = "DEEPSCIENTIST_RESEARCH_TEAM_ROLE_KIND";
+const SCIENCE_ARTIFACT_MCP_TOOLS: &[&str] = &[
+    "project_workspace",
+    "target_portfolio",
+    "factor_search",
+    "factor_lab",
+    "factor_submit",
+    "factor_registry",
+    "research_roadmap",
+    "math_research",
+    "lean_workspace",
+    "formal_verifier",
+    "math_portfolio",
+    "report_chart",
+    "science_artifact",
+];
 const MANAGED_TEAM_RUNTIME_ENV_KEYS: [&str; 4] = [
     AIONUI_BASE_URL_ENV,
     AIONUI_USER_ID_ENV,
@@ -224,6 +260,173 @@ fn bind_managed_team_mcp_runtime_env(servers: &mut [McpServer], runtime_env: &[(
             stdio.env.retain(|entry| entry.name != *key);
             stdio.env.push(EnvVariable::new(*key, *value));
         }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagedTeamToolPolicyEntry {
+    tool_name: String,
+    actions: ManagedTeamToolActions,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ManagedTeamToolActions {
+    Wildcard(String),
+    List(Vec<String>),
+}
+
+/// Select only Core-bound Team tools for headless approval.
+/// Dynamic `ds-team-*` names alone are insufficient: the stdio descriptor
+/// must point at an expected built-in bundle, carry the exact Team, slot, and
+/// conversation identities, and grant the requested tool/action in its frozen
+/// role policy.
+fn managed_team_auto_approve_policies(
+    servers: &[McpServer],
+    team: Option<&TeamSessionBinding>,
+    core_team_mcp: Option<&aionui_api_types::TeamMcpStdioConfig>,
+    conversation_id: &str,
+) -> Vec<TrustedMcpToolPolicy> {
+    let Some(team) = team else {
+        return Vec::new();
+    };
+    let Some(slot_id) = team.slot_id.as_deref() else {
+        return Vec::new();
+    };
+    let expected_role_kind = match team.role.as_deref() {
+        Some("lead" | "leader") => "lead",
+        Some("teammate") => "worker",
+        _ => return Vec::new(),
+    };
+
+    let mut policies = Vec::new();
+    if core_team_mcp.is_some_and(|config| config.team_id == team.team_id && config.slot_id == slot_id) {
+        policies.push(TrustedMcpToolPolicy {
+            server_name: TEAM_MCP_SERVER_NAME.to_owned(),
+            tool_name: "*".to_owned(),
+            allowed_actions: None,
+            denied_actions: Some(Vec::new()),
+        });
+    }
+
+    for server in servers {
+        let McpServer::Stdio(stdio) = server else {
+            continue;
+        };
+        let script = stdio
+            .args
+            .iter()
+            .find_map(|arg| std::path::Path::new(arg).file_name().and_then(|name| name.to_str()));
+        if !stdio.name.starts_with(MANAGED_TEAM_MCP_PREFIX)
+            || !matches!(
+                script,
+                Some(RESEARCH_TEAM_MCP_SCRIPT | SCIENCE_ARTIFACT_MCP_SCRIPT | RESEARCH_EVIDENCE_MCP_SCRIPT)
+            )
+            || !mcp_env_equals(
+                &stdio.env,
+                RESEARCH_TEAM_CAPABILITY_SCHEMA_ENV,
+                RESEARCH_TEAM_CAPABILITY_SCHEMA,
+            )
+            || !mcp_env_equals(&stdio.env, RESEARCH_TEAM_ID_ENV, &team.team_id)
+            || !mcp_env_equals(&stdio.env, RESEARCH_TEAM_SLOT_ID_ENV, slot_id)
+            || !mcp_env_equals(&stdio.env, RESEARCH_TEAM_ROLE_KIND_ENV, expected_role_kind)
+            || !mcp_env_equals(&stdio.env, AIONUI_CONVERSATION_ID_ENV, conversation_id)
+            || !mcp_env_nonempty(&stdio.env, AIONUI_RUNTIME_TOKEN_ENV)
+            || !mcp_env_nonempty(&stdio.env, AIONUI_BASE_URL_ENV)
+        {
+            continue;
+        }
+        if script == Some(RESEARCH_TEAM_MCP_SCRIPT) {
+            let Some(actions) = parse_action_list(mcp_env_value(&stdio.env, RESEARCH_TEAM_ACTIONS_ENV)) else {
+                continue;
+            };
+            policies.push(TrustedMcpToolPolicy {
+                server_name: stdio.name.clone(),
+                tool_name: "research_team".to_owned(),
+                allowed_actions: Some(actions),
+                denied_actions: Some(Vec::new()),
+            });
+            continue;
+        }
+        if !mcp_env_equals(
+            &stdio.env,
+            RESEARCH_TEAM_TOOL_POLICY_SCHEMA_ENV,
+            RESEARCH_TEAM_TOOL_POLICY_SCHEMA,
+        ) {
+            continue;
+        }
+        let Some(allowed) = parse_tool_policy(mcp_env_value(&stdio.env, RESEARCH_TEAM_TOOL_POLICY_ALLOWED_ENV)) else {
+            continue;
+        };
+        let Some(denied) = parse_tool_policy(mcp_env_value(&stdio.env, RESEARCH_TEAM_TOOL_POLICY_DENIED_ENV)) else {
+            continue;
+        };
+        for entry in allowed {
+            let tool_is_exposed = match script {
+                Some(RESEARCH_EVIDENCE_MCP_SCRIPT) => entry.tool_name == "research_evidence",
+                Some(SCIENCE_ARTIFACT_MCP_SCRIPT) => SCIENCE_ARTIFACT_MCP_TOOLS.contains(&entry.tool_name.as_str()),
+                _ => false,
+            };
+            if !tool_is_exposed {
+                continue;
+            }
+            let denied_actions = denied
+                .iter()
+                .find(|candidate| candidate.tool_name == entry.tool_name)
+                .map(|candidate| normalized_actions(&candidate.actions))
+                .unwrap_or_else(|| Some(Vec::new()));
+            policies.push(TrustedMcpToolPolicy {
+                server_name: stdio.name.clone(),
+                tool_name: entry.tool_name,
+                allowed_actions: normalized_actions(&entry.actions),
+                denied_actions,
+            });
+        }
+    }
+    policies.sort_by(|left, right| (&left.server_name, &left.tool_name).cmp(&(&right.server_name, &right.tool_name)));
+    policies
+}
+
+fn mcp_env_equals(env: &[EnvVariable], name: &str, expected: &str) -> bool {
+    env.iter().any(|entry| entry.name == name && entry.value == expected)
+}
+
+fn mcp_env_nonempty(env: &[EnvVariable], name: &str) -> bool {
+    env.iter().any(|entry| entry.name == name && !entry.value.is_empty())
+}
+
+fn mcp_env_value<'a>(env: &'a [EnvVariable], name: &str) -> Option<&'a str> {
+    env.iter()
+        .find(|entry| entry.name == name)
+        .map(|entry| entry.value.as_str())
+}
+
+fn parse_action_list(value: Option<&str>) -> Option<Vec<String>> {
+    let actions = serde_json::from_str::<Vec<String>>(value?).ok()?;
+    (!actions.is_empty() && actions.iter().all(|action| !action.trim().is_empty())).then_some(actions)
+}
+
+fn parse_tool_policy(value: Option<&str>) -> Option<Vec<ManagedTeamToolPolicyEntry>> {
+    let entries = serde_json::from_str::<Vec<ManagedTeamToolPolicyEntry>>(value?).ok()?;
+    entries
+        .iter()
+        .all(|entry| {
+            !entry.tool_name.trim().is_empty()
+                && match &entry.actions {
+                    ManagedTeamToolActions::Wildcard(value) => value == "*",
+                    ManagedTeamToolActions::List(actions) => {
+                        !actions.is_empty() && actions.iter().all(|action| !action.trim().is_empty())
+                    }
+                }
+        })
+        .then_some(entries)
+}
+
+fn normalized_actions(actions: &ManagedTeamToolActions) -> Option<Vec<String>> {
+    match actions {
+        ManagedTeamToolActions::Wildcard(_) => None,
+        ManagedTeamToolActions::List(actions) => Some(actions.clone()),
     }
 }
 
@@ -672,6 +875,118 @@ mod tests {
         };
         assert_eq!(third_party.env.len(), 1);
         assert_eq!(third_party.env[0].name, "THIRD_PARTY_KEY");
+    }
+
+    #[test]
+    fn auto_approve_policy_selects_only_bound_research_team_bundle() {
+        let bound_env = vec![
+            EnvVariable::new(RESEARCH_TEAM_CAPABILITY_SCHEMA_ENV, RESEARCH_TEAM_CAPABILITY_SCHEMA),
+            EnvVariable::new(RESEARCH_TEAM_ID_ENV, "team-1"),
+            EnvVariable::new(RESEARCH_TEAM_SLOT_ID_ENV, "slot-1"),
+            EnvVariable::new(RESEARCH_TEAM_ROLE_KIND_ENV, "lead"),
+            EnvVariable::new(RESEARCH_TEAM_ACTIONS_ENV, "[\"describe\",\"dispatch\"]"),
+            EnvVariable::new(AIONUI_CONVERSATION_ID_ENV, "conv-1"),
+            EnvVariable::new(AIONUI_RUNTIME_TOKEN_ENV, "runtime-token"),
+            EnvVariable::new(AIONUI_BASE_URL_ENV, "http://127.0.0.1:25808"),
+        ];
+        let servers = vec![
+            McpServer::Stdio(
+                McpServerStdio::new("ds-team-runtime-0", "/usr/bin/node")
+                    .args(vec![format!("/runtime/{RESEARCH_TEAM_MCP_SCRIPT}")])
+                    .env(bound_env.clone()),
+            ),
+            McpServer::Stdio(
+                McpServerStdio::new("ds-team-runtime-1", "/usr/bin/node")
+                    .args(vec!["/runtime/builtin-mcp-science-artifact.js".to_owned()])
+                    .env(bound_env),
+            ),
+        ];
+        let team = TeamSessionBinding {
+            team_id: "team-1".to_owned(),
+            slot_id: Some("slot-1".to_owned()),
+            role: Some("lead".to_owned()),
+            runtime_seed: Default::default(),
+            mcp: None,
+        };
+
+        assert_eq!(
+            managed_team_auto_approve_policies(&servers, Some(&team), None, "conv-1"),
+            vec![TrustedMcpToolPolicy {
+                server_name: "ds-team-runtime-0".to_owned(),
+                tool_name: "research_team".to_owned(),
+                allowed_actions: Some(vec!["describe".to_owned(), "dispatch".to_owned()]),
+                denied_actions: Some(Vec::new()),
+            }]
+        );
+    }
+
+    #[test]
+    fn auto_approve_policy_rejects_unbound_or_mismatched_team_descriptor() {
+        let server = McpServer::Stdio(
+            McpServerStdio::new("ds-team-runtime-0", "/usr/bin/node")
+                .args(vec![format!("/runtime/{RESEARCH_TEAM_MCP_SCRIPT}")])
+                .env(vec![
+                    EnvVariable::new(RESEARCH_TEAM_CAPABILITY_SCHEMA_ENV, RESEARCH_TEAM_CAPABILITY_SCHEMA),
+                    EnvVariable::new(RESEARCH_TEAM_ID_ENV, "team-1"),
+                    EnvVariable::new(RESEARCH_TEAM_SLOT_ID_ENV, "wrong-slot"),
+                    EnvVariable::new(AIONUI_CONVERSATION_ID_ENV, "conv-1"),
+                    EnvVariable::new(AIONUI_RUNTIME_TOKEN_ENV, "runtime-token"),
+                    EnvVariable::new(AIONUI_BASE_URL_ENV, "http://127.0.0.1:25808"),
+                ]),
+        );
+        let team = TeamSessionBinding {
+            team_id: "team-1".to_owned(),
+            slot_id: Some("slot-1".to_owned()),
+            role: Some("lead".to_owned()),
+            runtime_seed: Default::default(),
+            mcp: None,
+        };
+
+        assert!(managed_team_auto_approve_policies(&[server.clone()], None, None, "conv-1").is_empty());
+        assert!(managed_team_auto_approve_policies(&[server], Some(&team), None, "conv-1").is_empty());
+    }
+
+    #[test]
+    fn auto_approve_policy_projects_science_artifact_math_research_actions() {
+        let servers = vec![McpServer::Stdio(
+            McpServerStdio::new("ds-team-runtime-worker", "/usr/bin/node")
+                .args(vec![format!("/runtime/{SCIENCE_ARTIFACT_MCP_SCRIPT}")])
+                .env(vec![
+                    EnvVariable::new(RESEARCH_TEAM_CAPABILITY_SCHEMA_ENV, RESEARCH_TEAM_CAPABILITY_SCHEMA),
+                    EnvVariable::new(RESEARCH_TEAM_ID_ENV, "team-1"),
+                    EnvVariable::new(RESEARCH_TEAM_SLOT_ID_ENV, "slot-1"),
+                    EnvVariable::new(RESEARCH_TEAM_ROLE_KIND_ENV, "worker"),
+                    EnvVariable::new(AIONUI_CONVERSATION_ID_ENV, "conv-1"),
+                    EnvVariable::new(AIONUI_RUNTIME_TOKEN_ENV, "runtime-token"),
+                    EnvVariable::new(AIONUI_BASE_URL_ENV, "http://127.0.0.1:25808"),
+                    EnvVariable::new(RESEARCH_TEAM_TOOL_POLICY_SCHEMA_ENV, RESEARCH_TEAM_TOOL_POLICY_SCHEMA),
+                    EnvVariable::new(
+                        RESEARCH_TEAM_TOOL_POLICY_ALLOWED_ENV,
+                        r#"[{"toolName":"math_research","actions":["overview","get"]}]"#,
+                    ),
+                    EnvVariable::new(
+                        RESEARCH_TEAM_TOOL_POLICY_DENIED_ENV,
+                        r#"[{"toolName":"math_research","actions":["get"]}]"#,
+                    ),
+                ]),
+        )];
+        let team = TeamSessionBinding {
+            team_id: "team-1".to_owned(),
+            slot_id: Some("slot-1".to_owned()),
+            role: Some("teammate".to_owned()),
+            runtime_seed: Default::default(),
+            mcp: None,
+        };
+
+        assert_eq!(
+            managed_team_auto_approve_policies(&servers, Some(&team), None, "conv-1"),
+            vec![TrustedMcpToolPolicy {
+                server_name: "ds-team-runtime-worker".to_owned(),
+                tool_name: "math_research".to_owned(),
+                allowed_actions: Some(vec!["overview".to_owned(), "get".to_owned()]),
+                denied_actions: Some(vec!["get".to_owned()]),
+            }]
+        );
     }
 
     #[test]

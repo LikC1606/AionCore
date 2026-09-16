@@ -485,9 +485,10 @@ impl AcpAgentManager {
                 AgentError::from(e)
             })?,
         };
-        let permission_router = Arc::new(PermissionRouter::with_benchmark_container_isolation(
+        let permission_router = Arc::new(PermissionRouter::with_auto_approve_policy(
             permission_rx,
             params.config.benchmark_container_isolation,
+            params.auto_approve_mcp_tools.clone(),
         ));
 
         let snapshot = params.session_snapshot.as_ref();

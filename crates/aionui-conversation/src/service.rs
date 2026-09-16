@@ -419,6 +419,13 @@ pub struct ConversationAgentTurnOutcome {
 impl ConversationService {
     pub fn runtime_capabilities(&self) -> aionui_api_types::ConversationRuntimeCapabilitiesResponse {
         aionui_api_types::ConversationRuntimeCapabilitiesResponse {
+            math_fair_turn_gate: crate::math_fair_turn_gate::capability(),
+            math_request_gate: aionui_api_types::MathRequestGateCapability {
+                enabled: std::env::var("DEEPSCIENTIST_MATH_REQUEST_GATE_URL").is_ok()
+                    && std::env::var("DEEPSCIENTIST_MATH_REQUEST_GATE_SECRET").is_ok(),
+                scope: "math_run_root".into(),
+                protocol_version: 1,
+            },
             math_run_inputs: math_run_inputs::capability(),
             runtime_process_id: std::process::id(),
         }
