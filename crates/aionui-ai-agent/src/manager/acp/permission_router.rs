@@ -266,14 +266,13 @@ fn is_trusted_mcp_tool_request(
     let Some(server_name) = extract_mcp_server_name(request) else {
         return false;
     };
-    let Some(tool_name) = extract_mcp_tool_name(request) else {
-        return false;
-    };
+    let tool_name = extract_mcp_tool_name(request);
     let action = extract_mcp_action(request);
     let matching: Vec<&TrustedMcpToolPolicy> = policies
         .iter()
         .filter(|policy| {
-            policy.server_name == server_name && (policy.tool_name == "*" || tool_name == policy.tool_name)
+            policy.server_name == server_name
+                && (policy.tool_name == "*" || tool_name.as_deref() == Some(policy.tool_name.as_str()))
         })
         .collect();
     if matching.is_empty() {
