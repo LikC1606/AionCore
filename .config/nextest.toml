@@ -1,0 +1,6 @@
+[test-groups]
+file-watching = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'package(aionui-file) & binary(file_watching)'
+test-group = 'file-watching'
