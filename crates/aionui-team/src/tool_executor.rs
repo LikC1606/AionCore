@@ -34,13 +34,21 @@ impl<'a> TeamToolExecutor<'a> {
     }
 
     pub fn list_tools(&self, context: &TeamToolContext) -> Vec<TeamToolDescriptor> {
+        if self.scheduler.coordination_protocol.is_managed() {
+            return Vec::new();
+        }
         aionui_api_types::team_tool_descriptors_for_role(team_tool_role(context.caller_role))
     }
 
     pub async fn execute(&self, context: &TeamToolContext, call: TeamToolCall) -> Result<Value, TeamToolErrorPayload> {
         let started = Instant::now();
         let tool = call.tool.as_str();
-        let result = if is_canonical_work_tool(call.tool) {
+        let result = if self.scheduler.coordination_protocol.is_managed() {
+            Err(TeamToolErrorPayload::new(
+                TeamToolErrorCode::PermissionDenied,
+                "native Team tools are disabled for managed coordination",
+            ))
+        } else if is_canonical_work_tool(call.tool) {
             let service = self.service.upgrade().ok_or_else(|| {
                 TeamToolErrorPayload::new(
                     TeamToolErrorCode::TransportUnavailable,

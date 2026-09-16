@@ -3,7 +3,9 @@ use sqlx::SqlitePool;
 
 use crate::error::DbError;
 use crate::models::{MailboxMessageRow, TeamRow};
-use crate::repository::team::{ITeamRepository, MailboxIdempotencyParams, MailboxWriteResult, UpdateTeamParams};
+use crate::repository::team::{
+    ITeamRepository, MailboxIdempotencyParams, MailboxWriteResult, TeamCoordinationMigrationRow, UpdateTeamParams,
+};
 
 /// SQLite-backed implementation of [`ITeamRepository`].
 #[derive(Clone, Debug)]
@@ -23,9 +25,10 @@ impl ITeamRepository for SqliteTeamRepository {
 
     async fn create_team(&self, row: &TeamRow) -> Result<(), DbError> {
         sqlx::query(
-            "INSERT INTO teams (id, user_id, name, workspace, workspace_mode, agents, lead_agent_id, session_mode, agents_version, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO teams (coordination_protocol, id, user_id, name, workspace, workspace_mode, agents, lead_agent_id, session_mode, agents_version, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
+        .bind(&row.coordination_protocol)
         .bind(&row.id)
         .bind(&row.user_id)
         .bind(&row.name)
@@ -148,6 +151,83 @@ impl ITeamRepository for SqliteTeamRepository {
         }
         transaction.commit().await?;
         Ok(())
+    }
+
+    async fn get_coordination_migration(&self, team_id: &str) -> Result<Option<TeamCoordinationMigrationRow>, DbError> {
+        Ok(
+            sqlx::query_as("SELECT * FROM team_coordination_migrations WHERE team_id = ?")
+                .bind(team_id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
+    async fn migrate_coordination_protocol(
+        &self,
+        expected: &TeamRow,
+        audit: &TeamCoordinationMigrationRow,
+    ) -> Result<TeamCoordinationMigrationRow, DbError> {
+        const LEGACY: &str = r#"{"kind":"legacy_managed_migration_required"}"#;
+        const MANAGED: &str = r#"{"kind":"managed_mcp","logicalTool":"research_team"}"#;
+        if expected.id != audit.team_id || expected.user_id != audit.user_id {
+            return Err(DbError::Conflict(
+                "Team coordination migration identity mismatch".into(),
+            ));
+        }
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let current: TeamRow = sqlx::query_as("SELECT * FROM teams WHERE id = ?")
+            .bind(&expected.id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or_else(|| DbError::NotFound("Team coordination migration target not found".into()))?;
+        let existing: Option<TeamCoordinationMigrationRow> =
+            sqlx::query_as("SELECT * FROM team_coordination_migrations WHERE team_id = ?")
+                .bind(&expected.id)
+                .fetch_optional(&mut *transaction)
+                .await?;
+        if let Some(existing) = existing {
+            if existing.user_id != audit.user_id
+                || existing.migration_id != audit.migration_id
+                || existing.proof_digest != audit.proof_digest
+                || existing.proof_json != audit.proof_json
+                || current.user_id != audit.user_id
+                || current.coordination_protocol.as_deref() != Some(MANAGED)
+            {
+                return Err(DbError::Conflict("Team coordination migration replay conflict".into()));
+            }
+            transaction.commit().await?;
+            return Ok(existing);
+        }
+        let snapshot = |row: &TeamRow| {
+            serde_json::to_value(row)
+                .map_err(|_| DbError::Init("Cannot encode Team coordination migration snapshot".into()))
+        };
+        if current.coordination_protocol.as_deref() != Some(LEGACY) || snapshot(&current)? != snapshot(expected)? {
+            return Err(DbError::Conflict("Team coordination migration snapshot changed".into()));
+        }
+        let reused_id: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM team_coordination_migrations WHERE user_id = ? AND migration_id = ?")
+                .bind(&audit.user_id)
+                .bind(&audit.migration_id)
+                .fetch_optional(&mut *transaction)
+                .await?;
+        if reused_id.is_some() {
+            return Err(DbError::Conflict("Team coordination migration id already used".into()));
+        }
+        // Both writes share the transaction, so an interruption cannot leave an
+        // upgraded Team without the authorization that justified the upgrade.
+        sqlx::query("INSERT INTO team_coordination_migrations (team_id, user_id, migration_id, proof_digest, proof_json, receipt_json, applied_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+            .bind(&audit.team_id).bind(&audit.user_id).bind(&audit.migration_id)
+            .bind(&audit.proof_digest).bind(&audit.proof_json).bind(&audit.receipt_json).bind(audit.applied_at)
+            .execute(&mut *transaction).await?;
+        sqlx::query("UPDATE teams SET coordination_protocol = ?, updated_at = ? WHERE id = ?")
+            .bind(MANAGED)
+            .bind(audit.applied_at)
+            .bind(&expected.id)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(audit.clone())
     }
 
     // ── Mailbox ──────────────────────────────────────────────────────

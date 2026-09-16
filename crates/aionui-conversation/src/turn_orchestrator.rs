@@ -11,11 +11,12 @@ use tracing::{debug, error, info, warn};
 use crate::agent_health_policy::{AgentHealthAction, AgentHealthPolicy};
 use crate::runtime_state::RuntimeLifecycleState;
 use crate::runtime_state::TurnClaim;
+use crate::service::math_run_inputs::{self, IntegrityError, MathRunInputs};
 use crate::service::{
-    ConversationAgentTurnStartedCallback, ConversationService, MAX_SYSTEM_RESPONSE_CONTINUATIONS_PER_TURN,
-    agent_error_top_level_code, persist_session_key,
+    ConversationAgentTurnFailureKind, ConversationAgentTurnStartedCallback, ConversationService,
+    MAX_SYSTEM_RESPONSE_CONTINUATIONS_PER_TURN, agent_error_top_level_code, persist_session_key,
 };
-use crate::stream_relay::{RelayOutcome, StreamRelay, TurnAttemptSummary};
+use crate::stream_relay::{RelayOutcome, StreamRelay, TurnAttemptSummary, is_transport_disconnect_message};
 use crate::turn_continuation_policy::{ContinuationDecision, TurnContinuationPolicy};
 use crate::turn_recovery_policy::{TurnRecoveryDecision, TurnRecoveryPolicy};
 use aionui_api_types::{AgentErrorCode, SendMessageRequest};
@@ -52,6 +53,7 @@ pub(crate) enum ConversationTurnStatus {
 pub(crate) struct ConversationTurnResult {
     pub status: ConversationTurnStatus,
     pub error_message: Option<String>,
+    pub failure_kind: Option<ConversationAgentTurnFailureKind>,
 }
 
 pub(crate) struct ConversationTurnOrchestrator {
@@ -60,6 +62,7 @@ pub(crate) struct ConversationTurnOrchestrator {
 }
 
 struct TurnAttemptInput {
+    run_inputs: Result<Option<MathRunInputs>, IntegrityError>,
     conv_id: String,
     turn_id: String,
     user_id: String,
@@ -94,6 +97,13 @@ impl ConversationTurnOrchestrator {
     }
 
     async fn run_attempt(&self, input: TurnAttemptInput) -> Result<TurnAttemptResult, ConversationTurnResult> {
+        let run_inputs = match input.run_inputs {
+            Ok(inputs) => inputs,
+            Err(_) => return Err(self.reject_math_inputs(&input.conv_id, &input.turn_id, true).await),
+        };
+        if math_run_inputs::verify_optional(run_inputs.as_ref()).is_err() {
+            return Err(self.reject_math_inputs(&input.conv_id, &input.turn_id, true).await);
+        }
         let build_started_at = now_ms();
         let availability_agent_id = availability_agent_id(&input.build_options);
         let backend = acp_backend_from_build_options(&input.build_options).map(str::to_owned);
@@ -152,6 +162,7 @@ impl ConversationTurnOrchestrator {
                     )
                     .await;
                 return Err(ConversationTurnResult {
+                    failure_kind: None,
                     status: ConversationTurnStatus::Failed,
                     error_message: Some(failure_message),
                 });
@@ -182,6 +193,7 @@ impl ConversationTurnOrchestrator {
                 )
                 .await;
             return Err(ConversationTurnResult {
+                failure_kind: None,
                 status: ConversationTurnStatus::Failed,
                 error_message: Some(failure_message),
             });
@@ -261,6 +273,7 @@ impl ConversationTurnOrchestrator {
                             )
                             .await;
                         return Err(ConversationTurnResult {
+                            failure_kind: None,
                             status: ConversationTurnStatus::Failed,
                             error_message: Some(failure_message),
                         });
@@ -273,8 +286,18 @@ impl ConversationTurnOrchestrator {
             let feedback_service = self.service.clone();
             let feedback_agent_id = availability_agent_id.clone();
             let (send_error_tx, send_error_rx) = oneshot::channel();
+            let send_inputs = run_inputs.clone();
 
             let send_task = tokio::spawn(async move {
+                // Cold task build, runtime-mode confirmation and task scheduling
+                // may all await. Verify in the sending task, immediately before
+                // handing the prompt to the agent, including every continuation.
+                if math_run_inputs::verify_optional(send_inputs.as_ref()).is_err() {
+                    let _ = send_error_tx.send(AgentSendError::from_agent_error(AgentError::bad_request(
+                        math_run_inputs::INTEGRITY_MESSAGE,
+                    )));
+                    return true;
+                }
                 match send_agent.send_message(current_send).await {
                     Ok(()) => {}
                     Err(e) => {
@@ -315,16 +338,27 @@ impl ConversationTurnOrchestrator {
                         let _ = send_error_tx.send(e);
                     }
                 }
+                false
             });
 
             let outcome = relay.consume_with_send_error(rx, send_error_rx).await;
-            if let Err(error) = send_task.await {
-                error!(
-                    conversation_id = %input.conv_id,
-                    turn_id = %input.turn_id,
-                    error = %error,
-                    "Agent send task terminated unexpectedly"
-                );
+            match send_task.await {
+                Ok(true) => {
+                    // Publish errors deferred by the ordinary retry policy, but
+                    // bypass continuation and auto-replay for identity loss.
+                    return Err(self
+                        .reject_math_inputs(&input.conv_id, &input.turn_id, outcome.attempt.terminal_error_deferred)
+                        .await);
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    error!(
+                        conversation_id = %input.conv_id,
+                        turn_id = %input.turn_id,
+                        error = %error,
+                        "Agent send task terminated unexpectedly"
+                    );
+                }
             }
             aggregate_summary.merge(&outcome.attempt);
 
@@ -386,7 +420,9 @@ impl ConversationTurnOrchestrator {
         let mut replay_started_at = None;
         let mut final_error_message;
         let mut auth_failure = false;
+        let mut failure_kind = None;
         let prompt_accepted = Arc::new(AtomicBool::new(false));
+        let run_inputs = math_run_inputs::from_persisted_extra(&input.conversation.extra);
 
         info!(conversation_id = %conv_id, turn_id = %turn_id, "conversation turn orchestrator started");
 
@@ -394,6 +430,7 @@ impl ConversationTurnOrchestrator {
             let attempt_number = if replayed { 2 } else { 1 };
             let attempt_result = match self
                 .run_attempt(TurnAttemptInput {
+                    run_inputs: run_inputs.clone(),
                     conv_id: conv_id.clone(),
                     turn_id: turn_id.clone(),
                     user_id: input.user_id.clone(),
@@ -412,6 +449,7 @@ impl ConversationTurnOrchestrator {
             {
                 Ok(result) => result,
                 Err(result) => {
+                    failure_kind = result.failure_kind;
                     final_error_message = result.error_message;
                     break result.status == ConversationTurnStatus::Failed;
                 }
@@ -535,12 +573,42 @@ impl ConversationTurnOrchestrator {
             .await;
 
         ConversationTurnResult {
+            failure_kind,
             status: if final_failed {
                 ConversationTurnStatus::Failed
             } else {
                 ConversationTurnStatus::Completed
             },
             error_message: if final_failed { final_error_message } else { None },
+        }
+    }
+
+    async fn reject_math_inputs(
+        &self,
+        conversation_id: &str,
+        turn_id: &str,
+        persist_tip: bool,
+    ) -> ConversationTurnResult {
+        error!(
+            conversation_id,
+            turn_id,
+            error_code = math_run_inputs::INTEGRITY_CODE,
+            "Mathematics turn rejected because frozen run inputs failed integrity checks"
+        );
+        if persist_tip {
+            self.service
+                .persist_and_broadcast_send_failure_tip(
+                    conversation_id,
+                    turn_id,
+                    &AgentSendError::from_agent_error(AgentError::bad_request(math_run_inputs::INTEGRITY_MESSAGE)),
+                    Some(math_run_inputs::INTEGRITY_CODE),
+                )
+                .await;
+        }
+        ConversationTurnResult {
+            failure_kind: Some(ConversationAgentTurnFailureKind::RunInputsIntegrity),
+            status: ConversationTurnStatus::Failed,
+            error_message: Some(math_run_inputs::INTEGRITY_MESSAGE.into()),
         }
     }
 }
@@ -594,12 +662,16 @@ fn send_error_display_message(error: &AgentSendError) -> String {
 
 fn turn_attempt_error_message(summary: &TurnAttemptSummary) -> Option<String> {
     summary.terminal_error.as_ref().map(|error| {
-        error
-            .detail
-            .as_deref()
-            .filter(|detail| !detail.trim().is_empty())
-            .unwrap_or(error.message.as_str())
-            .to_owned()
+        if is_transport_disconnect_message(&error.message) {
+            error.message.clone()
+        } else {
+            error
+                .detail
+                .as_deref()
+                .filter(|detail| !detail.trim().is_empty())
+                .unwrap_or(error.message.as_str())
+                .to_owned()
+        }
     })
 }
 

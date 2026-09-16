@@ -1027,6 +1027,7 @@ pub(crate) mod workspace_harness {
 
     pub(crate) fn single_agent_team_request(name: &str) -> CreateTeamRequest {
         CreateTeamRequest {
+            coordination_protocol: Default::default(),
             name: name.into(),
             agents: vec![aionui_api_types::TeamAgentInput {
                 name: "Lead".into(),

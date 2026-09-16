@@ -14,8 +14,10 @@ use aionui_ai_agent::ActiveLeaseRegistry;
 use aionui_api_types::{
     AddAgentRequest, ApiResponse, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest,
     GetConfigOptionsResponse, PauseTeamSlotRequest, RenameAgentRequest, RenameTeamRequest, SendAgentMessageRequest,
-    SendTeamMessageRequest, SetModeRequest, TeamAgentResponse, TeamListResponse, TeamResponse, TeamRunAckResponse,
-    TeamRunStateResponse, TeamWorkEventResponse, TeamWorkItemResponse, TeamWorkItemSnapshotResponse,
+    SendTeamMessageRequest, SetModeRequest, TeamAgentResponse, TeamCoordinationMigrationRequest,
+    TeamCoordinationMigrationResponse, TeamCoordinationMigrationSnapshot, TeamListResponse, TeamResponse,
+    TeamRunAckResponse, TeamRunStateResponse, TeamWorkEventResponse, TeamWorkItemResponse,
+    TeamWorkItemSnapshotResponse,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -115,6 +117,10 @@ pub fn team_routes(state: TeamRouterState) -> Router {
         .route("/api/teams", post(create_team).get(list_teams))
         .route("/api/teams/{id}", get(get_team).delete(remove_team))
         .route("/api/teams/{id}/run-state", get(get_run_state))
+        .route(
+            "/api/teams/{id}/coordination-protocol/migration",
+            get(coordination_migration_snapshot).post(migrate_coordination_protocol),
+        )
         .route("/api/teams/{id}/work-items", get(list_work_items))
         .route(
             "/api/teams/{id}/work-items/delegate",
@@ -175,6 +181,34 @@ async fn create_team(
     let Json(req) = body.map_err(ApiError::from)?;
     let team = state.service.create_team(&user.id, req).await?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(team))))
+}
+
+async fn coordination_migration_snapshot(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(team_id): Path<String>,
+) -> Result<Json<ApiResponse<TeamCoordinationMigrationSnapshot>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .coordination_migration_snapshot(&user.id, &team_id)
+            .await?,
+    )))
+}
+
+async fn migrate_coordination_protocol(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(team_id): Path<String>,
+    body: Result<Json<TeamCoordinationMigrationRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<TeamCoordinationMigrationResponse>>, ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .migrate_coordination_protocol(&user.id, &team_id, request)
+            .await?,
+    )))
 }
 
 async fn list_teams(

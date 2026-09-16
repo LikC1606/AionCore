@@ -2,10 +2,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use aionui_api_types::WebSocketMessage;
+use aionui_api_types::{RuntimeEventGap, WebSocketMessage};
 use dashmap::DashMap;
 use serde_json::json;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -23,6 +23,7 @@ pub type TokenValidator = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 pub struct WebSocketManager {
     connections: Arc<DashMap<ConnectionId, ClientInfo>>,
     next_id: AtomicU64,
+    forced_close: DashMap<ConnectionId, oneshot::Sender<()>>,
 }
 
 impl WebSocketManager {
@@ -30,17 +31,40 @@ impl WebSocketManager {
         Self {
             connections: Arc::new(DashMap::new()),
             next_id: AtomicU64::new(1),
+            forced_close: DashMap::new(),
         }
     }
 
     /// Register a new client connection and return its assigned ID.
     pub fn add_client(&self, token: String, tx: mpsc::Sender<WsOutbound>) -> ConnectionId {
+        self.register_client(token, tx, None)
+    }
+
+    /// Out-of-band shutdown is not blocked by a saturated outbound queue.
+    pub fn add_client_with_close(
+        &self,
+        token: String,
+        tx: mpsc::Sender<WsOutbound>,
+    ) -> (ConnectionId, oneshot::Receiver<()>) {
+        let (close_tx, close_rx) = oneshot::channel();
+        (self.register_client(token, tx, Some(close_tx)), close_rx)
+    }
+
+    fn register_client(
+        &self,
+        token: String,
+        tx: mpsc::Sender<WsOutbound>,
+        close: Option<oneshot::Sender<()>>,
+    ) -> ConnectionId {
         let id = ConnectionId(self.next_id.fetch_add(1, Ordering::Relaxed));
         let info = ClientInfo {
             token,
             last_ping: Instant::now(),
             tx,
         };
+        if let Some(close) = close {
+            self.forced_close.insert(id, close);
+        }
         self.connections.insert(id, info);
         debug!(%id, "client added");
         id
@@ -51,6 +75,50 @@ impl WebSocketManager {
         if self.connections.remove(&conn_id).is_some() {
             debug!(%conn_id, "client removed");
         }
+        if let Some((_, close)) = self.forced_close.remove(&conn_id) {
+            let _ = close.send(());
+        }
+    }
+
+    pub fn disconnect_all(&self) {
+        let ids: Vec<_> = self.connections.iter().map(|entry| *entry.key()).collect();
+        for id in ids {
+            self.remove_client(id);
+        }
+    }
+
+    /// A bus gap invalidates client projections but does not end the bridge.
+    pub async fn receive_event(
+        &self,
+        receiver: &mut broadcast::Receiver<WebSocketMessage<serde_json::Value>>,
+    ) -> Option<WebSocketMessage<serde_json::Value>> {
+        loop {
+            match receiver.recv().await {
+                Ok(event) => return Some(event),
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(skipped, "event bridge lagged; client snapshots require reconciliation");
+                    self.report_event_gap(skipped);
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    warn!("event bridge closed; disconnecting clients");
+                    self.disconnect_all();
+                    return None;
+                }
+            }
+        }
+    }
+
+    /// Use only payload-free metadata when an event cannot be delivered safely.
+    pub fn report_event_gap(&self, skipped: u64) {
+        let gap = RuntimeEventGap {
+            skipped,
+            observed_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+        };
+        self.broadcast_all(WebSocketMessage::new("runtime.eventGap", serde_json::json!(gap)));
     }
 
     /// Update the last heartbeat timestamp for a connection.
@@ -69,9 +137,10 @@ impl WebSocketManager {
     ///
     /// Uses `try_send` for backpressure. A saturated channel cannot reliably
     /// receive an additional `REALTIME_BACKPRESSURE` event on the same path, so
-    /// broadcast backpressure is logged and the connection is left alive.
-    /// Closed channels trigger client removal.
+    /// critical-event backpressure closes the connection to force reconciliation.
+    /// Ordinary telemetry may be dropped. Closed channels trigger client removal.
     pub fn broadcast_all(&self, msg: WebSocketMessage<serde_json::Value>) {
+        let critical = requires_reconciliation(&msg.name);
         let text = match serde_json::to_string(&msg) {
             Ok(t) => t,
             Err(e) => {
@@ -86,8 +155,12 @@ impl WebSocketManager {
             match entry.value().tx.try_send(WsOutbound::Text(text.clone())) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
+                    if critical {
+                        disconnected.push(conn_id);
+                    }
                     warn!(
                         %conn_id,
+                        critical,
                         code = RealtimeError::Backpressure.code(),
                         "outbound channel full, broadcast message dropped"
                     );
@@ -116,6 +189,7 @@ impl WebSocketManager {
         msg: WebSocketMessage<serde_json::Value>,
         resolve_user: &(dyn Fn(&str) -> Option<String> + Send + Sync),
     ) {
+        let critical = requires_reconciliation(&msg.name);
         let text = match serde_json::to_string(&msg) {
             Ok(text) => text,
             Err(error) => {
@@ -134,8 +208,12 @@ impl WebSocketManager {
             match client.tx.try_send(WsOutbound::Text(text.clone())) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
+                    if critical {
+                        disconnected.push(conn_id);
+                    }
                     warn!(
                         %conn_id,
+                        critical,
                         code = RealtimeError::Backpressure.code(),
                         "outbound channel full, user-scoped message dropped"
                     );
@@ -151,6 +229,7 @@ impl WebSocketManager {
 
     /// Send a message to a specific connection.
     pub fn send_to(&self, conn_id: ConnectionId, msg: WebSocketMessage<serde_json::Value>) {
+        let critical = requires_reconciliation(&msg.name);
         let text = match serde_json::to_string(&msg) {
             Ok(t) => t,
             Err(e) => {
@@ -162,7 +241,7 @@ impl WebSocketManager {
             }
         };
 
-        self.send_raw_to(conn_id, WsOutbound::Text(text));
+        self.send_raw(conn_id, WsOutbound::Text(text), critical);
     }
 
     /// Send a raw outbound message to a specific connection.
@@ -171,6 +250,10 @@ impl WebSocketManager {
     /// channel cannot receive a send-failure event through the same queue, so
     /// backpressure is logged as the downgrade path.
     pub fn send_raw_to(&self, conn_id: ConnectionId, outbound: WsOutbound) {
+        self.send_raw(conn_id, outbound, false);
+    }
+
+    fn send_raw(&self, conn_id: ConnectionId, outbound: WsOutbound, critical: bool) {
         if let Some(client) = self.connections.get(&conn_id) {
             match client.tx.try_send(outbound) {
                 Ok(()) => {}
@@ -180,6 +263,10 @@ impl WebSocketManager {
                         code = RealtimeError::SendFailed.code(),
                         "outbound channel full, raw message dropped"
                     );
+                    if critical {
+                        drop(client);
+                        self.remove_client(conn_id);
+                    }
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
                     drop(client);
@@ -207,6 +294,20 @@ impl WebSocketManager {
             }
         })
     }
+}
+
+fn requires_reconciliation(name: &str) -> bool {
+    matches!(
+        name,
+        "runtime.eventGap"
+            | "runtime.subscriptionReady"
+            | "team.runCompleted"
+            | "team.runFailed"
+            | "team.runCancelled"
+            | "team.childTurnCompleted"
+            | "team.childTurnCancelled"
+            | "team.childTurnFailed"
+    )
 }
 
 impl Default for WebSocketManager {
@@ -301,6 +402,90 @@ fn terminal_realtime_error(conn_id: ConnectionId, error: RealtimeError, reason: 
 mod tests {
     use super::*;
     use crate::types::PER_CONNECTION_BUFFER;
+
+    #[tokio::test]
+    async fn lag_emits_payload_free_gap_and_continues_to_receive_events() {
+        let manager = WebSocketManager::new();
+        let (outbound, mut client) = mpsc::channel(8);
+        manager.add_client("owner".into(), outbound);
+        let (bus, mut receiver) = broadcast::channel(1);
+        bus.send(WebSocketMessage::new("private", json!({"secret": "not-in-gap"})))
+            .unwrap();
+        bus.send(WebSocketMessage::new("latest", json!({}))).unwrap();
+        assert_eq!(manager.receive_event(&mut receiver).await.unwrap().name, "latest");
+        let WsOutbound::Text(gap) = client.recv().await.unwrap() else {
+            panic!("expected gap");
+        };
+        let value: serde_json::Value = serde_json::from_str(&gap).unwrap();
+        assert_eq!(value["name"], "runtime.eventGap");
+        assert_eq!(value["data"]["skipped"], 1);
+        assert_eq!(value["data"].as_object().unwrap().len(), 2);
+        assert!(value["data"]["observedAt"].as_u64().unwrap() > 0);
+        bus.send(WebSocketMessage::new("after-gap", json!({}))).unwrap();
+        assert_eq!(manager.receive_event(&mut receiver).await.unwrap().name, "after-gap");
+    }
+
+    #[tokio::test]
+    async fn closed_event_bus_forces_live_sockets_to_disconnect() {
+        let manager = WebSocketManager::new();
+        let (outbound, _client) = mpsc::channel(1);
+        let (_, closed) = manager.add_client_with_close("owner".into(), outbound);
+        let (bus, mut receiver) = broadcast::channel(1);
+        drop(bus);
+        assert!(manager.receive_event(&mut receiver).await.is_none());
+        assert_eq!(manager.client_count(), 0);
+        closed.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn critical_backpressure_disconnects_even_with_an_extra_sender_alive() {
+        for name in [
+            "runtime.eventGap",
+            "team.runCompleted",
+            "team.runFailed",
+            "team.runCancelled",
+            "team.childTurnCompleted",
+            "team.childTurnCancelled",
+        ] {
+            let manager = WebSocketManager::new();
+            let (outbound, _client) = mpsc::channel(1);
+            outbound.try_send(WsOutbound::Text("full".into())).unwrap();
+            let (_, closed) = manager.add_client_with_close("owner".into(), outbound.clone());
+            manager.broadcast_all(WebSocketMessage::new(name, json!({})));
+            assert_eq!(manager.client_count(), 0, "{name}");
+            closed.await.unwrap();
+            drop(outbound);
+        }
+    }
+
+    #[tokio::test]
+    async fn user_scoped_terminal_pressure_does_not_disconnect_other_users() {
+        let manager = WebSocketManager::new();
+        let (owner, _owner_rx) = mpsc::channel(1);
+        owner.try_send(WsOutbound::Text("full".into())).unwrap();
+        let (_, closed) = manager.add_client_with_close("owner".into(), owner);
+        let (other, mut other_rx) = mpsc::channel(1);
+        manager.add_client("other".into(), other);
+        manager.broadcast_to_user(
+            "owner",
+            WebSocketMessage::new("team.runCompleted", json!({"team_id": "private"})),
+            &|token| Some(token.to_owned()),
+        );
+        closed.await.unwrap();
+        assert_eq!(manager.client_count(), 1);
+        assert!(other_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn ordinary_telemetry_pressure_preserves_connection() {
+        let manager = WebSocketManager::new();
+        let (outbound, _client) = mpsc::channel(1);
+        outbound.try_send(WsOutbound::Text("full".into())).unwrap();
+        let (_, mut closed) = manager.add_client_with_close("owner".into(), outbound);
+        manager.broadcast_all(WebSocketMessage::new("team.runUpdated", json!({})));
+        assert_eq!(manager.client_count(), 1);
+        assert!(closed.try_recv().is_err());
+    }
 
     fn always_valid() -> TokenValidator {
         Arc::new(|_| true)

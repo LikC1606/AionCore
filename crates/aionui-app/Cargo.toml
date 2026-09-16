@@ -64,6 +64,7 @@ windows-sys = { version = "0.61", features = [
 libc.workspace = true
 
 [dev-dependencies]
+ed25519-dalek.workspace = true
 aionui-api-types.workspace = true
 aionui-realtime.workspace = true
 # Enable the `AgentInstance::Mock` variant so tests can build fake agents

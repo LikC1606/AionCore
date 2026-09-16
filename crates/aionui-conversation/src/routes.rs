@@ -3,14 +3,15 @@
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, patch, post};
 
 use aionui_api_types::{
     ActiveCountResponse, ApiResponse, ApprovalCheckQuery, ApprovalCheckResponse, CancelConversationRequest,
     CancelConversationResponse, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse,
     ConversationArtifactListResponse, ConversationArtifactResponse, ConversationListResponse, ConversationResponse,
-    CreateConversationRequest, EnsureConversationRuntimeResponse, ListConversationsQuery, ListMessagesQuery,
+    ConversationRuntimeCapabilitiesResponse, CreateConversationRequest, EnsureConversationRuntimeResponse,
+    ListConversationsQuery, ListMessagesQuery, MathBudgetBindingRequest, MathBudgetBindingResponse,
     MessageListResponse, MessageResponse, MessageSearchResponse, SearchMessagesQuery, SendMessageRequest,
     SendMessageResponse, UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
@@ -107,6 +108,11 @@ impl From<ConversationError> for ApiError {
 /// All routes require authentication (applied by the caller).
 pub fn conversation_routes(state: ConversationRouterState) -> Router {
     Router::new()
+        .route("/api/conversations/runtime-capabilities", get(runtime_capabilities))
+        .route(
+            "/api/conversations/{id}/math-budget-binding",
+            post(register_math_budget_binding).delete(revoke_math_budget_binding),
+        )
         .route("/api/conversations", post(create).get(list))
         .route("/api/conversations/{id}", get(get_one).patch(update).delete(delete_one))
         .route("/api/conversations/{id}/reset", post(reset))
@@ -130,6 +136,57 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
 }
 
 // ── Handlers ───────────────────────────────────────────────────────
+
+async fn runtime_capabilities(
+    State(state): State<ConversationRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+) -> Json<ApiResponse<ConversationRuntimeCapabilitiesResponse>> {
+    Json(ApiResponse::ok(state.service.runtime_capabilities()))
+}
+
+async fn register_math_budget_binding(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Result<Json<MathBudgetBindingRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<MathBudgetBindingResponse>>, ApiError> {
+    let supplied = headers
+        .get("x-deepscientist-math-host-secret")
+        .and_then(|value| value.to_str().ok());
+    state
+        .service
+        .authorize_math_budget_host(supplied)
+        .map_err(ApiError::from)?;
+    let Json(request) = body.map_err(ApiError::from)?;
+    state
+        .service
+        .register_math_budget_binding(&user.id, &id, request)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(MathBudgetBindingResponse { ok: true })))
+}
+
+async fn revoke_math_budget_binding(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<ApiResponse<MathBudgetBindingResponse>>, ApiError> {
+    let supplied = headers
+        .get("x-deepscientist-math-host-secret")
+        .and_then(|value| value.to_str().ok());
+    state
+        .service
+        .authorize_math_budget_host(supplied)
+        .map_err(ApiError::from)?;
+    state
+        .service
+        .revoke_math_budget_binding(&user.id, &id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(MathBudgetBindingResponse { ok: true })))
+}
 
 async fn create(
     State(state): State<ConversationRouterState>,

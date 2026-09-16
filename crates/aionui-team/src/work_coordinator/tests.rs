@@ -176,6 +176,47 @@ fn retryable_start_returns_the_same_intents_to_the_queue() {
 }
 
 #[test]
+fn transport_recovery_replaces_lead_batch_without_failing_run_or_duplicating_message() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", TeamRunTargetRole::Lead, RuntimeConstraint::Ready);
+    let lease = coordinator
+        .acquire_enqueue(EnqueueRequest {
+            slot_id: "lead-1".into(),
+            role: TeamRunTargetRole::Lead,
+            source: WorkSource::UserMessage,
+            binding: CausalBinding::UserVisible,
+        })
+        .unwrap();
+    coordinator.commit_enqueue(&lease, Some("original".into())).unwrap();
+    let ReconcileDecision::Claim(batch) = coordinator.next("lead-1") else {
+        panic!("lead batch must be claimable");
+    };
+    assert_eq!(batch.team_run_ids, vec!["run-1"]);
+
+    assert_eq!(
+        coordinator.recover_transport_batch(&batch, "recovery".into()),
+        CommitResult::Committed
+    );
+    let intents = coordinator.intents_for_slot("lead-1");
+    assert_eq!(intents.len(), 2);
+    assert!(
+        intents
+            .iter()
+            .any(|intent| intent.mailbox_message_id.as_deref() == Some("recovery")
+                && intent.state == WorkIntentState::Queued
+                && intent.team_run_id.as_deref() == Some("run-1")
+                && intent.source == WorkSource::TransportRecovery)
+    );
+    assert_eq!(coordinator.slot_snapshot("lead-1").unwrap().active_batch, None);
+
+    assert_eq!(
+        coordinator.recover_transport_batch(&batch, "recovery".into()),
+        CommitResult::Committed
+    );
+    assert_eq!(coordinator.intents_for_slot("lead-1").len(), 2);
+}
+
+#[test]
 fn foreground_message_resumes_paused_slot() {
     let coordinator = coordinator();
     coordinator.set_runtime_constraint("lead-1", TeamRunTargetRole::Lead, RuntimeConstraint::Ready);

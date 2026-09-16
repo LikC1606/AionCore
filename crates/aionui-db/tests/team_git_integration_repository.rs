@@ -13,6 +13,7 @@ async fn setup() -> (aionui_db::Database, Arc<SqliteTeamModeRepository>) {
     let team_repo = SqliteTeamRepository::new(db.pool().clone());
     team_repo
         .create_team(&TeamRow {
+            coordination_protocol: None,
             id: "team-1".into(),
             user_id: "user-1".into(),
             name: "Integration Team".into(),

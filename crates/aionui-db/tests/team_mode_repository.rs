@@ -25,6 +25,7 @@ async fn repository() -> (SqliteTeamModeRepository, aionui_db::Database) {
 fn team(id: &str) -> TeamRow {
     let timestamp = now_ms();
     TeamRow {
+        coordination_protocol: None,
         id: id.into(),
         user_id: "system_default_user".into(),
         name: format!("Team {id}"),

@@ -6,7 +6,9 @@ use aionui_ai_agent::{AgentSendError, AgentStreamEvent, protocol::events::Thinki
 
 use crate::response_middleware::{ISkillLoadService, MessageMiddleware, MiddlewareResult};
 use crate::skill_resolver::{LoadedAgentSkill, SkillResolver};
-use aionui_api_types::{AgentErrorCode, WebSocketMessage};
+use aionui_api_types::{
+    AgentErrorCode, AgentErrorOwnership, AgentErrorResolution, AgentErrorResolutionKind, WebSocketMessage,
+};
 use aionui_common::{ErrorChain, normalize_keys_to_snake_case, now_ms};
 
 use crate::runtime_persistence::RuntimePersistenceCoordinator;
@@ -319,14 +321,13 @@ impl StreamRelay {
                             .prompt_accepted
                             .as_ref()
                             .is_some_and(|accepted| accepted.swap(true, Ordering::SeqCst))
+                        && let Some(on_started) = self.on_started.clone()
                     {
-                        if let Some(on_started) = self.on_started.clone() {
-                            on_started(ConversationAgentTurnStarted {
-                                conversation_id: self.conversation_id.clone(),
-                                turn_id: self.turn_id.clone(),
-                            })
-                            .await;
-                        }
+                        on_started(ConversationAgentTurnStarted {
+                            conversation_id: self.conversation_id.clone(),
+                            turn_id: self.turn_id.clone(),
+                        })
+                        .await;
                     }
                     if !first_agent_event_logged {
                         first_agent_event_logged = true;
@@ -412,13 +413,29 @@ impl StreamRelay {
                             }
                         }
                         AgentStreamEvent::Finish(_) | AgentStreamEvent::Error(_) => {
+                            // Some ACP clients report an upstream disconnect as a
+                            // normal Finish after writing their reconnect trace to
+                            // the text stream. Promote that trace to a structured
+                            // retryable error so Team can continue the existing
+                            // Lead turn without replaying its side effects.
+                            let transport_error = if matches!(&event, AgentStreamEvent::Finish(_)) {
+                                detect_transport_disconnect(&full_text_buffer)
+                            } else {
+                                None
+                            };
+                            let effective_event = transport_error
+                                .as_ref()
+                                .map(|data| AgentStreamEvent::Error(data.clone()));
+                            let event_for_terminal = effective_event.as_ref().unwrap_or(&event);
                             let elapsed_ms = now_ms() - started_at;
-                            let event_type = if matches!(event, AgentStreamEvent::Finish(_)) {
+                            let event_type = if transport_error.is_some() {
+                                "TransportDisconnect"
+                            } else if matches!(event, AgentStreamEvent::Finish(_)) {
                                 "Finish"
                             } else {
                                 "Error"
                             };
-                            let terminal = Self::terminal_from_event(&event);
+                            let terminal = Self::terminal_from_event(event_for_terminal);
                             info!(
                                 target: "aionui_feedback_diagnostics",
                                 diagnostic_event = "feedback.runtime.turn_terminal",
@@ -470,7 +487,7 @@ impl StreamRelay {
                                 self.close_active_text_segment(
                                     &mut active_text,
                                     &mut text_segments,
-                                    if matches!(event, AgentStreamEvent::Error(_)) {
+                                    if matches!(event_for_terminal, AgentStreamEvent::Error(_)) {
                                         "error"
                                     } else {
                                         "finish"
@@ -478,8 +495,8 @@ impl StreamRelay {
                                 )
                                 .await;
                             }
-                            self.forward_to_websocket(&event);
-                            if let AgentStreamEvent::Error(data) = &event {
+                            self.forward_to_websocket(event_for_terminal);
+                            if let AgentStreamEvent::Error(data) = event_for_terminal {
                                 attempt.terminal_error = Some(data.clone());
                             }
                             let mut outcome = if deleting {
@@ -489,7 +506,8 @@ impl StreamRelay {
                                     attempt: attempt.clone(),
                                 }
                             } else {
-                                self.finalize(&full_text_buffer, &text_segments, &event, terminal).await
+                                self.finalize(&full_text_buffer, &text_segments, event_for_terminal, terminal)
+                                    .await
                             };
                             outcome.attempt = attempt.clone();
                             if !full_text_buffer.is_empty() {
@@ -823,6 +841,46 @@ impl StreamRelay {
     }
 }
 
+/// Detect the Codex ACP failure mode where the CLI emits reconnect diagnostics
+/// as text and then closes with a misleading Finish event. Keep this matcher
+/// deliberately narrow so ordinary mathematical prose mentioning disconnects
+/// is never classified as a transport failure.
+pub fn detect_transport_disconnect(text: &str) -> Option<ErrorEventData> {
+    let lower = text.to_ascii_lowercase();
+    if !lower.contains("stream disconnected before completion") || !lower.contains("error sending request for url") {
+        return None;
+    }
+
+    let detail = text
+        .lines()
+        .rev()
+        .take(8)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(ErrorEventData::classified(
+        "The model stream disconnected before completion.",
+        AgentErrorCode::UserLlmProviderNetworkError,
+        AgentErrorOwnership::UserLlmProvider,
+        (!detail.trim().is_empty()).then_some(detail),
+        true,
+        false,
+        Some(AgentErrorResolution::new(
+            AgentErrorResolutionKind::ReconnectAgent,
+            None,
+        )),
+    ))
+}
+
+/// Recognize the concise message retained after a raw disconnect trace has
+/// already been converted into structured error data.
+pub fn is_transport_disconnect_message(text: &str) -> bool {
+    text.to_ascii_lowercase()
+        .contains("stream disconnected before completion")
+}
+
 struct SharedSkillResolver {
     resolver: Arc<dyn SkillResolver>,
     allowed_skill_names: Vec<String>,
@@ -856,6 +914,29 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use tracing::Level;
     use tracing_subscriber::fmt;
+
+    #[test]
+    fn detects_codex_finish_with_disconnect_trace() {
+        let error = detect_transport_disconnect(
+            "Reconnecting... 1/5\nReconnecting... 5/5\nstream disconnected before completion:\nerror sending request for url (http://provider/responses)",
+        )
+        .expect("transport trace should be classified");
+        assert_eq!(error.code, Some(AgentErrorCode::UserLlmProviderNetworkError));
+        assert_eq!(error.retryable, Some(true));
+        assert!(
+            error
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("stream disconnected before completion")
+        );
+    }
+
+    #[test]
+    fn does_not_detect_ordinary_disconnect_prose() {
+        assert!(detect_transport_disconnect("The proof disconnects the graph into two components.").is_none());
+        assert!(detect_transport_disconnect("stream disconnected before completion").is_none());
+    }
 
     // ── run() async tests ─────────────────────────────────────────
 
@@ -1201,6 +1282,40 @@ mod tests {
         let content: serde_json::Value = serde_json::from_str(&msg.content).unwrap();
         assert_eq!(content["content"], "Something went wrong");
         assert_eq!(content["type"], "error");
+    }
+
+    #[tokio::test]
+    async fn run_disconnect_trace_in_finish_becomes_retryable_error() {
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, rx) = broadcast::channel(64);
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo,
+            bus,
+        );
+
+        tx.send(AgentStreamEvent::Text(TextEventData {
+            content: "Reconnecting... 5/5\nstream disconnected before completion:\nerror sending request for url (http://provider/responses)".into(),
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        let outcome = relay.consume(rx).await;
+        assert_eq!(
+            outcome.terminal,
+            RelayTerminal::Error {
+                code: Some(AgentErrorCode::UserLlmProviderNetworkError),
+                retryable: Some(true),
+            }
+        );
+        assert_eq!(
+            outcome.attempt.terminal_error.as_ref().and_then(|error| error.code),
+            Some(AgentErrorCode::UserLlmProviderNetworkError)
+        );
     }
 
     #[test]

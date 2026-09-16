@@ -8,6 +8,12 @@ use serde_json::json;
 const CODEX_CONFIG_FLAG: &str = "-c";
 const CODEX_CONFIG_ENV: &str = "CODEX_CONFIG";
 const CODEX_WINDOWS_UNELEVATED_SANDBOX: &str = "windows.sandbox=\"unelevated\"";
+#[cfg(test)]
+const MATH_BUDGET_ENV: [&str; 3] = [
+    "DEEPSCIENTIST_MATH_BUDGET_SOCKET",
+    "DEEPSCIENTIST_MATH_BUDGET_SECRET",
+    "DEEPSCIENTIST_MATH_BUDGET_MAX_OUTPUT_TOKENS",
+];
 
 pub(super) struct AcpLaunchPolicyInput<'a> {
     pub metadata: &'a AgentMetadata,
@@ -21,6 +27,10 @@ pub(super) fn apply_acp_launch_policy(
     command_spec: &mut CommandSpec,
     input: AcpLaunchPolicyInput<'_>,
 ) -> Result<(), String> {
+    if command_spec.env.iter().any(|entry| is_math_budget_env(&entry.name)) {
+        return Err("math_budget_launch_env_invalid: budget binding must come from session runtime".to_owned());
+    }
+    validate_math_budget_backend(input.metadata.backend.as_deref(), input.runtime_env)?;
     let initial_mode = initial_mode_from_build_context(input.metadata, input.config, input.session_snapshot);
     apply_codex_runtime_config_args(command_spec, input.metadata, initial_mode.as_deref());
     append_runtime_env(command_spec, input.runtime_env);
@@ -42,6 +52,20 @@ fn append_runtime_env(command_spec: &mut CommandSpec, runtime_env: &[(String, St
             value: value.clone(),
         });
     }
+}
+
+pub(super) fn validate_math_budget_backend(
+    backend: Option<&str>,
+    runtime_env: &[(String, String)],
+) -> Result<(), String> {
+    if runtime_env.iter().any(|(name, _)| is_math_budget_env(name)) && backend != Some("codex") {
+        return Err("math_budget_backend_invalid: math budget environment is restricted to Codex ACP".to_owned());
+    }
+    Ok(())
+}
+
+fn is_math_budget_env(name: &str) -> bool {
+    name.to_ascii_uppercase().starts_with("DEEPSCIENTIST_MATH_BUDGET_")
 }
 
 fn append_claude_provider_env(command_spec: &mut CommandSpec, metadata: &AgentMetadata) {
@@ -145,7 +169,8 @@ fn append_codex_config_env(
             "inherit": "all",
             "experimental_use_profile": false,
             "include_only": [],
-            "exclude": ["DEEPSEEK_API_KEY"],
+            "exclude": ["DEEPSEEK_API_KEY", "DEEPSCIENTIST_MATH_BUDGET_*"],
+            "set": {},
         },
         "features": features,
         "sandbox_mode": sandbox_mode,
@@ -328,6 +353,11 @@ mod tests {
         assert_eq!(value["features"]["shell_snapshot"], false);
         assert!(value["features"].get("multi_agent").is_none());
         assert_eq!(value["shell_environment_policy"]["exclude"][0], "DEEPSEEK_API_KEY");
+        assert_eq!(
+            value["shell_environment_policy"]["exclude"][1],
+            "DEEPSCIENTIST_MATH_BUDGET_*"
+        );
+        assert_eq!(value["shell_environment_policy"]["set"], json!({}));
         assert_eq!(value["shell_environment_policy"]["include_only"], serde_json::json!([]));
     }
 
@@ -475,6 +505,94 @@ mod tests {
         .expect("non-Codex launch policy should succeed");
 
         assert_eq!(command_spec.args, vec!["claude-agent-acp.js"]);
+    }
+
+    #[test]
+    fn apply_acp_launch_policy_rejects_budget_environment_for_non_codex_agents() {
+        let mut command_spec = CommandSpec {
+            command: "node".into(),
+            args: vec!["claude-agent-acp.js".into()],
+            env: vec![],
+            cwd: None,
+        };
+        let error = apply_acp_launch_policy(
+            &mut command_spec,
+            AcpLaunchPolicyInput {
+                metadata: &agent_metadata_with_backend(Some("claude")),
+                config: &AcpBuildExtra::default(),
+                session_snapshot: None,
+                runtime_env: &[(MATH_BUDGET_ENV[1].into(), "redacted".into())],
+                belongs_to_team: false,
+            },
+        )
+        .expect_err("budget environment must not reach non-Codex ACP");
+        assert!(error.contains("restricted to Codex"));
+        assert!(command_spec.env.is_empty());
+    }
+
+    #[test]
+    fn apply_acp_launch_policy_passes_budget_environment_only_to_codex() {
+        let mut command_spec = CommandSpec {
+            command: "node".into(),
+            args: vec!["codex-acp.js".into()],
+            env: vec![],
+            cwd: None,
+        };
+        apply_acp_launch_policy(
+            &mut command_spec,
+            AcpLaunchPolicyInput {
+                metadata: &agent_metadata_with_backend(Some("codex")),
+                config: &AcpBuildExtra::default(),
+                session_snapshot: None,
+                runtime_env: &[(MATH_BUDGET_ENV[0].into(), "/private/broker.sock".into())],
+                belongs_to_team: false,
+            },
+        )
+        .expect("Codex may receive its bound budget environment");
+        assert!(command_spec.env.iter().any(|entry| entry.name == MATH_BUDGET_ENV[0]));
+    }
+
+    #[test]
+    fn catalog_budget_environment_is_rejected_before_launch_mutation() {
+        for backend in [Some("codex"), Some("claude"), None] {
+            let mut command_spec = CommandSpec {
+                command: "node".into(),
+                args: vec!["agent.js".into()],
+                cwd: None,
+                env: vec![aionui_common::EnvVar {
+                    name: MATH_BUDGET_ENV[1].to_ascii_lowercase(),
+                    value: "fixture-only".into(),
+                }],
+            };
+            let error = apply_acp_launch_policy(
+                &mut command_spec,
+                AcpLaunchPolicyInput {
+                    metadata: &agent_metadata_with_backend(backend),
+                    config: &AcpBuildExtra::default(),
+                    session_snapshot: None,
+                    runtime_env: &[],
+                    belongs_to_team: false,
+                },
+            )
+            .unwrap_err();
+            assert_eq!(
+                error,
+                "math_budget_launch_env_invalid: budget binding must come from session runtime"
+            );
+            assert_eq!(command_spec.args, vec!["agent.js"]);
+            assert_eq!(command_spec.env.len(), 1);
+        }
+    }
+
+    #[test]
+    fn unknown_and_case_variant_budget_keys_cannot_reach_other_backends() {
+        for key in ["deepscientist_math_budget_secret", "DEEPSCIENTIST_MATH_BUDGET_FUTURE"] {
+            let error = validate_math_budget_backend(Some("custom"), &[(key.into(), "fixture".into())]).unwrap_err();
+            assert_eq!(
+                error,
+                "math_budget_backend_invalid: math budget environment is restricted to Codex ACP"
+            );
+        }
     }
 
     #[test]

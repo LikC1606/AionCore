@@ -728,6 +728,17 @@ pub fn build_team_state(
             query_service.clone(),
         )
         .expect("configure canonical Team work adapter");
+    match std::env::var("DEEPSCIENTIST_TEAM_MIGRATION_PUBLIC_KEYS") {
+        Ok(keys) => {
+            if service.configure_coordination_migration_keys(&keys).is_err() {
+                tracing::error!("Invalid Team migration trust configuration; protocol migration is disabled");
+            }
+        }
+        Err(std::env::VarError::NotPresent) => {}
+        Err(std::env::VarError::NotUnicode(_)) => {
+            tracing::error!("Invalid Team migration trust encoding; protocol migration is disabled");
+        }
+    }
     TeamRouterState {
         service,
         command_service,

@@ -1,5 +1,23 @@
 use serde::{Deserialize, Serialize};
 
+/// Payload-free invalidation hint. Clients must re-read their authorized snapshots.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RuntimeEventGap {
+    pub skipped: u64,
+    pub observed_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeSubscriptionRequest {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RuntimeSubscriptionReady {
+    pub protocol_version: u8,
+}
+
 /// WebSocket message envelope.
 ///
 /// All WebSocket communication follows this format: a `name` field

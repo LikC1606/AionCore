@@ -12,6 +12,7 @@ use tracing::{debug, info, warn};
 use crate::active_lease::ActiveLeaseRegistry;
 use crate::agent_task::AgentInstance;
 use crate::error::AgentError;
+use crate::math_budget_binding::MathBudgetBinding;
 use crate::runtime_token::{RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN_SESSION_GENERATION};
 use crate::types::{AIONUI_RUNTIME_TOKEN_ENV, BuildTaskOptions, RuntimeCapabilities};
 
@@ -30,6 +31,16 @@ pub type AgentFactory =
 /// The trait is object-safe for dependency injection.
 #[async_trait]
 pub trait IWorkerTaskManager: Send + Sync {
+    fn register_math_budget_binding(
+        &self,
+        _conversation_id: &str,
+        _binding: MathBudgetBinding,
+    ) -> Result<(), AgentError> {
+        Err(AgentError::bad_request("math_budget_binding_unsupported"))
+    }
+    async fn revoke_math_budget_binding(&self, _conversation_id: &str) -> Result<(), AgentError> {
+        Err(AgentError::bad_request("math_budget_binding_unsupported"))
+    }
     /// Get an existing task by conversation ID.
     fn get_task(&self, conversation_id: &str) -> Option<AgentInstance>;
 
@@ -90,6 +101,10 @@ pub struct WorkerTaskManagerImpl {
     factory: AgentFactory,
     active_leases: Arc<ActiveLeaseRegistry>,
     runtime_token_service: Option<Arc<RuntimeTokenService>>,
+    math_bindings: DashMap<String, MathBudgetBinding>,
+    math_revoked: DashMap<String, ()>,
+    math_launched: DashMap<String, ()>,
+    math_registry_lock: std::sync::Mutex<()>,
 }
 
 impl WorkerTaskManagerImpl {
@@ -103,6 +118,10 @@ impl WorkerTaskManagerImpl {
             factory,
             active_leases,
             runtime_token_service: None,
+            math_bindings: DashMap::new(),
+            math_revoked: DashMap::new(),
+            math_launched: DashMap::new(),
+            math_registry_lock: std::sync::Mutex::new(()),
         }
     }
 
@@ -154,7 +173,49 @@ impl WorkerTaskManagerImpl {
 
 #[async_trait]
 impl IWorkerTaskManager for WorkerTaskManagerImpl {
+    fn register_math_budget_binding(
+        &self,
+        conversation_id: &str,
+        binding: MathBudgetBinding,
+    ) -> Result<(), AgentError> {
+        binding.validate().map_err(AgentError::bad_request)?;
+        let _guard = self
+            .math_registry_lock
+            .lock()
+            .map_err(|_| AgentError::internal("math_budget_registry_poisoned"))?;
+        if self.tasks.contains_key(conversation_id)
+            || self.math_launched.contains_key(conversation_id)
+            || self.math_revoked.contains_key(conversation_id)
+        {
+            return Err(AgentError::conflict(
+                "math_budget_binding_conversation_not_registerable",
+            ));
+        }
+        if self.math_bindings.contains_key(conversation_id) {
+            return Err(AgentError::conflict("math_budget_binding_already_registered"));
+        }
+        self.math_bindings.insert(conversation_id.to_owned(), binding);
+        Ok(())
+    }
+
+    async fn revoke_math_budget_binding(&self, conversation_id: &str) -> Result<(), AgentError> {
+        let wait = {
+            let _guard = self
+                .math_registry_lock
+                .lock()
+                .map_err(|_| AgentError::internal("math_budget_registry_poisoned"))?;
+            self.math_bindings.remove(conversation_id);
+            self.math_revoked.insert(conversation_id.to_owned(), ());
+            self.kill_and_wait(conversation_id, None)
+        };
+        wait.await;
+        Ok(())
+    }
+
     fn get_task(&self, conversation_id: &str) -> Option<AgentInstance> {
+        if self.math_revoked.contains_key(conversation_id) {
+            return None;
+        }
         self.initialised_instance(conversation_id)
     }
 
@@ -163,26 +224,67 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
         conversation_id: &str,
         mut options: BuildTaskOptions,
     ) -> Result<AgentInstance, AgentError> {
-        if let Some(existing) = self.initialised_managed_task(conversation_id)
-            && !existing.runtime_capabilities.satisfies(&options.runtime_capabilities)
-        {
-            info!(
-                conversation_id,
-                "Rebuilding agent task because runtime capabilities changed"
-            );
-            self.kill(conversation_id, Some(AgentKillReason::RuntimeCapabilityChanged))?;
-            self.refresh_runtime_token_for_new_task(&mut options);
-        }
-
-        // Atomically obtain the per-conversation slot. `DashMap::entry` is
-        // synchronous and side-effect-free — only an empty OnceCell is
-        // allocated on the miss path, so concurrent callers for the same id
-        // all end up holding the same `Arc<OnceCell>`.
-        let slot: TaskSlot = self
-            .tasks
-            .entry(conversation_id.to_owned())
-            .or_insert_with(|| Arc::new(OnceCell::new()))
-            .clone();
+        // Registration, revocation and slot ownership share one synchronous
+        // boundary. No lock guard or DashMap reference crosses factory I/O.
+        let slot: TaskSlot = {
+            let _guard = self
+                .math_registry_lock
+                .lock()
+                .map_err(|_| AgentError::internal("math_budget_registry_poisoned"))?;
+            if self.math_revoked.contains_key(conversation_id) {
+                return Err(AgentError::conflict("math_budget_binding_revoked"));
+            }
+            if options.conversation_id() != conversation_id {
+                return Err(AgentError::bad_request("math_budget_conversation_identity_mismatch"));
+            }
+            let required = options
+                .context
+                .runtime_env
+                .iter()
+                .any(|(key, _)| key.eq_ignore_ascii_case("DEEPSCIENTIST_MATH_BUDGET_REQUIRED"));
+            if let Some(binding) = self.math_bindings.get(conversation_id) {
+                match &options.context.kind {
+                    crate::session_context::AgentSessionKind::Acp(context)
+                        if context.config.current_model_id.as_deref() == Some("deepseek") => {}
+                    _ => return Err(AgentError::bad_request("math_budget_codex_deepseek_required")),
+                }
+                options
+                    .context
+                    .runtime_env
+                    .retain(|(key, _)| !key.to_ascii_uppercase().starts_with("DEEPSCIENTIST_MATH_BUDGET_"));
+                options.context.runtime_env.extend([
+                    ("DEEPSCIENTIST_MATH_BUDGET_SOCKET".into(), binding.socket_path.clone()),
+                    ("DEEPSCIENTIST_MATH_BUDGET_SECRET".into(), binding.secret.clone()),
+                    (
+                        "DEEPSCIENTIST_MATH_BUDGET_MAX_OUTPUT_TOKENS".into(),
+                        binding.output_tokens.to_string(),
+                    ),
+                ]);
+            } else if required
+                || options
+                    .context
+                    .runtime_env
+                    .iter()
+                    .any(|(key, _)| key.to_ascii_uppercase().starts_with("DEEPSCIENTIST_MATH_BUDGET_"))
+            {
+                return Err(AgentError::conflict("math_budget_binding_required"));
+            }
+            if let Some(existing) = self.initialised_managed_task(conversation_id)
+                && !existing.runtime_capabilities.satisfies(&options.runtime_capabilities)
+            {
+                info!(
+                    conversation_id,
+                    "Rebuilding agent task because runtime capabilities changed"
+                );
+                self.kill(conversation_id, Some(AgentKillReason::RuntimeCapabilityChanged))?;
+                self.refresh_runtime_token_for_new_task(&mut options);
+            }
+            self.math_launched.insert(conversation_id.to_owned(), ());
+            self.tasks
+                .entry(conversation_id.to_owned())
+                .or_insert_with(|| Arc::new(OnceCell::new()))
+                .clone()
+        };
 
         // `OnceCell::get_or_try_init` serialises concurrent initialisers:
         // the first caller to reach it runs the factory, every other caller
@@ -192,6 +294,15 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
         let runtime_capabilities = options.runtime_capabilities.clone();
         let managed = slot
             .get_or_try_init(|| async move {
+                {
+                    let _guard = self
+                        .math_registry_lock
+                        .lock()
+                        .map_err(|_| AgentError::internal("math_budget_registry_poisoned"))?;
+                    if self.math_revoked.contains_key(conversation_id) {
+                        return Err(AgentError::conflict("math_budget_binding_revoked"));
+                    }
+                }
                 let agent = factory(options).await?;
                 Ok::<ManagedAgentTask, AgentError>(ManagedAgentTask {
                     agent,
@@ -199,6 +310,10 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
                 })
             })
             .await?;
+        if self.math_revoked.contains_key(conversation_id) {
+            managed.agent.kill_and_wait(None).await;
+            return Err(AgentError::conflict("math_budget_binding_revoked"));
+        }
         Ok(managed.agent.clone())
     }
 
@@ -512,6 +627,137 @@ mod tests {
             async move { Ok(mock_instance(MockAgent::new(opts.conversation_id(), None))) }.boxed()
         });
         WorkerTaskManagerImpl::new(factory)
+    }
+
+    fn math_binding() -> MathBudgetBinding {
+        MathBudgetBinding {
+            run_id: "run-1".into(),
+            input_digest: "a".repeat(64),
+            actor_id: "lead".into(),
+            socket_path: "/tmp/math-test.sock".into(),
+            secret: "b".repeat(64),
+            output_tokens: 1000,
+            provider: "WestlakeHPC".into(),
+            model: "deepseek".into(),
+        }
+    }
+
+    fn math_options() -> BuildTaskOptions {
+        let mut options = make_options("conv-math");
+        if let AgentSessionKind::Acp(context) = &mut options.context.kind {
+            context.config.current_model_id = Some("deepseek".into());
+            context.config.backend = Some("codex".into());
+        }
+        options
+            .context
+            .runtime_env
+            .push(("DEEPSCIENTIST_MATH_BUDGET_REQUIRED".into(), "1".into()));
+        options
+    }
+
+    #[tokio::test]
+    async fn math_budget_duplicate_does_not_replace_launch_identity() {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capture = captured.clone();
+        let manager = WorkerTaskManagerImpl::new(Arc::new(move |options| {
+            *capture.lock().unwrap() = options.context.runtime_env.clone();
+            async move { Ok(mock_instance(MockAgent::new(options.conversation_id(), None))) }.boxed()
+        }));
+        manager
+            .register_math_budget_binding("conv-math", math_binding())
+            .unwrap();
+        let mut replacement = math_binding();
+        replacement.secret = "c".repeat(64);
+        assert!(matches!(
+            manager.register_math_budget_binding("conv-math", replacement),
+            Err(AgentError::Conflict(reason)) if reason == "math_budget_binding_already_registered"
+        ));
+        manager.get_or_build_task("conv-math", math_options()).await.unwrap();
+        let environment = captured.lock().unwrap();
+        assert_eq!(environment.len(), 3);
+        assert!(environment.contains(&("DEEPSCIENTIST_MATH_BUDGET_SECRET".into(), "b".repeat(64))));
+        assert!(!environment.iter().any(|(key, _)| key.ends_with("REQUIRED")));
+    }
+
+    #[tokio::test]
+    async fn math_budget_required_without_binding_does_not_call_factory() {
+        let manager = WorkerTaskManagerImpl::new(Arc::new(|_| panic!("factory must not be called")));
+        assert!(matches!(
+            manager.get_or_build_task("conv-math", math_options()).await,
+            Err(AgentError::Conflict(reason)) if reason == "math_budget_binding_required"
+        ));
+        assert_eq!(manager.active_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn math_budget_revoke_waits_for_pending_factory_and_blocks_rebuild() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let killed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let factory: AgentFactory = {
+            let entered = entered.clone();
+            let release = release.clone();
+            let killed = killed.clone();
+            Arc::new(move |options| {
+                let entered = entered.clone();
+                let release = release.clone();
+                let killed = killed.clone();
+                async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    Ok(mock_instance(
+                        MockAgent::new(options.conversation_id(), None).with_kill_counter(killed),
+                    ))
+                }
+                .boxed()
+            })
+        };
+        let manager = Arc::new(WorkerTaskManagerImpl::new(factory));
+        manager
+            .register_math_budget_binding("conv-math", math_binding())
+            .unwrap();
+        let build = {
+            let manager = manager.clone();
+            tokio::spawn(async move { manager.get_or_build_task("conv-math", math_options()).await })
+        };
+        entered.notified().await;
+        let revoke = {
+            let manager = manager.clone();
+            tokio::spawn(async move { manager.revoke_math_budget_binding("conv-math").await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !manager.math_revoked.contains_key("conv-math") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!revoke.is_finished());
+        release.notify_one();
+        assert!(
+            matches!(build.await.unwrap(), Err(AgentError::Conflict(reason)) if reason == "math_budget_binding_revoked")
+        );
+        revoke.await.unwrap().unwrap();
+        assert!(killed.load(Ordering::SeqCst) > 0);
+        assert!(manager.get_task("conv-math").is_none());
+        assert!(matches!(
+            manager.get_or_build_task("conv-math", math_options()).await,
+            Err(AgentError::Conflict(reason)) if reason == "math_budget_binding_revoked"
+        ));
+    }
+
+    #[tokio::test]
+    async fn math_budget_cannot_register_after_unbudgeted_task_is_removed() {
+        let manager = make_manager();
+        manager
+            .get_or_build_task("conv-math", make_options("conv-math"))
+            .await
+            .unwrap();
+        manager.kill_and_wait("conv-math", None).await;
+        assert!(matches!(
+            manager.register_math_budget_binding("conv-math", math_binding()),
+            Err(AgentError::Conflict(reason)) if reason == "math_budget_binding_conversation_not_registerable"
+        ));
     }
 
     fn capture_logs(max_level: tracing::Level, f: impl FnOnce()) -> String {

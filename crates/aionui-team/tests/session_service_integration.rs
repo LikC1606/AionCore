@@ -428,6 +428,12 @@ impl FakeConversationPorts {
 
 #[async_trait::async_trait]
 impl TeamConversationProvisioningPort for FakeConversationPorts {
+    async fn lookup_team_binding_by_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<TeamConversationBindingLookup>, aionui_team::TeamError> {
+        TeamConversationLookupPort::lookup_team_binding_by_conversation(self, conversation_id).await
+    }
     async fn create_team_conversation(
         &self,
         request: TeamConversationCreateRequest,
@@ -1836,12 +1842,130 @@ fn setup() -> Arc<TeamSessionService> {
 }
 
 #[tokio::test]
+async fn managed_coordination_survives_restart_without_native_tools_or_wake_prompts() {
+    use aionui_api_types::{TeamCoordinationProtocol, TeamManagedTool, TeamToolErrorCode, TeamToolTransport};
+    let (svc, team_repo, _turn_port, conv_repo) = setup_with_recording_turn_port();
+    let protocol = TeamCoordinationProtocol::ManagedMcp {
+        logical_tool: TeamManagedTool::ResearchTeam,
+    };
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                coordination_protocol: protocol,
+                name: "Managed math".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.coordination_protocol, protocol);
+    let stored = team_repo.get_team(&created.id).await.unwrap().unwrap();
+    assert_eq!(
+        serde_json::from_str::<TeamCoordinationProtocol>(stored.coordination_protocol.as_deref().unwrap()).unwrap(),
+        protocol
+    );
+    drop(svc);
+
+    for (index, agent) in created.assistants.iter().enumerate() {
+        team_repo
+            .write_message(&aionui_db::models::MailboxMessageRow {
+                id: format!("managed-restart-{index}"),
+                team_id: created.id.clone(),
+                to_agent_id: agent.slot_id.clone(),
+                from_agent_id: "user".into(),
+                msg_type: "message".into(),
+                content: "preserve the assigned mathematical work".into(),
+                summary: None,
+                files: None,
+                read: false,
+                created_at: aionui_common::now_ms(),
+            })
+            .await
+            .unwrap();
+    }
+    let turns = Arc::new(RecordingTurnPort::default());
+    let restarted =
+        build_service_with_existing_repositories(team_repo, conv_repo.clone(), success_factory(), turns.clone());
+    restarted.ensure_session("user1", &created.id).await.unwrap();
+    wait_for_recorded_turns(&turns, 2).await;
+    let scheduler = restarted.get_session_scheduler(&created.id).unwrap();
+    let service_ref = Arc::downgrade(&restarted);
+    let executor = aionui_team::TeamToolExecutor::new(&scheduler, &service_ref);
+    for agent in &created.assistants {
+        let resolved = restarted
+            .resolve_team_tool_context("user1", &agent.conversation_id)
+            .await
+            .unwrap();
+        assert!(resolved.response.allowed_tools.is_empty());
+        let mut context = resolved.context.unwrap();
+        for transport in [TeamToolTransport::Mcp, TeamToolTransport::CliAssumed] {
+            context.transport = transport;
+            assert!(executor.list_tools(&context).is_empty());
+            let call = aionui_team::team_tool_call_from_name("team_members", serde_json::json!({})).unwrap();
+            let error = restarted.execute_team_tool(&context, call).await.unwrap_err();
+            assert_eq!(error.code, TeamToolErrorCode::PermissionDenied);
+            assert_eq!(error.message, "native Team tools are disabled for managed coordination");
+        }
+        let extra = conv_repo.get_extra(&agent.conversation_id).unwrap();
+        assert!(
+            extra["team_mcp_stdio_config"].is_null(),
+            "managed agent must not receive native MCP credentials"
+        );
+    }
+    {
+        let requests = turns.requests.lock().unwrap();
+        for agent in &created.assistants {
+            let request = requests
+                .iter()
+                .find(|request| request.slot_id == agent.slot_id)
+                .unwrap();
+            assert!(request.content.contains("preserve the assigned mathematical work"));
+            assert!(!request.content.contains("## Team Governance"));
+            assert!(!request.content.contains("team_inspect"));
+            assert!(!request.content.contains("team_send_message"));
+        }
+    }
+    restarted.stop_session("user1", &created.id).await.unwrap();
+}
+
+#[tokio::test]
+async fn legacy_managed_protocol_requires_migration_before_any_runtime_starts() {
+    let (svc, repo, turns, _conv_repo) = setup_with_recording_turn_port();
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                coordination_protocol: Default::default(),
+                name: "Legacy managed".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    repo.teams
+        .lock()
+        .unwrap()
+        .iter_mut()
+        .find(|row| row.id == created.id)
+        .unwrap()
+        .coordination_protocol = Some(r#"{"kind":"legacy_managed_migration_required"}"#.into());
+    let error = svc.ensure_session("user1", &created.id).await.unwrap_err();
+    assert!(error.to_string().contains("legacy_managed_migration_required"));
+    assert!(svc.get_session_scheduler(&created.id).is_none());
+    assert!(turns.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn recovery_creates_background_intents_without_restoring_old_memory_run() {
     let (svc, team_repo, turn_port, _conv_repo) = setup_with_recording_turn_port();
     let created = svc
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Recover".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -1899,6 +2023,7 @@ async fn reconcile_unread_mailbox_recovers_cold_session_after_service_restart() 
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Restart Recovery".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -1953,6 +2078,7 @@ async fn reconcile_unread_mailbox_notifies_existing_session_after_lost_wake() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Lost Wake Recovery".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -2010,6 +2136,7 @@ async fn reconcile_unread_mailbox_retries_background_turn_after_pre_start_failur
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Background Turn Retry".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -2098,6 +2225,91 @@ async fn reconcile_unread_mailbox_retries_background_turn_after_pre_start_failur
 }
 
 #[tokio::test]
+async fn terminal_input_rejection_does_not_requeue_background_mailbox() {
+    #[derive(Default)]
+    struct RejectInputsTurnPort(AtomicUsize);
+    #[async_trait::async_trait]
+    impl AgentTurnExecutionPort for RejectInputsTurnPort {
+        async fn run_agent_turn(
+            &self,
+            _request: AgentTurnRequest,
+        ) -> Result<AgentTurnOutcome, aionui_team::AgentTurnExecutionError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(aionui_team::AgentTurnExecutionError::Rejected {
+                reason: "math_run_inputs_integrity_failed".into(),
+            })
+        }
+    }
+    let team_repo = Arc::new(FullMockTeamRepo::new());
+    let turn_port = Arc::new(RejectInputsTurnPort::default());
+    let service = build_service_with_existing_repositories(
+        team_repo.clone(),
+        Arc::new(MockConversationRepo::new()),
+        success_factory(),
+        turn_port.clone(),
+    );
+    let created = service
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                coordination_protocol: aionui_api_types::TeamCoordinationProtocol::ManagedMcp {
+                    logical_tool: aionui_api_types::TeamManagedTool::ResearchTeam,
+                },
+                name: "Rejected frozen inputs".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    let lead = created.leader_assistant_id.clone().unwrap();
+    service.ensure_session("user1", &created.id).await.unwrap();
+    team_repo
+        .write_message(&aionui_db::models::MailboxMessageRow {
+            id: "rejected-input-mailbox".into(),
+            team_id: created.id.clone(),
+            to_agent_id: lead.clone(),
+            from_agent_id: "team_work".into(),
+            msg_type: "message".into(),
+            content: "queued work".into(),
+            summary: None,
+            files: None,
+            read: false,
+            created_at: aionui_common::now_ms(),
+        })
+        .await
+        .unwrap();
+    service.reconcile_unread_mailboxes_once().await.unwrap();
+    let scheduler = service.get_session_scheduler(&created.id).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if turn_port.0.load(Ordering::SeqCst) == 1
+                && scheduler.get_agent(&lead).await.unwrap().status == Some(TeammateStatus::Error)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("permanent input rejection should settle as terminal failure");
+    assert!(team_repo.peek_unread(&created.id, &lead).await.unwrap().is_empty());
+    {
+        let mailbox = team_repo.inner.state.lock().unwrap();
+        let retained = mailbox
+            .messages
+            .iter()
+            .find(|message| message.id == "rejected-input-mailbox")
+            .unwrap();
+        assert!(retained.read);
+        assert_eq!(retained.content, "queued work");
+    }
+    let report = service.reconcile_unread_mailboxes_once().await.unwrap();
+    assert_eq!(report.notified_session_count, 0);
+    assert_eq!(turn_port.0.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn reconcile_unread_mailbox_periodic_runner_retries_transient_session_start_failure() {
     use futures_util::FutureExt;
 
@@ -2128,6 +2340,7 @@ async fn reconcile_unread_mailbox_periodic_runner_retries_transient_session_star
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Transient Recovery".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -2174,6 +2387,7 @@ async fn teammate_first_wake_uses_canonical_prompt_at_service_boundary() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Recover Teammate".into(),
                 agents: aionrs_two_agent_input(),
                 workspace: None,
@@ -2245,6 +2459,7 @@ async fn ensure_session_does_not_run_self_message_only_recovery_turn() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Self Only".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -2600,6 +2815,7 @@ async fn renew_active_lease_records_all_team_agent_conversations() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Lease Team".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -2626,6 +2842,7 @@ async fn renew_active_lease_allows_empty_team_without_unrelated_lease() {
     );
     team_repo
         .create_team(&aionui_db::models::TeamRow {
+            coordination_protocol: None,
             id: "team-empty".into(),
             user_id: "user1".into(),
             name: "Empty".into(),
@@ -2660,6 +2877,7 @@ async fn renew_active_lease_rejects_team_owned_by_other_user() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Lease Team".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -2703,6 +2921,7 @@ async fn tc1_create_team_with_multiple_agents() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Alpha".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -2727,6 +2946,7 @@ async fn create_team_rejects_existing_conversation_id_request_side_adoption() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "No Adoption".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -2762,6 +2982,7 @@ async fn create_team_with_workspace_writes_same_workspace_to_team_and_initial_ag
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Shared".into(),
                 agents: two_agent_input(),
                 workspace: Some(workspace.clone()),
@@ -2791,6 +3012,7 @@ async fn create_team_without_workspace_uses_leader_auto_workspace_for_all_initia
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Auto Shared".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -2870,6 +3092,7 @@ async fn tc_create_team_prefers_assistant_avatar_over_backend_logo() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Alpha".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -2940,6 +3163,7 @@ async fn tc_create_team_carries_assistant_identity_into_lead_conversation_extra(
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Alpha".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -3026,6 +3250,7 @@ async fn tc_create_team_derives_backend_from_assistant_when_backend_missing() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Assistant Lead".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -3112,6 +3337,7 @@ async fn tc_create_team_ignores_requested_backend_when_assistant_id_present() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Assistant Lead".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -3170,6 +3396,7 @@ async fn team_preset_assistant_snapshot_is_frozen() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Preset Team".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -3217,6 +3444,7 @@ async fn spawned_preset_assistant_snapshot_is_frozen() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Spawn Preset".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -3266,6 +3494,7 @@ async fn ta_add_agent_uses_model_fallback_for_acp_backend() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Alpha".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -3359,6 +3588,7 @@ async fn ta_add_agent_derives_backend_from_assistant_when_backend_missing() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Alpha".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -3453,6 +3683,7 @@ async fn ta_add_agent_ignores_requested_backend_when_assistant_id_present() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "T".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -3493,6 +3724,7 @@ async fn tc2_create_single_agent_team() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Solo".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -3519,6 +3751,7 @@ async fn create_team_uses_explicit_leader_role_when_leader_is_not_first() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "T".into(),
                 agents: vec![
                     TeamAgentInput {
@@ -3558,6 +3791,7 @@ async fn create_team_rejects_zero_leaders() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "T".into(),
                 agents: vec![TeamAgentInput {
                     name: "Worker".into(),
@@ -3582,6 +3816,7 @@ async fn create_team_rejects_multiple_leaders() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "T".into(),
                 agents: vec![
                     TeamAgentInput {
@@ -3616,6 +3851,7 @@ async fn create_team_rejects_unknown_role() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "T".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -3644,6 +3880,7 @@ async fn create_team_failure_removes_conversations_created_in_the_same_attempt()
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Rollback partial provisioning".into(),
                 agents: vec![
                     TeamAgentInput {
@@ -3685,6 +3922,7 @@ async fn orphan_recovery_preserves_fresh_bindings_and_retries_expired_cleanup() 
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Recover failed create cleanup".into(),
                 agents: vec![
                     TeamAgentInput {
@@ -3741,6 +3979,7 @@ async fn orphan_recovery_never_collects_an_active_team_create() {
             .create_team(
                 "user1",
                 CreateTeamRequest {
+                    coordination_protocol: Default::default(),
                     name: "Active create barrier".into(),
                     agents: vec![TeamAgentInput {
                         name: "Lead".into(),
@@ -3777,6 +4016,7 @@ async fn tc5_empty_agents_returns_error() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Empty".into(),
                 agents: vec![],
                 workspace: None,
@@ -3793,6 +4033,7 @@ async fn tc3_each_agent_has_conversation_id() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -3822,6 +4063,7 @@ async fn tl2_list_multiple_teams() {
     svc.create_team(
         "user1",
         CreateTeamRequest {
+            coordination_protocol: Default::default(),
             name: "A".into(),
             agents: two_agent_input(),
             workspace: None,
@@ -3832,6 +4074,7 @@ async fn tl2_list_multiple_teams() {
     svc.create_team(
         "user1",
         CreateTeamRequest {
+            coordination_protocol: Default::default(),
             name: "B".into(),
             agents: two_agent_input(),
             workspace: None,
@@ -3850,6 +4093,7 @@ async fn tl3_list_teams_filters_by_owner() {
     svc.create_team(
         "user1",
         CreateTeamRequest {
+            coordination_protocol: Default::default(),
             name: "Owned".into(),
             agents: two_agent_input(),
             workspace: None,
@@ -3860,6 +4104,7 @@ async fn tl3_list_teams_filters_by_owner() {
     svc.create_team(
         "user2",
         CreateTeamRequest {
+            coordination_protocol: Default::default(),
             name: "Other".into(),
             agents: two_agent_input(),
             workspace: None,
@@ -3881,6 +4126,7 @@ async fn tl_list_teams_includes_pending_confirmation_counts_without_rebuilding_t
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "With Confirmations".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -3923,6 +4169,7 @@ async fn tg1_get_existing_team() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Alpha".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -3951,6 +4198,7 @@ async fn tg3_get_team_rejects_cross_user_access() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Private".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -3973,6 +4221,7 @@ async fn td1_delete_existing_team() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -3996,6 +4245,7 @@ async fn team_domain_delete_failure_preserves_data_and_allows_session_rebuild() 
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -4041,6 +4291,7 @@ async fn team_delete_waits_for_admitted_stdio_tcp_tool_then_closes_handler_and_r
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Delete command barrier".into(),
                 agents: aionrs_two_agent_input(),
                 workspace: None,
@@ -4175,6 +4426,7 @@ async fn conversation_cleanup_failure_is_replayed_from_persisted_team_bindings()
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Replay conversation cleanup".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -4214,6 +4466,7 @@ async fn tr1_rename_existing_team() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Old".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -4241,6 +4494,7 @@ async fn tr5_rename_team_rejects_cross_user_access() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Private".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -4265,6 +4519,7 @@ async fn aa1_add_agent_to_team() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "T".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -4313,6 +4568,7 @@ async fn manual_add_without_active_run_queues_background_welcome_without_creatin
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "T".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -4379,6 +4635,7 @@ async fn add_agent_rejects_leader_role() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -4419,6 +4676,7 @@ async fn add_agent_allows_same_assistant_id_multiple_times() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -4475,6 +4733,7 @@ async fn manual_add_agent_active_session_attaches_runtime_in_background_without_
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "T".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -4553,6 +4812,7 @@ async fn manual_add_agent_attach_failure_marks_slot_error_and_notifies_leader() 
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "T".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -4722,6 +4982,7 @@ async fn failed_member_returns_conflict_and_removal_restores_ready() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Failed member removal".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -4865,6 +5126,7 @@ async fn remove_during_attach_cancels_work_and_rejects_late_ready() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Remove attaching member".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -4945,6 +5207,7 @@ async fn aa_add_agent_inherits_team_workspace() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "T".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -4991,6 +5254,7 @@ async fn add_agent_backfills_empty_team_workspace_from_leader_workspace() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Legacy".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -5045,6 +5309,7 @@ async fn add_agent_uses_team_temp_workspace_when_team_and_leader_workspaces_are_
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Legacy Empty".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -5106,6 +5371,7 @@ async fn add_agent_does_not_create_teammate_when_workspace_writeback_fails() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Writeback Failure".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -5156,6 +5422,7 @@ async fn add_agent_continues_when_team_temp_leader_patch_fails() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Patch Failure".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -5218,6 +5485,7 @@ async fn provisioning_writes_typed_team_binding_for_create_and_add_agent() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Typed".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -5292,6 +5560,7 @@ async fn provisioning_resolves_acp_backend_from_agent_metadata() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Metadata ACP".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -5356,6 +5625,7 @@ async fn ar1_remove_agent_from_team() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -5382,6 +5652,7 @@ async fn membership_persist_failure_does_not_delete_the_conversation() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Removal persistence failure".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -5428,6 +5699,7 @@ async fn remove_tolerates_current_session_already_missing_the_slot() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Already absent runtime slot".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -5468,6 +5740,7 @@ async fn manual_remove_agent_projects_team_system_message_without_active_team_ru
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -5503,6 +5776,7 @@ async fn remove_agent_rejects_leader() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -5526,6 +5800,7 @@ async fn ar4_remove_nonexistent_agent() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -5545,6 +5820,7 @@ async fn an1_rename_agent() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -5570,6 +5846,7 @@ async fn an3_rename_nonexistent_agent() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -5593,6 +5870,7 @@ async fn es1_ensure_session_creates_session() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -5663,6 +5941,7 @@ async fn spawn_agent_in_session_succeeds_without_active_team_run() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Alpha".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -5721,6 +6000,7 @@ async fn leader_spawn_then_immediate_ensure_joins_the_same_attach_operation() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Leader spawn reconciliation".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -5784,6 +6064,7 @@ async fn lead_send_agent_message_without_active_run_opens_system_lifecycle_run()
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Alpha".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -5866,6 +6147,7 @@ async fn spawn_agent_in_session_aborts_lease_when_persistence_fails() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Alpha".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -5912,6 +6194,7 @@ async fn spawn_agent_in_session_compensates_when_welcome_mailbox_write_fails() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Alpha".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -5951,6 +6234,7 @@ async fn es2_ensure_session_is_idempotent() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -5977,6 +6261,7 @@ async fn es4_ensure_session_rejects_cross_user_access() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Private".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6023,6 +6308,7 @@ async fn ensure_session_broadcasts_starting_and_ready_session_status() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6059,6 +6345,7 @@ async fn ensure_session_existing_ready_session_broadcasts_ready_terminal_status(
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6097,6 +6384,7 @@ async fn ss1_stop_session() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6116,6 +6404,7 @@ async fn ss3_stop_session_without_active_is_noop() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6134,6 +6423,7 @@ async fn ss4_stop_session_rejects_cross_user_access() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Private".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6165,6 +6455,7 @@ async fn sm1_send_message_with_active_session() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6189,6 +6480,7 @@ async fn retry_idempotency_collapses_lead_message_across_session_rebuild() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Retry receipt".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6241,6 +6533,7 @@ async fn retry_idempotency_reuses_mailbox_and_projection_after_service_restart()
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Durable retry receipt".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6313,6 +6606,7 @@ async fn retry_idempotency_conflict_does_not_poison_restarted_service_gate() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Retry gate recovery".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6428,6 +6722,7 @@ async fn mcp_send_message_idempotency_collapses_lead_and_worker_retries() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "MCP retry receipt".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6579,6 +6874,7 @@ async fn mcp_send_message_rejects_self_target_without_writing_mailbox() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "No self wake loop".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6636,6 +6932,7 @@ async fn retry_idempotency_collapses_concurrent_lead_requests() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Concurrent retry receipt".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6703,6 +7000,7 @@ async fn retry_idempotency_rejects_key_reuse_with_different_payload() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Retry payload".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6739,6 +7037,7 @@ async fn sm2_send_message_rejects_cross_user_access() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Private".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6759,6 +7058,7 @@ async fn sa_send_message_to_agent_with_active_session() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6781,6 +7081,7 @@ async fn worker_delivery_targets_the_team_lead() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6815,6 +7116,7 @@ async fn worker_delivery_rejects_cross_user_access() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Private".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6843,6 +7145,7 @@ async fn artifact_dispatch_rebinds_only_the_target_worker_to_the_prepared_worksp
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Worktree binding".into(),
                 agents: two_agent_input(),
                 workspace: Some(canonical.path().to_string_lossy().into_owned()),
@@ -6889,6 +7192,7 @@ async fn sa2_send_message_to_agent_rejects_cross_user_access() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Private".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6912,6 +7216,7 @@ async fn sa3_send_message_to_nonexistent_agent() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6938,6 +7243,7 @@ async fn dispose_all_cleans_up_sessions() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "A".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6949,6 +7255,7 @@ async fn dispose_all_cleans_up_sessions() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "B".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -6978,6 +7285,7 @@ async fn td_delete_team_stops_session() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -7004,6 +7312,7 @@ async fn d9_create_team_persists_without_warming_initial_agents() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -7034,6 +7343,7 @@ async fn d9_ensure_session_kills_and_rebuilds_only_the_lead() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -7064,6 +7374,7 @@ async fn d9_ensure_session_does_not_start_dormant_workers() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "T".into(),
                 agents: five_agent_input_leader_not_first(),
                 workspace: None,
@@ -7120,6 +7431,7 @@ async fn d9_ensure_session_persists_team_mcp_stdio_config() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "T".into(),
                 agents: aionrs_two_agent_input(),
                 workspace: None,
@@ -7138,6 +7450,7 @@ async fn d9_ensure_session_is_idempotent() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -7164,6 +7477,7 @@ async fn manual_add_then_immediate_ensure_joins_attach_without_rebuilding_sessio
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Join dynamic attach".into(),
                 agents: vec![team_agent_input("Lead", "lead", "claude")],
                 workspace: None,
@@ -7237,6 +7551,7 @@ async fn concurrent_worker_messages_launch_one_on_demand_attach() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Concurrent repair".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -7293,6 +7608,7 @@ async fn stopped_session_rejects_late_attach_completion() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "Stopped late attach".into(),
                 agents: vec![team_agent_input("Lead", "lead", "claude")],
                 workspace: None,
@@ -7380,6 +7696,7 @@ async fn d9_ensure_session_rollbacks_when_build_fails() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -7434,6 +7751,7 @@ async fn cold_bootstrap_failure_stops_session_and_cleans_all_successful_runtimes
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "T".into(),
                 agents: four_agent_input_leader_not_first(),
                 workspace: None,
@@ -7507,6 +7825,7 @@ async fn ensure_session_serializes_manual_add_until_rebuild_completes() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "T".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -7574,6 +7893,7 @@ async fn ensure_session_serializes_manual_remove_until_rebuild_completes() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -7628,6 +7948,7 @@ async fn ensure_session_serializes_manual_rename_until_rebuild_completes() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,
@@ -7689,6 +8010,7 @@ async fn w4_d23_concurrent_add_agent_preserves_every_insertion() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "T".into(),
                 agents: vec![TeamAgentInput {
                     name: "Lead".into(),
@@ -7763,6 +8085,7 @@ async fn d115_remove_team_kills_every_agent_process() {
         .create_team(
             "user1",
             CreateTeamRequest {
+                coordination_protocol: Default::default(),
                 name: "T".into(),
                 agents: two_agent_input(),
                 workspace: None,

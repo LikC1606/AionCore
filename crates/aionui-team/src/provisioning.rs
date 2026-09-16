@@ -418,12 +418,17 @@ impl TeamAgentProvisioner {
         agent: &TeamAgent,
         mcp_stdio_cfg: TeamMcpStdioConfig,
         task_manager: &Arc<dyn IWorkerTaskManager>,
+        coordination_protocol: aionui_api_types::TeamCoordinationProtocol,
     ) -> Result<(), TeamError> {
         let team_id = mcp_stdio_cfg.team_id.clone();
-        let transport = self.team_tool_transport(agent).await?;
+        let transport = if coordination_protocol.is_managed() {
+            None
+        } else {
+            Some(self.team_tool_transport(agent).await?)
+        };
         match transport {
-            TeamToolTransport::Mcp => self.write_team_mcp_runtime_config(agent, mcp_stdio_cfg).await?,
-            TeamToolTransport::CliAssumed => self.write_team_cli_runtime_config(agent).await?,
+            Some(TeamToolTransport::Mcp) => self.write_team_mcp_runtime_config(agent, mcp_stdio_cfg).await?,
+            Some(TeamToolTransport::CliAssumed) | None => self.write_team_runtime_config_without_mcp(agent).await?,
         }
         task_manager
             .kill_and_wait(&agent.conversation_id, Some(AgentKillReason::TeamMcpRebuild))
@@ -502,7 +507,7 @@ impl TeamAgentProvisioner {
             })
     }
 
-    pub(crate) async fn write_team_cli_runtime_config(&self, agent: &TeamAgent) -> Result<(), TeamError> {
+    pub(crate) async fn write_team_runtime_config_without_mcp(&self, agent: &TeamAgent) -> Result<(), TeamError> {
         let acp_metadata = acp_backend_metadata(&self.agent_metadata_repo, &agent.backend).await?;
         let agent_type = if acp_metadata.is_some() {
             AgentType::Acp
@@ -519,7 +524,7 @@ impl TeamAgentProvisioner {
             .await
             .map_err(|e| {
                 TeamError::InvalidRequest(format!(
-                    "failed to persist Team CLI runtime config for {}: {e}",
+                    "failed to persist Team runtime config without native MCP for {}: {e}",
                     agent.slot_id
                 ))
             })
@@ -1044,7 +1049,10 @@ mod tests {
         let patches = Arc::new(Mutex::new(Vec::new()));
         let provisioner = test_provisioner_with_patches(events, Arc::clone(&patches));
 
-        provisioner.write_team_cli_runtime_config(&test_agent()).await.unwrap();
+        provisioner
+            .write_team_runtime_config_without_mcp(&test_agent())
+            .await
+            .unwrap();
 
         let patches = patches.lock().unwrap();
         assert_eq!(patches[0]["team_mcp_stdio_config"], serde_json::Value::Null);
@@ -1067,7 +1075,7 @@ mod tests {
 
         let attach = tokio::spawn(async move {
             provisioner
-                .attach_agent_process("user-1", &agent, test_mcp_config(), &task_manager)
+                .attach_agent_process("user-1", &agent, test_mcp_config(), &task_manager, Default::default())
                 .await
         });
         while !*kill_started_rx.borrow() {

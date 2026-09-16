@@ -12,6 +12,7 @@ pub mod error;
 pub mod factory;
 pub(crate) mod idle_scanner;
 pub mod manager;
+pub mod math_budget_binding;
 pub(crate) mod persistence;
 pub mod protocol;
 pub mod registry;
@@ -40,6 +41,7 @@ pub use factory::{AgentFactoryDeps, build_agent_factory};
 pub use idle_scanner::{
     IdleCleanupCoordinator, resolve_idle_config_from_env, start_idle_scanner, start_idle_scanner_with_coordinator,
 };
+pub use math_budget_binding::MathBudgetBinding;
 pub use persistence::AcpSessionSyncService;
 pub use protocol::error::AcpError;
 pub use protocol::events::AgentStreamEvent;

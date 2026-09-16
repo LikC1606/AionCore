@@ -558,6 +558,68 @@ impl SlotWorkCoordinator {
         self.terminalize_batch(batch, WorkIntentState::Failed { classification }, classification)
     }
 
+    /// Replace a Lead batch that lost its upstream model stream with one
+    /// continuation intent. Existing intents are settled without marking the
+    /// Team run failed; the new intent keeps the original run id so workers and
+    /// integrated commits remain part of the same run. The mailbox id is the
+    /// idempotency boundary for duplicate recovery notifications.
+    pub(crate) fn recover_transport_batch(&self, batch: &WorkBatch, mailbox_message_id: String) -> CommitResult {
+        let mut state = self.lock_state();
+        if state
+            .intents
+            .values()
+            .any(|intent| intent.mailbox_message_id.as_deref() == Some(mailbox_message_id.as_str()))
+        {
+            return CommitResult::Committed;
+        }
+        if !self.is_current_batch(&state, batch) {
+            self.log_stale_batch(batch, "recover_transport_batch");
+            return CommitResult::StaleOwner;
+        }
+
+        for intent_id in &batch.intent_ids {
+            if let Some(intent) = state.intents.get_mut(intent_id) {
+                intent.state = WorkIntentState::Completed;
+            }
+        }
+        let role = state
+            .slots
+            .get(&batch.slot_id)
+            .map(|slot| slot.role.clone())
+            .expect("current batch slot exists");
+        let intent_id = generate_id();
+        state.intents.insert(
+            intent_id.clone(),
+            WorkIntent {
+                intent_id: intent_id.clone(),
+                session_generation: self.session_generation.clone(),
+                slot_id: batch.slot_id.clone(),
+                role,
+                source: WorkSource::TransportRecovery,
+                priority: WorkPriority::Background,
+                mailbox_message_id: Some(mailbox_message_id),
+                team_run_id: batch.team_run_ids.first().cloned(),
+                created_at_ms: now_ms(),
+                state: WorkIntentState::Queued,
+            },
+        );
+        let slot = state.slots.get_mut(&batch.slot_id).expect("current batch slot exists");
+        slot.active = None;
+        slot.background.push_back(intent_id);
+        let summaries = Self::run_summaries_locked(&state, batch.team_run_ids.iter().cloned());
+        drop(state);
+        self.publish_run_summaries(summaries);
+        info!(
+            team_id = %self.team_id,
+            session_generation = %self.session_generation,
+            slot_id = %batch.slot_id,
+            batch_id = %batch.batch_id,
+            operation_id = batch.operation_id,
+            "team Lead transport recovery continuation queued"
+        );
+        CommitResult::Committed
+    }
+
     pub(crate) fn cancel_batch(&self, batch: &WorkBatch, classification: &'static str) -> CommitResult {
         self.terminalize_batch(batch, WorkIntentState::Cancelled { classification }, classification)
     }

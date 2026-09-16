@@ -3,8 +3,8 @@ use std::sync::Arc;
 use aionui_ai_agent::IWorkerTaskManager;
 use aionui_api_types::{AssistantConversationRequest, CreateConversationRequest, GetConfigOptionsResponse};
 use aionui_conversation::{
-    ConversationAgentTurnRequest, ConversationAgentTurnStarted, ConversationAgentTurnStatus, ConversationError,
-    ConversationService,
+    ConversationAgentTurnFailureKind, ConversationAgentTurnOutcome, ConversationAgentTurnRequest,
+    ConversationAgentTurnStarted, ConversationAgentTurnStatus, ConversationError, ConversationService,
 };
 use aionui_db::models::MessageRow;
 use aionui_db::{ConversationFilters, IConversationRepository};
@@ -110,15 +110,7 @@ impl AgentTurnExecutionPort for TeamConversationAdapters {
             }
         };
 
-        Ok(AgentTurnOutcome {
-            conversation_id: outcome.conversation_id,
-            turn_id: outcome.turn_id,
-            status: match outcome.status {
-                ConversationAgentTurnStatus::Completed => AgentTurnStatus::Completed,
-                ConversationAgentTurnStatus::Failed => AgentTurnStatus::Failed,
-            },
-            runtime: Some(outcome.runtime),
-        })
+        map_conversation_turn_outcome(outcome)
     }
 }
 
@@ -381,6 +373,32 @@ fn is_retryable_conversation_busy(error: &ConversationError) -> bool {
     matches!(error, ConversationError::Busy { reason } if reason.contains("already running"))
 }
 
+fn map_conversation_turn_outcome(
+    outcome: ConversationAgentTurnOutcome,
+) -> Result<AgentTurnOutcome, AgentTurnExecutionError> {
+    match outcome.failure_kind {
+        Some(ConversationAgentTurnFailureKind::RunInputsIntegrity) => Err(AgentTurnExecutionError::Rejected {
+            reason: outcome
+                .error_message
+                .unwrap_or_else(|| "math_run_inputs_integrity_failed".into()),
+        }),
+        Some(ConversationAgentTurnFailureKind::TransportDisconnect) => Err(AgentTurnExecutionError::Transport {
+            reason: outcome
+                .error_message
+                .unwrap_or_else(|| "model stream disconnected before completion".into()),
+        }),
+        None => Ok(AgentTurnOutcome {
+            conversation_id: outcome.conversation_id,
+            turn_id: outcome.turn_id,
+            status: match outcome.status {
+                ConversationAgentTurnStatus::Completed => AgentTurnStatus::Completed,
+                ConversationAgentTurnStatus::Failed => AgentTurnStatus::Failed,
+            },
+            runtime: Some(outcome.runtime),
+        }),
+    }
+}
+
 fn map_conversation_create_error(error: ConversationError) -> TeamError {
     match error {
         ConversationError::WorkspacePathUnavailable { path } => TeamError::WorkspacePathUnavailable(path),
@@ -413,6 +431,41 @@ fn map_conversation_turn_error(error: ConversationError) -> AgentTurnExecutionEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn turn_outcome(kind: Option<ConversationAgentTurnFailureKind>) -> ConversationAgentTurnOutcome {
+        ConversationAgentTurnOutcome {
+            conversation_id: "conversation-test".into(),
+            turn_id: "turn-test".into(),
+            status: ConversationAgentTurnStatus::Failed,
+            error_message: Some("static rejection".into()),
+            failure_kind: kind,
+            runtime: aionui_api_types::ConversationRuntimeSummary {
+                state: aionui_api_types::ConversationRuntimeStateKind::Idle,
+                can_send_message: true,
+                has_task: false,
+                task_status: None,
+                is_processing: false,
+                pending_confirmations: 0,
+                turn_id: None,
+            },
+        }
+    }
+
+    #[test]
+    fn run_input_integrity_is_terminal_not_transport_or_background_start_retry() {
+        assert!(
+            matches!(map_conversation_turn_outcome(turn_outcome(Some(ConversationAgentTurnFailureKind::RunInputsIntegrity))),
+            Err(AgentTurnExecutionError::Rejected { reason }) if reason == "static rejection")
+        );
+        assert!(
+            matches!(map_conversation_turn_outcome(turn_outcome(Some(ConversationAgentTurnFailureKind::TransportDisconnect))),
+            Err(AgentTurnExecutionError::Transport { reason }) if reason == "static rejection")
+        );
+        assert_eq!(
+            map_conversation_turn_outcome(turn_outcome(None)).unwrap().status,
+            AgentTurnStatus::Failed
+        );
+    }
 
     #[test]
     fn active_agent_missing_maps_to_team_runtime_not_ready() {

@@ -1,3 +1,4 @@
+mod coordination_migration;
 mod describe_support;
 mod response_builder;
 pub(crate) mod spawn_support;
@@ -211,6 +212,7 @@ fn spawn_rebuild_agent_process(
     user_id: String,
     agent: TeamAgent,
     cfg: TeamMcpStdioConfig,
+    coordination_protocol: aionui_api_types::TeamCoordinationProtocol,
 ) {
     jobs.spawn(async move {
         let team_id = cfg.team_id.clone();
@@ -226,7 +228,7 @@ fn spawn_rebuild_agent_process(
         );
         let attach_started_at = Instant::now();
         let result = provisioner
-            .attach_agent_process(&user_id, &agent, cfg, &task_manager)
+            .attach_agent_process(&user_id, &agent, cfg, &task_manager, coordination_protocol)
             .await;
         let duration_ms = attach_started_at.elapsed().as_millis();
         match &result {
@@ -315,6 +317,7 @@ pub struct TeamSessionService {
     /// Canonical Team work adapter. AppServices installs it once after
     /// constructing the shared command and query services.
     team_work_runtime: OnceLock<Arc<TeamWorkRuntimeService>>,
+    coordination_migration_keys: OnceLock<coordination_migration::MigrationTrust>,
     /// Back-pointer used by [`TeamSession::spawn_agent`] to reach DB-facing
     /// orchestration without threading the service through every session method.
     /// Stored as `Weak` so the session map does not create a strong cycle with
@@ -398,6 +401,7 @@ impl TeamSessionService {
             runtime_start_gates: Arc::new(DashMap::new()),
             idempotency_receipts: Arc::new(AsyncMutex::new(HashMap::new())),
             team_work_runtime: OnceLock::new(),
+            coordination_migration_keys: OnceLock::new(),
             self_ref: weak.clone(),
         })
     }
@@ -566,6 +570,7 @@ impl TeamSessionService {
         };
 
         let row = TeamRow {
+            coordination_protocol: Some(serde_json::to_string(&req.coordination_protocol)?),
             id: team_id.clone(),
             user_id: user_id.to_owned(),
             name: req.name.clone(),
@@ -586,6 +591,7 @@ impl TeamSessionService {
         }
 
         let team = Team {
+            coordination_protocol: req.coordination_protocol,
             id: team_id,
             user_id: user_id.to_owned(),
             name: req.name,
@@ -1809,6 +1815,7 @@ impl TeamSessionService {
                 user_id.to_owned(),
                 agent,
                 cfg,
+                session.scheduler().coordination_protocol,
             );
         }
 
@@ -2075,14 +2082,7 @@ impl TeamSessionService {
             });
         };
         let snapshot = session.work_snapshot().await;
-        let active_run = session.team_run_manager().current_payload(&snapshot).filter(|run| {
-            matches!(
-                run.status,
-                aionui_api_types::TeamRunStatus::Accepted
-                    | aionui_api_types::TeamRunStatus::Running
-                    | aionui_api_types::TeamRunStatus::Cancelling
-            )
-        });
+        let active_run = session.team_run_manager().current_payload(&snapshot);
         let slot_work = snapshot.slots.iter().map(TeamRunManager::slot_payload).collect();
         Ok(TeamRunStateResponse {
             session_generation: Some(snapshot.session_generation),
@@ -2167,10 +2167,26 @@ impl TeamSessionService {
             conversation_id: Some(conversation_id.to_owned()),
             transport: TeamToolTransport::CliAssumed,
         };
-        let allowed_tools = aionui_api_types::team_tool_descriptors_for_role(role_to_tool_role(agent.role))
-            .into_iter()
-            .map(|descriptor| descriptor.name)
-            .collect::<Vec<_>>();
+        let protocol = team_row
+            .coordination_protocol
+            .as_deref()
+            .map(serde_json::from_str::<aionui_api_types::TeamCoordinationProtocol>)
+            .transpose()
+            .map_err(|_| {
+                error_payload(
+                    TeamToolErrorCode::RuntimeContextMissing,
+                    "Team coordination protocol is invalid or requires migration",
+                )
+            })?
+            .unwrap_or_default();
+        let allowed_tools = if protocol.is_managed() {
+            Vec::new()
+        } else {
+            aionui_api_types::team_tool_descriptors_for_role(role_to_tool_role(agent.role))
+        }
+        .into_iter()
+        .map(|descriptor| descriptor.name)
+        .collect::<Vec<_>>();
         Ok(ResolvedTeamToolContext {
             response: TeamToolContextResponse {
                 in_team: true,
@@ -3175,6 +3191,7 @@ mod tests {
 
     fn two_agent_team_request(name: &str) -> aionui_api_types::CreateTeamRequest {
         aionui_api_types::CreateTeamRequest {
+            coordination_protocol: Default::default(),
             name: name.into(),
             agents: vec![
                 aionui_api_types::TeamAgentInput {
@@ -4035,6 +4052,24 @@ mod tests {
         assert_eq!(active_run.slot_work.len(), 1);
         assert_eq!(active_run.slot_work[0].slot_id, ack.run.slot_work[0].slot_id);
         assert_eq!(active_run.slot_work[0].role, TeamRunTargetRole::Lead);
+
+        let session = Arc::clone(&svc.sessions.get(&created.id).expect("session").session);
+        session
+            .team_run_manager()
+            .apply_work_summary(crate::work_coordinator::RunWorkSummary {
+                team_run_id: ack.run.team_run_id.clone(),
+                queued_intent_count: 0,
+                starting_batch_count: 0,
+                running_batch_count: 0,
+                active_enqueue_lease_count: 0,
+                paused_intent_count: 0,
+                failed_intent_count: 0,
+                slots: Vec::new(),
+            });
+        let completed_state = svc.get_run_state("user-test", &created.id).await.unwrap();
+        let completed_run = completed_state.active_run.expect("completed run state");
+        assert_eq!(completed_run.team_run_id, ack.run.team_run_id);
+        assert_eq!(completed_run.status, aionui_api_types::TeamRunStatus::Completed);
     }
 
     #[tokio::test]

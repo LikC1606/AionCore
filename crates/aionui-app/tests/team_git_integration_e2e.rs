@@ -215,6 +215,7 @@ async fn seed_team(services: &aionui_app::AppServices, workspace: &str) {
     ];
     SqliteTeamRepository::new(services.database.pool().clone())
         .create_team(&TeamRow {
+            coordination_protocol: None,
             id: TEAM_ID.into(),
             user_id: "system_default_user".into(),
             name: "Git HTTP Team".into(),

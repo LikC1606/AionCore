@@ -29,6 +29,7 @@ fn make_team(id: &str, name: &str) -> TeamRow {
 fn make_team_for_user(id: &str, user_id: &str, name: &str) -> TeamRow {
     let now = now_ms();
     TeamRow {
+        coordination_protocol: None,
         id: id.into(),
         user_id: user_id.into(),
         name: name.into(),
@@ -61,6 +62,28 @@ fn make_mailbox_msg(id: &str, team_id: &str, to: &str, from: &str, msg_type: &st
 }
 
 // ── Team CRUD Tests ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn coordination_protocol_survives_repository_reload_and_ordinary_updates() {
+    let (repo, db) = repo().await;
+    let mut row = make_team("managed-1", "Managed");
+    row.coordination_protocol = Some(r#"{"kind":"managed_mcp","logicalTool":"research_team"}"#.into());
+    repo.create_team(&row).await.unwrap();
+    repo.update_team(
+        &row.id,
+        &UpdateTeamParams {
+            name: Some("Renamed".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let reopened = SqliteTeamRepository::new(db.pool().clone());
+    assert_eq!(
+        reopened.get_team(&row.id).await.unwrap().unwrap().coordination_protocol,
+        row.coordination_protocol
+    );
+}
 
 #[tokio::test]
 async fn create_and_get_team() {

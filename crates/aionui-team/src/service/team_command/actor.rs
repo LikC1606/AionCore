@@ -141,6 +141,7 @@ mod tests {
 
     fn row(agents: Vec<TeamAgent>, lead_agent_id: Option<&str>) -> TeamRow {
         TeamRow {
+            coordination_protocol: None,
             id: "team-1".into(),
             user_id: "user-1".into(),
             name: "Team".into(),

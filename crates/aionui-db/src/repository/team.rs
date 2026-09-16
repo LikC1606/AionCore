@@ -11,6 +11,18 @@ pub struct UpdateTeamParams {
     pub session_mode: Option<String>,
 }
 
+/// Atomically persisted authorization and outcome for the legacy protocol upgrade.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct TeamCoordinationMigrationRow {
+    pub team_id: String,
+    pub user_id: String,
+    pub migration_id: String,
+    pub proof_digest: String,
+    pub proof_json: String,
+    pub receipt_json: String,
+    pub applied_at: aionui_common::TimestampMs,
+}
+
 /// Durable identity for a caller-retryable mailbox write.
 #[derive(Debug, Clone, Copy)]
 pub struct MailboxIdempotencyParams<'a> {
@@ -51,6 +63,27 @@ pub trait ITeamRepository: Send + Sync {
     /// Updates a team by id with the provided fields.
     /// Returns `DbError::NotFound` if absent.
     async fn update_team(&self, team_id: &str, params: &UpdateTeamParams) -> Result<(), DbError>;
+
+    async fn get_coordination_migration(
+        &self,
+        _team_id: &str,
+    ) -> Result<Option<TeamCoordinationMigrationRow>, DbError> {
+        Err(DbError::Init(
+            "Team coordination migration storage is unavailable".into(),
+        ))
+    }
+
+    /// Compare the complete expected snapshot, then commit protocol and audit together.
+    /// Implementations must never emulate this with separate update/insert calls.
+    async fn migrate_coordination_protocol(
+        &self,
+        _expected: &TeamRow,
+        _audit: &TeamCoordinationMigrationRow,
+    ) -> Result<TeamCoordinationMigrationRow, DbError> {
+        Err(DbError::Init(
+            "Team coordination migration storage is unavailable".into(),
+        ))
+    }
 
     /// Atomically deletes a Team and all Team-owned mailbox and work state.
     /// Returns `DbError::NotFound` if absent.

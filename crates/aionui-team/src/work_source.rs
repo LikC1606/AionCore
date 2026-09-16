@@ -14,6 +14,7 @@ pub(crate) enum WorkSource {
     InterruptedNotification,
     ShutdownRejected,
     RecoveryDrain,
+    TransportRecovery,
 }
 
 impl WorkSource {
@@ -27,7 +28,8 @@ impl WorkSource {
             | Self::SpawnAttachFailure
             | Self::IdleNotification
             | Self::InterruptedNotification
-            | Self::RecoveryDrain => WorkPriority::Background,
+            | Self::RecoveryDrain
+            | Self::TransportRecovery => WorkPriority::Background,
         }
     }
 
@@ -47,6 +49,7 @@ impl WorkSource {
                 | Self::InterruptedNotification
                 | Self::ShutdownRejected
                 | Self::RecoveryDrain
+                | Self::TransportRecovery
         )
     }
 }
@@ -65,6 +68,7 @@ impl fmt::Display for WorkSource {
             Self::InterruptedNotification => "interrupted_notification",
             Self::ShutdownRejected => "shutdown_rejected",
             Self::RecoveryDrain => "recovery_drain",
+            Self::TransportRecovery => "transport_recovery",
         };
         formatter.write_str(value)
     }

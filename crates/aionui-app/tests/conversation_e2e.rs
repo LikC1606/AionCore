@@ -38,6 +38,41 @@ fn create_body_with_extra(name: &str, extra: serde_json::Value) -> serde_json::V
 // ── T1: Create ────────────────────────────────────────────────────────
 
 #[tokio::test]
+async fn runtime_capabilities_requires_authentication() {
+    let (app, _services) = build_app().await;
+    let resp = app
+        .oneshot(get_request("/api/conversations/runtime-capabilities"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn runtime_capabilities_reports_platform_support_without_creating_conversations() {
+    let (mut app, services) = build_app().await;
+    let (token, _) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let resp = app
+        .clone()
+        .oneshot(get_with_token("/api/conversations/runtime-capabilities", &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let versions: Vec<u32> = if cfg!(unix) { vec![1, 2] } else { vec![] };
+    assert_eq!(
+        body_json(resp).await,
+        json!({ "success": true, "data": {
+        "math_run_inputs": { "supported_versions": versions },
+        "runtime_process_id": std::process::id()
+    } })
+    );
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM conversations")
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
+    assert_eq!(count.0, 0);
+}
+
+#[tokio::test]
 async fn t1_1_create_conversation_success() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;

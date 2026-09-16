@@ -3,7 +3,7 @@
 //! layer sees it.
 
 use crate::error::AgentError;
-use crate::session_context::AgentSessionContext;
+use crate::session_context::{AgentSessionContext, AgentSessionKind};
 
 pub(super) struct FactoryContext {
     pub conversation_id: String,
@@ -14,6 +14,10 @@ pub(super) struct FactoryContext {
 
 impl FactoryContext {
     pub async fn resolve(context: &AgentSessionContext) -> Result<Self, AgentError> {
+        if matches!(context.kind, AgentSessionKind::Aionrs(_)) {
+            super::acp_launch_policy::validate_math_budget_backend(Some("aionrs"), &context.runtime_env)
+                .map_err(AgentError::bad_request)?;
+        }
         Ok(Self {
             conversation_id: context.conversation.conversation_id.clone(),
             workspace: context.workspace.path.clone(),
@@ -68,5 +72,41 @@ mod tests {
             ctx.runtime_env,
             vec![("AIONUI_USER_ID".to_owned(), "user-1".to_owned())]
         );
+    }
+
+    #[tokio::test]
+    async fn aionrs_context_rejects_budget_binding_before_factory_dispatch() {
+        let context = AgentSessionContext {
+            conversation: ConversationContext {
+                conversation_id: "conv-1".into(),
+                user_id: "user-1".into(),
+                agent_type: AgentType::Acp,
+                source: None,
+            },
+            workspace: WorkspaceContext {
+                path: "/tmp/workspace".into(),
+                stored_path: "/tmp/workspace".into(),
+                is_custom: true,
+            },
+            model: ProviderWithModel {
+                provider_id: "provider".into(),
+                model: "model".into(),
+                use_model: None,
+            },
+            skills: vec![],
+            team: None,
+            runtime_env: vec![("DEEPSCIENTIST_MATH_BUDGET_SECRET".into(), "fixture-only".into())],
+            kind: AgentSessionKind::Aionrs(Box::new(crate::session_context::AionrsSessionBuildContext {
+                config: Default::default(),
+                team: None,
+                belongs_to_team: false,
+            })),
+        };
+        let error = FactoryContext::resolve(&context)
+            .await
+            .err()
+            .expect("must reject AionRS budget binding");
+        assert!(error.to_string().contains("math_budget_backend_invalid"));
+        assert!(!error.to_string().contains("fixture-only"));
     }
 }
