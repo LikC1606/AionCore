@@ -31,11 +31,11 @@ impl State {
                 self.groups.rotate_left(1);
             }
             let (name, mut queue) = self.groups.pop_front().expect("nonempty queue");
-            if let Some((id, sender)) = queue.pop_front() {
-                if sender.send(()).is_ok() {
-                    self.active.insert(id);
-                    self.last_group = Some(name.clone());
-                }
+            if let Some((id, sender)) = queue.pop_front()
+                && sender.send(()).is_ok()
+            {
+                self.active.insert(id);
+                self.last_group = Some(name.clone());
             }
             if !queue.is_empty() {
                 self.groups.push_back((name, queue));

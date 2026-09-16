@@ -448,10 +448,9 @@ fn extract_mcp_server_from_raw_input(
             raw_input.get("server").and_then(serde_json::Value::as_str),
             raw_input.get("tool").and_then(serde_json::Value::as_str),
             fields.title.as_deref(),
-        ) {
-            if title != format!("mcp.{server}.{tool}") || server != server_name {
-                return None;
-            }
+        ) && (title != format!("mcp.{server}.{tool}") || server != server_name)
+        {
+            return None;
         }
         return Some(server_name.to_owned());
     }
