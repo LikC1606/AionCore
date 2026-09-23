@@ -484,3 +484,51 @@ fn late_terminal_after_cancel_is_rejected() {
 
     assert_eq!(coordinator.complete_batch(&batch), CommitResult::StaleOwner);
 }
+
+#[test]
+fn replayed_mailbox_does_not_create_queued_or_completed_work() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", TeamRunTargetRole::Lead, RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::McpSendMessage, "same-row");
+    for _ in 0..20 {
+        enqueue(&coordinator, WorkSource::McpSendMessage, "same-row");
+    }
+    assert_eq!(coordinator.slot_snapshot("lead-1").unwrap().queued_background_count, 1);
+    let ReconcileDecision::Claim(batch) = coordinator.next("lead-1") else {
+        panic!("claim")
+    };
+    enqueue(&coordinator, WorkSource::McpSendMessage, "same-row");
+    assert_eq!(coordinator.slot_snapshot("lead-1").unwrap().queued_background_count, 0);
+    coordinator.complete_batch(&batch);
+    enqueue(&coordinator, WorkSource::McpSendMessage, "same-row");
+    assert_eq!(coordinator.slot_snapshot("lead-1").unwrap().queued_background_count, 0);
+    enqueue(&coordinator, WorkSource::McpSendMessage, "new-row");
+    assert_eq!(coordinator.slot_snapshot("lead-1").unwrap().queued_background_count, 1);
+}
+
+#[test]
+fn failed_mailbox_work_can_be_explicitly_retried() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", TeamRunTargetRole::Lead, RuntimeConstraint::Ready);
+    enqueue(&coordinator, WorkSource::McpSendMessage, "retry-row");
+    let ReconcileDecision::Claim(batch) = coordinator.next("lead-1") else {
+        panic!("claim")
+    };
+    coordinator.fail_batch(&batch, "transport_failed");
+    enqueue(&coordinator, WorkSource::McpSendMessage, "retry-row");
+    assert_eq!(coordinator.slot_snapshot("lead-1").unwrap().queued_background_count, 1);
+}
+
+#[test]
+fn concurrent_mailbox_replays_commit_one_intent() {
+    let coordinator = coordinator();
+    coordinator.set_runtime_constraint("lead-1", TeamRunTargetRole::Lead, RuntimeConstraint::Ready);
+    std::thread::scope(|scope| {
+        for _ in 0..16 {
+            let coordinator = &coordinator;
+            scope.spawn(move || enqueue(coordinator, WorkSource::McpSendMessage, "shared-row"));
+        }
+    });
+    assert_eq!(coordinator.slot_snapshot("lead-1").unwrap().queued_background_count, 1);
+    assert_eq!(coordinator.intents_for_slot("lead-1").len(), 1);
+}

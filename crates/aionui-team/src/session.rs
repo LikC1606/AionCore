@@ -2741,6 +2741,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repeated_agent_relay_keeps_one_mailbox_intent() {
+        let session = start_session().await;
+        // Keep the recipient busy so retries cannot hide behind queue draining.
+        session.work_coordinator.set_runtime_constraint(
+            "worker-1",
+            TeamRunTargetRole::Teammate,
+            RuntimeConstraint::Ready,
+        );
+        let lease = session
+            .work_coordinator
+            .acquire_enqueue(EnqueueRequest {
+                slot_id: "worker-1".into(),
+                role: TeamRunTargetRole::Teammate,
+                source: WorkSource::McpSendMessage,
+                binding: CausalBinding::Background,
+            })
+            .unwrap();
+        session
+            .work_coordinator
+            .commit_enqueue(&lease, Some("busy".into()))
+            .unwrap();
+        let ReconcileDecision::Claim(batch) = session.work_coordinator.next("worker-1") else {
+            panic!("worker must claim the initial turn")
+        };
+        session.work_coordinator.mark_started(&batch, "busy-turn");
+        for _ in 0..10 {
+            session
+                .send_agent_message_from_agent_with_idempotency(
+                    "lead-1",
+                    "worker-1",
+                    "frozen finding",
+                    None,
+                    Some("same-report"),
+                )
+                .await
+                .unwrap();
+        }
+        let snapshot = session.work_coordinator.slot_snapshot("worker-1").unwrap();
+        assert_eq!(snapshot.queued_background_count, 1);
+        assert_eq!(snapshot.active_turn_id.as_deref(), Some("busy-turn"));
+        assert_eq!(session.mailbox.peek_unread("t1", "worker-1").await.unwrap().len(), 1);
+        session.stop();
+    }
+
+    #[tokio::test]
     async fn agent_delivery_to_lead_records_the_active_worker_turn() {
         let repo = Arc::new(MockTeamRepo::new());
         let repo_dyn: Arc<dyn ITeamRepository> = repo.clone();

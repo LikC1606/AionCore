@@ -199,6 +199,50 @@ impl SlotWorkCoordinator {
             }
         };
 
+        // Mailbox persistence is idempotent, but callers may retry after the
+        // receipt is lost. Deduplicate under the same lock as enqueue: a
+        // preflight lookup races concurrent retries. Failed/cancelled work
+        // remains eligible for explicit recovery.
+        if matches!(lease.source, WorkSource::McpSendMessage)
+            && let Some(existing) = mailbox_message_id.as_ref().and_then(|message_id| {
+                state
+                    .intents
+                    .values()
+                    .find(|intent| {
+                        intent.slot_id == lease.slot_id
+                            && intent.mailbox_message_id.as_ref() == Some(message_id)
+                            && (!intent.state.is_terminal() || intent.state == WorkIntentState::Completed)
+                    })
+                    .cloned()
+            })
+        {
+            state.enqueue_leases.remove(&lease.lease_id);
+            let slot = Self::slot_snapshot_locked(&state, &lease.slot_id).expect("validated slot exists");
+            let summaries = Self::run_summaries_locked(&state, lease.team_run_id.iter().cloned());
+            let abort_empty_binding = record.binding.created_new_run
+                && !state
+                    .intents
+                    .values()
+                    .any(|intent| intent.team_run_id == lease.team_run_id)
+                && !state
+                    .enqueue_leases
+                    .values()
+                    .any(|entry| entry.lease.team_run_id == lease.team_run_id);
+            drop(state);
+            if abort_empty_binding {
+                self.run_causality.abort_binding(&record.binding);
+            }
+            self.publish_run_summaries(summaries);
+            info!(team_id = %self.team_id, slot_id = %lease.slot_id,
+                intent_id = %existing.intent_id, "team mailbox enqueue replay suppressed");
+            return Ok(EnqueueCommit {
+                intent_id: existing.intent_id,
+                team_run_id: existing.team_run_id,
+                disposition,
+                slot,
+            });
+        }
+
         state.enqueue_leases.remove(&lease.lease_id);
         let intent_id = generate_id();
         let intent = WorkIntent {
