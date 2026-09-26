@@ -478,6 +478,26 @@ fn validate_isolated_attachment_paths(files: &[String]) -> Result<(), String> {
     let root = fs_canonical_dir(Path::new(&root))?;
     for file in files {
         let candidate = fs_canonical_file(Path::new(file))?;
+        if candidate.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::Normal(name)
+                    if matches!(
+                        name.to_str(),
+                        Some(
+                            ".git"
+                                | ".deepscientist"
+                                | "active-problem.json"
+                                | "run-state.json"
+                                | "receipt.json"
+                                | "environment.json"
+                                | "task.md"
+                        )
+                    )
+            )
+        }) {
+            return Err("isolated Team attachments may not include runtime or Git metadata".to_owned());
+        }
         if !candidate.starts_with(&root) {
             return Err("isolated Team attachments must stay inside the trial workspace".to_owned());
         }
