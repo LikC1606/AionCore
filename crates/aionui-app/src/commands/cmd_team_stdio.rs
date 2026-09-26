@@ -263,15 +263,16 @@ impl TeamStdioServer {
         description = "Send a message to a teammate, to the team leader (to=\"leader\"), or broadcast to all (to=\"*\"). When delegating work that depends on user attachments, forward their absolute paths in files."
     )]
     async fn send_message(&self, Parameters(params): Parameters<SendMessageParams>) -> CallToolResult {
-        if let Err(message) = validate_isolated_attachment_paths(&params.files) {
-            return CallToolResult::error(vec![Content::text(message)]);
-        }
+        let files = match validate_isolated_attachment_paths(&params.files) {
+            Ok(files) => files,
+            Err(message) => return CallToolResult::error(vec![Content::text(message)]),
+        };
         self.forward_to_tcp(
             "team_send_message",
             &serde_json::json!({
                 "to": params.to,
                 "message": params.message,
-                "files": params.files,
+                "files": files,
                 "idempotency_key": params.idempotency_key,
             }),
         )
@@ -471,11 +472,12 @@ impl TeamStdioServer {
 /// The isolated model may only attach files from its frozen trial workspace.
 /// The Core-backed Team broker runs outside the model namespace, so this check
 /// must happen before an absolute path reaches the TCP protocol.
-fn validate_isolated_attachment_paths(files: &[String]) -> Result<(), String> {
+fn validate_isolated_attachment_paths(files: &[String]) -> Result<Vec<String>, String> {
     let Some(root) = std::env::var_os(ENV_ISOLATED_WORKSPACE) else {
-        return Ok(());
+        return Ok(files.to_vec());
     };
     let root = fs_canonical_dir(Path::new(&root))?;
+    let mut canonical_files = Vec::with_capacity(files.len());
     for file in files {
         let candidate = fs_canonical_file(Path::new(file))?;
         if candidate.components().any(|component| {
@@ -501,8 +503,9 @@ fn validate_isolated_attachment_paths(files: &[String]) -> Result<(), String> {
         if !candidate.starts_with(&root) {
             return Err("isolated Team attachments must stay inside the trial workspace".to_owned());
         }
+        canonical_files.push(candidate.to_string_lossy().into_owned());
     }
-    Ok(())
+    Ok(canonical_files)
 }
 
 fn fs_canonical_dir(path: &Path) -> Result<PathBuf, String> {
