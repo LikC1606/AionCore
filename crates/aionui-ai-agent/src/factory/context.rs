@@ -10,12 +10,21 @@ pub(super) struct FactoryContext {
     pub workspace: String,
     pub is_custom_workspace: bool,
     pub runtime_env: Vec<(String, String)>,
+    /// Only persisted, integrity-checked mathematics runs may opt into the
+    /// operator-owned ACP isolation launcher. Ordinary Codex sessions in the
+    /// same Core must keep their normal process contract.
+    pub math_isolated: bool,
 }
 
 impl FactoryContext {
     pub async fn resolve(context: &AgentSessionContext) -> Result<Self, AgentError> {
+        let math_isolated = context
+            .runtime_env
+            .iter()
+            .any(|(name, _)| name == "DEEPSCIENTIST_MATH_REQUEST_GROUP");
         if matches!(context.kind, AgentSessionKind::Aionrs(_)) {
-            super::acp_isolation::validate_non_acp_isolation(&context.runtime_env).map_err(AgentError::bad_request)?;
+            super::acp_isolation::validate_non_acp_isolation(&context.runtime_env, math_isolated)
+                .map_err(AgentError::bad_request)?;
             super::acp_launch_policy::validate_math_budget_backend(Some("aionrs"), &context.runtime_env)
                 .map_err(AgentError::bad_request)?;
         }
@@ -24,6 +33,7 @@ impl FactoryContext {
             workspace: context.workspace.path.clone(),
             is_custom_workspace: context.workspace.is_custom,
             runtime_env: context.runtime_env.clone(),
+            math_isolated,
         })
     }
 }

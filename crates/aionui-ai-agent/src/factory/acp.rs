@@ -158,6 +158,7 @@ pub(super) async fn build(
         &mut params.command_spec,
         params.metadata.backend.as_deref(),
         &params.conversation_id,
+        ctx.math_isolated,
     )
     .map_err(AgentError::bad_request)?;
     let params = Arc::new(params);

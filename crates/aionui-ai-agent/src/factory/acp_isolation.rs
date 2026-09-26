@@ -108,9 +108,15 @@ fn validate_backend(backend: Option<&str>, configured: bool) -> Result<(), &'sta
     Ok(())
 }
 
-pub(super) fn validate_non_acp_isolation(runtime_env: &[(String, String)]) -> Result<(), &'static str> {
+pub(super) fn validate_non_acp_isolation(
+    runtime_env: &[(String, String)],
+    math_isolated: bool,
+) -> Result<(), &'static str> {
     validate_isolation_env(runtime_env.iter().map(|(name, _)| name.as_str()))?;
-    validate_backend(Some("aionrs"), IsolationLauncher::from_process_env()?.is_some())
+    validate_backend(
+        Some("aionrs"),
+        math_isolated && IsolationLauncher::from_process_env()?.is_some(),
+    )
 }
 
 /// Called after all ACP session parameters, including Team MCP, are assembled.
@@ -119,12 +125,16 @@ pub(super) fn apply_isolation_launcher(
     command: &mut CommandSpec,
     backend: Option<&str>,
     conversation_id: &str,
+    math_isolated: bool,
 ) -> Result<(), &'static str> {
     let result = (|| {
         validate_isolation_env(command.env.iter().map(|entry| entry.name.as_str()))?;
         let config = IsolationLauncher::from_process_env()?;
-        validate_backend(backend, config.is_some())?;
-        if let Some(config) = config {
+        validate_backend(backend, math_isolated && config.is_some())?;
+        if math_isolated {
+            let Some(config) = config else {
+                return Err("math_acp_isolation_config_incomplete");
+            };
             config.wrap(command, conversation_id)?;
             info!(
                 conversation_id,
@@ -148,8 +158,32 @@ pub fn math_acp_isolation_capability() -> MathAcpIsolationCapability {
 
 fn capability_for_config(config: Result<Option<IsolationLauncher>, &'static str>) -> MathAcpIsolationCapability {
     MathAcpIsolationCapability {
-        enabled: matches!(config, Ok(Some(_))),
+        enabled: matches!(config, Ok(Some(_))) && sandbox_usable(),
         protocol_version: 1,
+    }
+}
+
+/// The launcher is hard-coded to bubblewrap. Advertise the capability only
+/// when the host can create the same user/mount namespace that launch will use.
+fn sandbox_usable() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("/usr/bin/bwrap")
+            .args([
+                "--unshare-all",
+                "--die-with-parent",
+                "--ro-bind",
+                "/",
+                "/",
+                "--",
+                "true",
+            ])
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
     }
 }
 

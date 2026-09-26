@@ -9,6 +9,7 @@
 //! (injecting auth_token + slot_id), then sends the `tools/call` frame, reads
 //! the response, and closes the connection (one-shot mode).
 
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use crate::commands::error::{CliBoundaryCode, CliBoundaryError, missing_env, parse_required_port};
@@ -28,6 +29,7 @@ const ERR_TCP_WRITE: &str = "failed to write MCP frame to TCP listener";
 const ERR_TCP_READ: &str = "failed to read MCP frame from TCP listener";
 const ERR_TOOL_REMOTE: &str = "local team tool returned an error";
 const ERR_TOOL_RESPONSE_UNEXPECTED: &str = "unexpected local team tool response";
+const ENV_ISOLATED_WORKSPACE: &str = "DEEPSCIENTIST_MATH_ISOLATION_WORKSPACE";
 
 pub async fn run_team_stdio() -> ExitCode {
     let env = match TeamStdioEnv::from_env() {
@@ -261,6 +263,9 @@ impl TeamStdioServer {
         description = "Send a message to a teammate, to the team leader (to=\"leader\"), or broadcast to all (to=\"*\"). When delegating work that depends on user attachments, forward their absolute paths in files."
     )]
     async fn send_message(&self, Parameters(params): Parameters<SendMessageParams>) -> CallToolResult {
+        if let Err(message) = validate_isolated_attachment_paths(&params.files) {
+            return CallToolResult::error(vec![Content::text(message)]);
+        }
         self.forward_to_tcp(
             "team_send_message",
             &serde_json::json!({
@@ -461,6 +466,46 @@ impl TeamStdioServer {
         )
         .await
     }
+}
+
+/// The isolated model may only attach files from its frozen trial workspace.
+/// The Core-backed Team broker runs outside the model namespace, so this check
+/// must happen before an absolute path reaches the TCP protocol.
+fn validate_isolated_attachment_paths(files: &[String]) -> Result<(), String> {
+    let Some(root) = std::env::var_os(ENV_ISOLATED_WORKSPACE) else {
+        return Ok(());
+    };
+    let root = fs_canonical_dir(Path::new(&root))?;
+    for file in files {
+        let candidate = fs_canonical_file(Path::new(file))?;
+        if !candidate.starts_with(&root) {
+            return Err("isolated Team attachments must stay inside the trial workspace".to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn fs_canonical_dir(path: &Path) -> Result<PathBuf, String> {
+    let canonical = path
+        .canonicalize()
+        .map_err(|_| "isolated Team workspace is unavailable".to_owned())?;
+    if !canonical.is_dir() {
+        return Err("isolated Team workspace is not a directory".to_owned());
+    }
+    Ok(canonical)
+}
+
+fn fs_canonical_file(path: &Path) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err("isolated Team attachments must use absolute paths".to_owned());
+    }
+    let canonical = path
+        .canonicalize()
+        .map_err(|_| "isolated Team attachment is unavailable".to_owned())?;
+    if !canonical.is_file() {
+        return Err("isolated Team attachment is not a file".to_owned());
+    }
+    Ok(canonical)
 }
 
 #[rmcp::tool_handler(router = Self::tool_router())]
