@@ -84,9 +84,10 @@ pub use conversation::{
     ConversationAssistantIdentityResponse, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
     ConversationResponse, ConversationRuntimeCapabilitiesResponse, ConversationRuntimeStateKind,
     ConversationRuntimeSummary, CreateConversationRequest, EnsureConversationRuntimeResponse, ListConversationsQuery,
-    ListMessagesQuery, MathFairTurnGateCapability, MathRequestGateCapability, MathRunInputsCapability,
-    MessageListResponse, MessageResponse, MessageSearchItem, MessageSearchResponse, SearchMessagesQuery,
-    SendMessageRequest, SendMessageResponse, UpdateConversationArtifactRequest, UpdateConversationRequest,
+    ListMessagesQuery, MathAcpIsolationCapability, MathFairTurnGateCapability, MathRequestGateCapability,
+    MathRunInputsCapability, MessageListResponse, MessageResponse, MessageSearchItem, MessageSearchResponse,
+    SearchMessagesQuery, SendMessageRequest, SendMessageResponse, UpdateConversationArtifactRequest,
+    UpdateConversationRequest,
 };
 pub use cron::{
     CreateConversationCronRequest, CreateConversationCronResponse, CreateCronJobRequest, CronAgentConfigReadDto,

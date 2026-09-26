@@ -27,6 +27,13 @@ pub(super) fn apply_acp_launch_policy(
     command_spec: &mut CommandSpec,
     input: AcpLaunchPolicyInput<'_>,
 ) -> Result<(), String> {
+    super::acp_isolation::validate_isolation_env(
+        command_spec
+            .env
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .chain(input.runtime_env.iter().map(|(name, _)| name.as_str())),
+    )?;
     if command_spec.env.iter().any(|entry| is_math_budget_env(&entry.name)) {
         return Err("math_budget_launch_env_invalid: budget binding must come from session runtime".to_owned());
     }
@@ -686,6 +693,45 @@ mod tests {
         )
         .expect("Codex may receive its bound budget environment");
         assert!(command_spec.env.iter().any(|entry| entry.name == MATH_BUDGET_ENV[0]));
+    }
+
+    #[test]
+    fn isolation_configuration_cannot_be_overridden_by_catalog_or_runtime_environment() {
+        for catalog_override in [false, true] {
+            let mut command_spec = CommandSpec {
+                command: "node".into(),
+                args: vec!["agent.js".into()],
+                cwd: None,
+                env: Vec::new(),
+            };
+            let override_entry = (
+                "DEEPSCIENTIST_MATH_ACP_ISOLATION_POLICY".to_owned(),
+                "fixture-only".to_owned(),
+            );
+            let mut runtime_env = Vec::new();
+            if catalog_override {
+                command_spec.env.push(aionui_common::EnvVar {
+                    name: override_entry.0,
+                    value: override_entry.1,
+                });
+            } else {
+                runtime_env.push(override_entry);
+            }
+            let error = apply_acp_launch_policy(
+                &mut command_spec,
+                AcpLaunchPolicyInput {
+                    metadata: &agent_metadata_with_backend(Some("codex")),
+                    config: &AcpBuildExtra::default(),
+                    session_snapshot: None,
+                    runtime_env: &runtime_env,
+                    belongs_to_team: false,
+                },
+            )
+            .unwrap_err();
+            assert_eq!(error, "math_acp_isolation_env_override_rejected");
+            assert_eq!(command_spec.args, vec!["agent.js"]);
+            assert!(!error.contains("fixture-only"));
+        }
     }
 
     #[test]

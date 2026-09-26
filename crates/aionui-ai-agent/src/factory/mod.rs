@@ -1,10 +1,13 @@
 pub mod acp_assembler;
 
 mod acp;
+mod acp_isolation;
 mod acp_launch_policy;
 pub(crate) mod aionrs;
 mod context;
 mod mcp_stdio_policy;
+
+pub use acp_isolation::math_acp_isolation_capability;
 
 use std::path::PathBuf;
 use std::sync::Arc;

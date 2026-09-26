@@ -427,6 +427,7 @@ impl ConversationService {
                 protocol_version: 1,
             },
             math_run_inputs: math_run_inputs::capability(),
+            math_acp_isolation: aionui_ai_agent::factory::math_acp_isolation_capability(),
             runtime_process_id: std::process::id(),
         }
     }

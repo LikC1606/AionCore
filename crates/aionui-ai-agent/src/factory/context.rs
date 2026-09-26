@@ -15,6 +15,7 @@ pub(super) struct FactoryContext {
 impl FactoryContext {
     pub async fn resolve(context: &AgentSessionContext) -> Result<Self, AgentError> {
         if matches!(context.kind, AgentSessionKind::Aionrs(_)) {
+            super::acp_isolation::validate_non_acp_isolation(&context.runtime_env).map_err(AgentError::bad_request)?;
             super::acp_launch_policy::validate_math_budget_backend(Some("aionrs"), &context.runtime_env)
                 .map_err(AgentError::bad_request)?;
         }

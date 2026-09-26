@@ -72,6 +72,7 @@ async fn runtime_capabilities_reports_platform_support_without_creating_conversa
             "protocolVersion": 1
         },
         "math_run_inputs": { "supported_versions": versions },
+        "math_acp_isolation": { "enabled": false, "protocol_version": 1 },
         "runtime_process_id": std::process::id()
     } })
     );

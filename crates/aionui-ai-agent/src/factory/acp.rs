@@ -4,6 +4,7 @@ use crate::agent_task::AgentInstance;
 use crate::error::AgentError;
 use crate::factory::AgentFactoryDeps;
 use crate::factory::acp_assembler::{WorkspaceInfo, assemble_acp_params};
+use crate::factory::acp_isolation::apply_isolation_launcher;
 use crate::factory::acp_launch_policy::{AcpLaunchPolicyInput, apply_acp_launch_policy};
 use crate::factory::context::FactoryContext;
 use crate::factory::mcp_stdio_policy::{BENCHMARK_CONTAINER_MCP_NAME, validate_deepscientist_stdio_reference};
@@ -153,6 +154,12 @@ pub(super) async fn build(
     )
     .await;
     params.auto_approve_mcp_tools = auto_approve_mcp_tools;
+    apply_isolation_launcher(
+        &mut params.command_spec,
+        params.metadata.backend.as_deref(),
+        &params.conversation_id,
+    )
+    .map_err(AgentError::bad_request)?;
     let params = Arc::new(params);
 
     let skill_mgr = deps.skill_manager.clone();

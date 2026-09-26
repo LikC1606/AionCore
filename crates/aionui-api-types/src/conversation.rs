@@ -30,9 +30,18 @@ pub struct MathBudgetBindingResponse {
 pub struct ConversationRuntimeCapabilitiesResponse {
     pub math_fair_turn_gate: MathFairTurnGateCapability,
     pub math_request_gate: MathRequestGateCapability,
+    pub math_acp_isolation: MathAcpIsolationCapability,
     pub math_run_inputs: MathRunInputsCapability,
     /// Allows a local runner to verify the actual executable against its frozen build manifest.
     pub runtime_process_id: u32,
+}
+
+/// Availability of operator-owned launcher configuration, not proof of a
+/// running sandbox or successful isolation canaries.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MathAcpIsolationCapability {
+    pub enabled: bool,
+    pub protocol_version: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
